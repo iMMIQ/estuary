@@ -1,0 +1,100 @@
+# The public listener has no client authentication in phase one. Keep it on a
+# trusted network or place an authenticating reverse proxy in front of it.
+server:
+  listen: "0.0.0.0:8080"
+  # Bind to 0.0.0.0 in containers so the orchestrator can probe it, then keep
+  # port 9090 private with host bindings or network policy.
+  admin_listen: "0.0.0.0:9090"
+  connect_timeout_ms: 5000
+  # Deadline for receiving upstream HTTP response headers.
+  upstream_header_timeout_ms: 120000
+  # Maximum silence between upstream response-body chunks, including SSE.
+  stream_idle_timeout_ms: 300000
+  # Absolute deadline for the complete upstream response body. Raise this for
+  # intentionally long-running generations; no request can hold a node forever.
+  upstream_body_timeout_ms: 3600000
+  # Abort the upstream reader when a client stops draining the bounded buffer.
+  downstream_stall_timeout_ms: 30000
+  # On SIGINT/SIGTERM, abort server tasks still active after this grace period.
+  shutdown_grace_ms: 30000
+  max_request_body_bytes: 16777216 # 16 MiB
+  expose_node_header: false
+  log_json: true
+
+routing:
+  # Requests wait here only when all eligible nodes are at max_concurrency.
+  queue_timeout_ms: 2000
+  queue_max_requests: 512
+  queue_max_bytes: 268435456 # 256 MiB of queued request bodies
+
+  # Lower load/latency/error scores are preferred when cache routing is not active.
+  load_weight: 1.0
+  latency_weight: 0.20
+  error_weight: 1.0
+  target_latency_ms: 1000.0
+
+  prefix:
+    enabled: true
+    # vLLM Router-style cache-aware policy. A match must be greater than 50%.
+    cache_threshold: 0.5
+    # Switch to load-first routing only when BOTH thresholds are exceeded:
+    # max_load - min_load > 2 AND max_load > min_load * 1.1.
+    # This is lower than vLLM Router's large-fleet default because this gateway
+    # enforces the example nodes' 8/16-request hard concurrency limits.
+    balance_abs_threshold: 2
+    balance_rel_threshold: 1.1
+    max_request_chars: 131072
+    # Approximate radix-tree characters retained for each upstream node.
+    max_tree_chars_per_node: 1000000
+
+health:
+  interval_ms: 5000
+  timeout_ms: 2000
+  unhealthy_threshold: 3
+  # Used to recover an unhealthy node. The first startup success is immediate.
+  healthy_threshold: 2
+  passive_failure_threshold: 3
+  # Production should wait for the initial active health check before routing.
+  route_while_starting: false
+  # Deterministic per-node probe delay, as a percentage of interval_ms (0-50).
+  jitter_percent: 20
+
+retry:
+  # Conservative default: never replay a generation after it may have reached
+  # an upstream. Values above 1 are explicit at-least-once delivery and can
+  # duplicate generation work or billing, even for 502/503/504 responses.
+  max_attempts: 1
+  statuses: [429, 502, 503, 504]
+
+nodes:
+  - id: "upstream-a"
+    # Include /v1; endpoint paths are appended to this URL.
+    base_url: "http://host.docker.internal:8001/v1"
+    # This is an environment-variable NAME. Never put the secret in YAML.
+    api_key_env: "UPSTREAM_A_API_KEY"
+    models:
+      gateway-chat: "served-model-a"
+      gateway-reasoning: "served-reasoning-a"
+    max_concurrency: 16
+    # Larger weights make a node relatively more attractive at equal load.
+    weight: 1.0
+    health_path: "/v1/models"
+    # Literal values only. Do not place secrets here.
+    headers: {}
+    # Map a header name to an environment-variable name for non-Bearer secrets.
+    headers_from_env: {}
+
+  - id: "upstream-b"
+    base_url: "http://host.docker.internal:8002/v1"
+    # Example for Azure-style or other non-Bearer authentication. The value of
+    # UPSTREAM_B_API_KEY becomes the api-key header; it is not stored in YAML.
+    headers_from_env:
+      api-key: "UPSTREAM_B_API_KEY"
+    # Public model names match upstream-a, while upstream names may differ.
+    models:
+      gateway-chat: "served-model-b"
+      gateway-reasoning: "served-reasoning-b"
+    max_concurrency: 8
+    weight: 0.75
+    health_path: "/v1/models"
+    headers: {}

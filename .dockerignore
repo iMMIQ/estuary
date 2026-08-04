@@ -1,0 +1,10 @@
+# Use an allow-list so local configs, dotenv files, certificates, and build
+# output can never be copied into an image by a broad COPY instruction.
+**
+!Cargo.toml
+!Cargo.lock
+!.cargo/
+!.cargo/**
+!src/
+!src/**
+!config.example.yaml

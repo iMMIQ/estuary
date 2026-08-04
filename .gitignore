@@ -1,0 +1,35 @@
+# Rust build output and local profiling/coverage artifacts
+/target/
+/coverage/
+*.profraw
+*.profdata
+lcov.info
+
+# Local configuration and credentials
+/config.yaml
+/config.local.yaml
+/config.*.local.yaml
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+
+# Runtime output and local scratch files
+*.log
+*.pid
+*.sock
+/tmp/
+/.cache/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+.DS_Store

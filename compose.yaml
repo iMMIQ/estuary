@@ -1,0 +1,32 @@
+services:
+  estuary:
+    build:
+      context: .
+      args:
+        RUST_VERSION: "1.97.1"
+    image: estuary:local
+    init: true
+    restart: unless-stopped
+    environment:
+      UPSTREAM_A_API_KEY: "${UPSTREAM_A_API_KEY:?UPSTREAM_A_API_KEY is required}"
+      UPSTREAM_B_API_KEY: "${UPSTREAM_B_API_KEY:?UPSTREAM_B_API_KEY is required}"
+      RUST_LOG: "${RUST_LOG:-estuary=info}"
+    volumes:
+      - "${ESTUARY_CONFIG_FILE:-./config.example.yaml}:/etc/estuary/config.yaml:ro"
+    ports:
+      - "127.0.0.1:${ESTUARY_PORT:-8080}:8080"
+      - "127.0.0.1:${ESTUARY_ADMIN_PORT:-9090}:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 45s
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
