@@ -6,7 +6,7 @@ use std::{
 };
 
 use estuary::{
-    config::{HealthConfig, NodeConfig, PrefixConfig, RoutingConfig},
+    config::{HealthConfig, NodeConfig, PrefixConfig, ProviderConfig, ProviderKind, RoutingConfig},
     error::GatewayError,
     node::{HealthState, Node},
     prefix,
@@ -43,18 +43,36 @@ fn healthy_node_for_model(id: &str, model: &str, max_concurrency: usize) -> Arc<
     node
 }
 
-fn routing(queue_timeout_ms: u64, queue_max_requests: usize) -> RoutingConfig {
+fn healthy_vllm_node(id: &str, max_concurrency: usize, waiting_threshold: usize) -> Arc<Node> {
+    let node = Node::from_config(&NodeConfig {
+        id: id.to_owned(),
+        base_url: format!("http://{id}.invalid/v1"),
+        models: HashMap::from([("model".to_owned(), "model".to_owned())]),
+        max_concurrency,
+        provider: ProviderConfig {
+            kind: ProviderKind::Vllm,
+            waiting_threshold,
+            ..ProviderConfig::default()
+        },
+        ..NodeConfig::default()
+    })
+    .expect("valid vLLM node configuration");
+    node.record_vllm_ready("0.25.0".to_owned());
+    node.record_probe_success(&strict_health());
+    node
+}
+
+fn routing(queue_max_requests: usize) -> RoutingConfig {
     RoutingConfig {
-        queue_timeout_ms,
         queue_max_requests,
         ..RoutingConfig::default()
     }
 }
 
 #[tokio::test]
-async fn queue_wait_times_out() {
+async fn queue_waits_until_capacity_is_released() {
     let node = healthy_node("only", 1);
-    let scheduler = Scheduler::new(vec![node], routing(20, 1));
+    let scheduler = Scheduler::new(vec![node], routing(1));
     let excluded = HashSet::new();
     let held = scheduler
         .acquire(
@@ -66,26 +84,30 @@ async fn queue_wait_times_out() {
         .await
         .expect("initial selection");
 
-    let result = tokio::time::timeout(
-        Duration::from_millis(500),
-        scheduler.acquire(
-            Some("model"),
-            prefix::PrefixInput::default(),
-            &excluded,
-            128,
-        ),
-    )
-    .await
-    .expect("scheduler should enforce its queue deadline");
-
-    assert!(matches!(result, Err(GatewayError::CapacityTimeout)));
+    let mut waiter = Box::pin(scheduler.acquire(
+        Some("model"),
+        prefix::PrefixInput::default(),
+        &excluded,
+        128,
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), waiter.as_mut())
+            .await
+            .is_err(),
+        "capacity pressure must keep the request queued"
+    );
     drop(held);
+    let selected = tokio::time::timeout(Duration::from_millis(250), waiter.as_mut())
+        .await
+        .expect("permit release should wake the request")
+        .expect("queued request should be selected");
+    assert_eq!(selected.node.id(), "only");
 }
 
 #[tokio::test]
-async fn queue_full_is_rejected() {
+async fn queue_admission_pressure_waits_instead_of_rejecting() {
     let node = healthy_node("only", 1);
-    let scheduler = Scheduler::new(vec![node], routing(1_000, 1));
+    let scheduler = Scheduler::new(vec![node], routing(1));
     let excluded = HashSet::new();
     let held = scheduler
         .acquire(
@@ -97,33 +119,39 @@ async fn queue_full_is_rejected() {
         .await
         .expect("initial selection");
 
-    {
-        let first_waiter = scheduler.acquire(
-            Some("model"),
-            prefix::PrefixInput::default(),
-            &excluded,
-            128,
-        );
-        tokio::pin!(first_waiter);
-        assert!(matches!(poll!(first_waiter.as_mut()), Poll::Pending));
+    let mut first_waiter = Box::pin(scheduler.acquire(
+        Some("model"),
+        prefix::PrefixInput::default(),
+        &excluded,
+        128,
+    ));
+    assert!(matches!(poll!(first_waiter.as_mut()), Poll::Pending));
+    let mut second_waiter = Box::pin(scheduler.acquire(
+        Some("model"),
+        prefix::PrefixInput::default(),
+        &excluded,
+        128,
+    ));
+    assert!(matches!(poll!(second_waiter.as_mut()), Poll::Pending));
 
-        let result = scheduler
-            .acquire(
-                Some("model"),
-                prefix::PrefixInput::default(),
-                &excluded,
-                128,
-            )
-            .await;
-        assert!(matches!(result, Err(GatewayError::QueueFull)));
-    }
     drop(held);
+    let first = tokio::time::timeout(Duration::from_millis(250), first_waiter.as_mut())
+        .await
+        .expect("oldest waiter should receive released capacity")
+        .expect("first queued selection");
+    assert!(matches!(poll!(second_waiter.as_mut()), Poll::Pending));
+    drop(first);
+    let second = tokio::time::timeout(Duration::from_millis(250), second_waiter.as_mut())
+        .await
+        .expect("admission waiter should eventually enter the node queue")
+        .expect("second queued selection");
+    assert_eq!(second.node.id(), "only");
 }
 
 #[tokio::test]
 async fn permit_release_wakes_waiter() {
     let node = healthy_node("only", 1);
-    let scheduler = Scheduler::new(vec![node], routing(1_000, 1));
+    let scheduler = Scheduler::new(vec![node], routing(1));
     let excluded = HashSet::new();
     let held = scheduler
         .acquire(
@@ -155,7 +183,7 @@ async fn permit_release_wakes_waiter() {
 #[tokio::test(flavor = "current_thread")]
 async fn queued_waiter_cannot_be_bypassed_by_new_fast_path() {
     let node = healthy_node("only", 1);
-    let scheduler = Scheduler::new(vec![Arc::clone(&node)], routing(1_000, 2));
+    let scheduler = Scheduler::new(vec![Arc::clone(&node)], routing(2));
     let excluded = HashSet::new();
     let held = scheduler
         .acquire(
@@ -202,7 +230,7 @@ async fn queued_waiter_cannot_be_bypassed_by_new_fast_path() {
 #[tokio::test(flavor = "current_thread")]
 async fn cancelling_assigned_waiter_hands_permit_to_next_waiter() {
     let node = healthy_node("only", 1);
-    let scheduler = Scheduler::new(vec![node], routing(1_000, 2));
+    let scheduler = Scheduler::new(vec![node], routing(2));
     let excluded = HashSet::new();
     let held = scheduler
         .acquire(
@@ -243,7 +271,7 @@ async fn cancelling_assigned_waiter_hands_permit_to_next_waiter() {
 async fn queued_model_does_not_block_an_independent_model() {
     let first = healthy_node_for_model("first", "model-a", 1);
     let second = healthy_node_for_model("second", "model-b", 1);
-    let scheduler = Scheduler::new(vec![first, second], routing(1_000, 1));
+    let scheduler = Scheduler::new(vec![first, second], routing(1));
     let excluded = HashSet::new();
     let held = scheduler
         .acquire(
@@ -281,7 +309,7 @@ async fn queued_model_does_not_block_an_independent_model() {
 #[tokio::test(flavor = "current_thread")]
 async fn state_notification_does_not_reorder_node_waiters() {
     let node = healthy_node("only", 1);
-    let scheduler = Scheduler::new(vec![node], routing(1_000, 2));
+    let scheduler = Scheduler::new(vec![node], routing(2));
     let excluded = HashSet::new();
     let held = scheduler
         .acquire(
@@ -331,7 +359,7 @@ async fn recovered_node_is_added_without_losing_existing_fifo_position() {
     recovered.record_probe_failure("forced failure", &strict_health());
     assert_eq!(recovered.health(), HealthState::Unhealthy);
 
-    let scheduler = Scheduler::new(vec![saturated, Arc::clone(&recovered)], routing(1_000, 1));
+    let scheduler = Scheduler::new(vec![saturated, Arc::clone(&recovered)], routing(1));
     let excluded = HashSet::new();
     let held = scheduler
         .acquire(
@@ -361,6 +389,55 @@ async fn recovered_node_is_added_without_losing_existing_fifo_position() {
 
     drop(selection);
     drop(held);
+}
+
+#[tokio::test]
+async fn vllm_waiting_watermark_spills_a_cached_request_to_an_idle_node() {
+    let cached = healthy_vllm_node("cached", 4, 2);
+    let fallback = healthy_node("fallback", 4);
+    cached.record_vllm_telemetry(0, 2, None);
+    let mut config = RoutingConfig::default();
+    config.prefix.balance_abs_threshold = usize::MAX;
+    let scheduler = Scheduler::new(vec![Arc::clone(&cached), fallback], config.clone());
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "a cached agent conversation"}]
+    });
+    let input = prefix::routing_text(
+        "chat/completions",
+        Some("model"),
+        Some(&body),
+        &config.prefix,
+    );
+    scheduler.prefix_directory().record("cached", &input);
+
+    let selected = scheduler
+        .acquire(Some("model"), input, &HashSet::new(), 128)
+        .await
+        .expect("idle fallback should accept the request");
+    assert_eq!(selected.node.id(), "fallback");
+}
+
+#[tokio::test]
+async fn vllm_waiting_watermark_queues_until_fresh_telemetry_recovers() {
+    let node = healthy_vllm_node("only", 4, 2);
+    node.record_vllm_telemetry(1, 2, None);
+    let scheduler = Scheduler::new(vec![Arc::clone(&node)], RoutingConfig::default());
+    let excluded = HashSet::new();
+    let mut waiting = Box::pin(scheduler.acquire(
+        Some("model"),
+        prefix::PrefixInput::default(),
+        &excluded,
+        128,
+    ));
+    assert!(matches!(poll!(waiting.as_mut()), Poll::Pending));
+
+    node.record_vllm_telemetry(1, 0, None);
+    scheduler.notify_state_change();
+    let selected = tokio::time::timeout(Duration::from_millis(250), waiting.as_mut())
+        .await
+        .expect("fresh telemetry should release the queued request")
+        .expect("recovered vLLM selection");
+    assert_eq!(selected.node.id(), "only");
 }
 
 #[tokio::test]
@@ -394,6 +471,53 @@ async fn unhealthy_node_is_never_selected() {
         .await
         .expect("healthy fallback should remain available");
     assert_eq!(selected.node.id(), "fallback");
+}
+
+#[tokio::test]
+async fn draining_stops_new_work_without_cancelling_active_lease() {
+    let node = healthy_node("only", 1);
+    let scheduler = Scheduler::new(vec![Arc::clone(&node)], routing(1));
+    let held = scheduler
+        .acquire(
+            Some("model"),
+            prefix::PrefixInput::default(),
+            &HashSet::new(),
+            128,
+        )
+        .await
+        .expect("initial selection");
+
+    scheduler.set_node_draining("only", true).unwrap();
+    assert_eq!(node.active(), 1);
+    assert!(matches!(
+        scheduler
+            .acquire(
+                Some("model"),
+                prefix::PrefixInput::default(),
+                &HashSet::new(),
+                128,
+            )
+            .await,
+        Err(GatewayError::NoHealthyNode(_))
+    ));
+
+    drop(held);
+    assert!(
+        scheduler
+            .wait_for_node_idle(&node, Duration::from_millis(100))
+            .await
+    );
+    scheduler.set_node_draining("only", false).unwrap();
+    let resumed = scheduler
+        .acquire(
+            Some("model"),
+            prefix::PrefixInput::default(),
+            &HashSet::new(),
+            128,
+        )
+        .await
+        .expect("resumed node should accept work");
+    drop(resumed);
 }
 
 #[tokio::test]

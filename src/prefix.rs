@@ -10,11 +10,20 @@ pub struct PrefixInput {
     tree_key: String,
     text: String,
     char_count: usize,
+    token_ids: Option<Arc<[u64]>>,
 }
 
 impl PrefixInput {
     pub fn char_count(&self) -> usize {
         self.char_count
+    }
+
+    pub fn set_token_ids(&mut self, token_ids: Vec<u64>) {
+        self.token_ids = Some(token_ids.into());
+    }
+
+    pub fn token_ids(&self) -> Option<&[u64]> {
+        self.token_ids.as_deref()
     }
 }
 
@@ -120,6 +129,20 @@ impl RadixTree {
             self.root.tenant_last_access.remove(tenant);
         }
     }
+
+    fn clear_tenant(&mut self, tenant: &str) {
+        clear_tenant_from_node(&mut self.root, tenant);
+        self.root.tenant_last_access.remove(tenant);
+        self.tenant_char_count.remove(tenant);
+    }
+}
+
+fn clear_tenant_from_node(node: &mut RadixNode, tenant: &str) {
+    node.tenant_last_access.remove(tenant);
+    node.children.retain(|_, child| {
+        clear_tenant_from_node(child, tenant);
+        !child.children.is_empty() || !child.tenant_last_access.is_empty()
+    });
 }
 
 fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, count: &mut usize) {
@@ -272,6 +295,12 @@ impl PrefixDirectory {
             tree.read().prefix_match(&input.text, input.char_count())
         })
     }
+
+    pub fn clear_node(&self, node_id: &str) {
+        for tree in self.trees.read().values() {
+            tree.write().clear_tenant(node_id);
+        }
+    }
 }
 
 pub fn routing_text(
@@ -291,6 +320,7 @@ pub fn routing_text(
             tree_key,
             text,
             char_count: 0,
+            token_ids: None,
         };
     };
 
@@ -332,6 +362,7 @@ pub fn routing_text(
         tree_key,
         char_count: char_count.min(config.max_request_chars),
         text,
+        token_ids: None,
     }
 }
 

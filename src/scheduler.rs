@@ -1,16 +1,28 @@
-use std::{cmp::Ordering, collections::HashSet, future::Future, pin::Pin, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::HashSet,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
+    time::Duration,
+};
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
+use parking_lot::RwLock;
 use tokio::{
     sync::{Notify, OwnedSemaphorePermit, Semaphore},
-    time::{Instant, sleep_until},
+    time::Instant,
 };
 
 use crate::{
     config::RoutingConfig,
     error::GatewayError,
+    kv_cache::ExactCacheDirectory,
     node::{HealthState, Node, NodeLease, NodeReservation},
-    prefix::{PrefixDirectory, PrefixInput},
+    prefix::{PrefixDirectory, PrefixInput, PrefixMatch},
 };
 
 #[derive(Debug)]
@@ -19,6 +31,7 @@ pub struct Selection {
     pub lease: NodeLease,
     pub upstream_model: Option<String>,
     pub prefix_match_chars: usize,
+    pub prefix_match_tokens: usize,
     pub score: f64,
 }
 
@@ -28,6 +41,7 @@ struct Candidate {
     node: Arc<Node>,
     upstream_model: Option<String>,
     prefix_match_chars: usize,
+    prefix_match_tokens: usize,
     cache_preferred: bool,
     score: f64,
 }
@@ -37,35 +51,77 @@ type PendingAcquisition =
 
 #[derive(Debug)]
 pub struct Scheduler {
-    nodes: Vec<Arc<Node>>,
+    nodes: RwLock<Vec<Arc<Node>>>,
     config: RoutingConfig,
     prefix: Arc<PrefixDirectory>,
+    exact_cache: Arc<ExactCacheDirectory>,
     notify: Arc<Notify>,
-    queue_requests: Arc<Semaphore>,
+    queue_slots: Arc<Semaphore>,
     queue_kib: Arc<Semaphore>,
+    queued_requests: Arc<AtomicUsize>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct QueueAccounting {
+    requests: Arc<AtomicUsize>,
+    bytes: Arc<AtomicUsize>,
+    rounded_bytes: usize,
+}
+
+impl QueueAccounting {
+    fn new(requests: Arc<AtomicUsize>, bytes: Arc<AtomicUsize>, rounded_bytes: usize) -> Self {
+        requests.fetch_add(1, AtomicOrdering::Relaxed);
+        bytes.fetch_add(rounded_bytes, AtomicOrdering::Relaxed);
+        Self {
+            requests,
+            bytes,
+            rounded_bytes,
+        }
+    }
+}
+
+impl Drop for QueueAccounting {
+    fn drop(&mut self) {
+        self.requests.fetch_sub(1, AtomicOrdering::Relaxed);
+        self.bytes
+            .fetch_sub(self.rounded_bytes, AtomicOrdering::Relaxed);
+    }
 }
 
 impl Scheduler {
     pub fn new(nodes: Vec<Arc<Node>>, config: RoutingConfig) -> Self {
         let prefix = Arc::new(PrefixDirectory::new(&config.prefix));
+        let exact_cache = Arc::new(ExactCacheDirectory::default());
         let queue_max_requests = config.queue_max_requests;
         let queue_max_kib = config.queue_max_bytes.div_ceil(1024).min(u32::MAX as usize);
         Self {
-            nodes,
+            nodes: RwLock::new(nodes),
             config,
             prefix,
+            exact_cache,
             notify: Arc::new(Notify::new()),
-            queue_requests: Arc::new(Semaphore::new(queue_max_requests)),
+            queue_slots: Arc::new(Semaphore::new(queue_max_requests)),
             queue_kib: Arc::new(Semaphore::new(queue_max_kib)),
+            queued_requests: Arc::new(AtomicUsize::new(0)),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    pub fn nodes(&self) -> &[Arc<Node>] {
-        &self.nodes
+    pub fn nodes(&self) -> Vec<Arc<Node>> {
+        self.nodes.read().clone()
     }
 
     pub fn prefix_directory(&self) -> &Arc<PrefixDirectory> {
         &self.prefix
+    }
+
+    pub fn exact_cache_directory(&self) -> &Arc<ExactCacheDirectory> {
+        &self.exact_cache
+    }
+
+    pub fn state_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.notify)
     }
 
     pub async fn acquire(
@@ -79,15 +135,22 @@ impl Scheduler {
             return Ok(selection);
         }
 
-        let _queue_request = Arc::clone(&self.queue_requests)
-            .try_acquire_owned()
-            .map_err(|_| GatewayError::QueueFull)?;
         let body_kib = u32::try_from(body_bytes.div_ceil(1024).max(1).min(u32::MAX as usize))
             .unwrap_or(u32::MAX);
+        let rounded_bytes = body_kib as usize * 1024;
+        let _accounting = QueueAccounting::new(
+            Arc::clone(&self.queued_requests),
+            Arc::clone(&self.queued_bytes),
+            rounded_bytes,
+        );
+        let _queue_request = Arc::clone(&self.queue_slots)
+            .acquire_owned()
+            .await
+            .expect("queue admission semaphore is never closed");
         let _queue_bytes: OwnedSemaphorePermit = Arc::clone(&self.queue_kib)
-            .try_acquire_many_owned(body_kib)
-            .map_err(|_| GatewayError::QueueFull)?;
-        let deadline = Instant::now() + self.config.queue_timeout();
+            .acquire_many_owned(body_kib)
+            .await
+            .expect("queue byte semaphore is never closed");
 
         let mut registered = HashSet::new();
         let mut acquisitions = FuturesUnordered::<PendingAcquisition>::new();
@@ -107,9 +170,9 @@ impl Scheduler {
 
             tokio::select! {
                 biased;
-                acquired = acquisitions.next() => {
+                acquired = acquisitions.next(), if !acquisitions.is_empty() => {
                     let Some((candidate, reservation)) = acquired else {
-                        return Err(GatewayError::CapacityTimeout);
+                        unreachable!("a guarded acquisition set is not empty");
                     };
                     registered.remove(&candidate.node_index);
                     if !candidate.node.is_routable() {
@@ -132,16 +195,18 @@ impl Scheduler {
                         drop(reservation);
                         continue;
                     }
-                    let lease = reservation.commit(Arc::clone(&self.notify));
+                    let Some(lease) = reservation.try_commit(Arc::clone(&self.notify)) else {
+                        continue;
+                    };
                     return Ok(Selection {
                         node: candidate.node,
                         lease,
                         upstream_model: candidate.upstream_model,
                         prefix_match_chars: candidate.prefix_match_chars,
+                        prefix_match_tokens: candidate.prefix_match_tokens,
                         score: candidate.score,
                     });
                 }
-                () = sleep_until(deadline) => return Err(GatewayError::CapacityTimeout),
                 () = state_changed => {}
             }
         }
@@ -155,15 +220,12 @@ impl Scheduler {
     ) -> Result<Option<Selection>, GatewayError> {
         for candidate in self.ranked_candidates(model, prefix_input, excluded)? {
             if let Some(lease) = candidate.node.try_acquire(Arc::clone(&self.notify)) {
-                if !candidate.node.is_routable() {
-                    drop(lease);
-                    continue;
-                }
                 return Ok(Some(Selection {
                     node: candidate.node,
                     lease,
                     upstream_model: candidate.upstream_model,
                     prefix_match_chars: candidate.prefix_match_chars,
+                    prefix_match_tokens: candidate.prefix_match_tokens,
                     score: candidate.score,
                 }));
             }
@@ -182,7 +244,8 @@ impl Scheduler {
         let prefix_match = self.prefix.best_match(prefix_input);
         let mut candidates = Vec::new();
 
-        for (node_index, node) in self.nodes.iter().enumerate() {
+        let nodes = self.nodes();
+        for (node_index, node) in nodes.iter().enumerate() {
             if excluded.contains(node.id()) {
                 continue;
             }
@@ -191,12 +254,18 @@ impl Scheduler {
             };
             model_nodes += 1;
             let health = node.health();
-            if !node.is_health_state_routable(health) {
+            if !node.is_routable() {
                 continue;
             }
             healthy_nodes += 1;
+            if node
+                .fresh_vllm_waiting()
+                .is_some_and(|waiting| waiting >= node.provider().waiting_threshold)
+            {
+                continue;
+            }
 
-            let active = node.active() as f64;
+            let active = node.scheduling_load() as f64;
             let capacity = node.max_concurrency() as f64;
             let load = ((active + 1.0) / capacity) / node.weight();
             let (latency_ms, error_ewma) = node.score_stats();
@@ -219,6 +288,7 @@ impl Scheduler {
                 node: Arc::clone(node),
                 upstream_model,
                 prefix_match_chars: 0,
+                prefix_match_tokens: 0,
                 cache_preferred: false,
                 score: base_score,
             });
@@ -234,7 +304,7 @@ impl Scheduler {
 
         let (min_load, max_load) = candidates
             .iter()
-            .map(|candidate| candidate.node.active())
+            .map(|candidate| candidate.node.scheduling_load())
             .fold((usize::MAX, 0), |(min, max), load| {
                 (min.min(load), max.max(load))
             });
@@ -242,27 +312,12 @@ impl Scheduler {
         let load_imbalanced = max_load.saturating_sub(min_load)
             > self.config.prefix.balance_abs_threshold
             && (max_load as f64) > min_load as f64 * self.config.prefix.balance_rel_threshold;
-        let match_ratio = if prefix_match.input_chars == 0 {
-            0.0
-        } else {
-            prefix_match.matched_chars as f64 / prefix_match.input_chars as f64
-        };
-        let cache_mode = self.config.prefix.enabled
-            && !load_imbalanced
-            && match_ratio > self.config.prefix.cache_threshold;
-
-        if cache_mode {
-            for candidate in &mut candidates {
-                if prefix_match
-                    .node_ids
-                    .iter()
-                    .any(|node_id| node_id == candidate.node.id())
-                {
-                    candidate.cache_preferred = true;
-                    candidate.prefix_match_chars = prefix_match.matched_chars;
-                }
-            }
-        }
+        self.apply_cache_affinity(
+            &mut candidates,
+            prefix_input,
+            &prefix_match,
+            load_imbalanced,
+        );
 
         candidates.sort_by(|left, right| {
             right
@@ -278,11 +333,81 @@ impl Scheduler {
         Ok(candidates)
     }
 
+    fn apply_cache_affinity(
+        &self,
+        candidates: &mut [Candidate],
+        prefix_input: &PrefixInput,
+        prefix_match: &PrefixMatch,
+        load_imbalanced: bool,
+    ) {
+        let exact_match = prefix_input
+            .token_ids()
+            .map(|tokens| self.exact_cache.matches(tokens));
+        let exact_tokens = exact_match
+            .as_ref()
+            .and_then(|matched| {
+                candidates
+                    .iter()
+                    .filter_map(|candidate| matched.matched_tokens.get(candidate.node.id()))
+                    .max()
+                    .copied()
+            })
+            .unwrap_or_default();
+        let input_tokens = prefix_input.token_ids().map_or(0, <[u64]>::len);
+        let exact_ratio = if input_tokens == 0 {
+            0.0
+        } else {
+            exact_tokens as f64 / input_tokens as f64
+        };
+        let approximate_ratio = if prefix_match.input_chars == 0 {
+            0.0
+        } else {
+            prefix_match.matched_chars as f64 / prefix_match.input_chars as f64
+        };
+        let exact_cache_mode = self.config.prefix.enabled
+            && !load_imbalanced
+            && exact_ratio > self.config.prefix.cache_threshold;
+        let approximate_cache_mode = self.config.prefix.enabled
+            && !load_imbalanced
+            && !exact_cache_mode
+            && approximate_ratio > self.config.prefix.cache_threshold;
+
+        if exact_cache_mode {
+            let matched = exact_match.as_ref().expect("exact cache mode has matches");
+            for candidate in candidates.iter_mut() {
+                let tokens = matched
+                    .matched_tokens
+                    .get(candidate.node.id())
+                    .copied()
+                    .unwrap_or_default();
+                if tokens == exact_tokens {
+                    candidate.cache_preferred = true;
+                    candidate.prefix_match_tokens = tokens;
+                }
+            }
+        } else if approximate_cache_mode {
+            for candidate in candidates.iter_mut() {
+                if prefix_match
+                    .node_ids
+                    .iter()
+                    .any(|node_id| node_id == candidate.node.id())
+                {
+                    candidate.cache_preferred = true;
+                    candidate.prefix_match_chars = prefix_match.matched_chars;
+                }
+            }
+        }
+    }
+
     pub fn models(&self) -> Vec<String> {
         let mut models = self
-            .nodes
-            .iter()
-            .flat_map(|node| node.explicit_models().map(|(public, _)| public.to_owned()))
+            .nodes()
+            .into_iter()
+            .flat_map(|node| {
+                node.explicit_models()
+                    .map(|(public, _)| public.to_owned())
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         models.sort();
         models.dedup();
@@ -290,17 +415,50 @@ impl Scheduler {
     }
 
     pub fn ready(&self) -> bool {
-        self.nodes.iter().any(|node| node.health().is_ready())
+        self.nodes().iter().any(|node| node.is_routable())
+    }
+
+    pub fn set_node_draining(&self, node_id: &str, draining: bool) -> Option<Arc<Node>> {
+        let node = self.nodes().into_iter().find(|node| node.id() == node_id)?;
+        if node.set_draining(draining) {
+            self.notify.notify_waiters();
+        }
+        Some(node)
+    }
+
+    pub fn drain_all(&self) {
+        let mut changed = false;
+        for node in self.nodes() {
+            changed |= node.set_draining(true);
+        }
+        if changed {
+            self.notify.notify_waiters();
+        }
+    }
+
+    pub async fn wait_for_node_idle(&self, node: &Node, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if node.active() == 0 {
+                return true;
+            }
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if node.active() == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return node.active() == 0;
+            }
+        }
     }
 
     pub fn queue_snapshot(&self) -> (usize, usize) {
-        let requests = self
-            .config
-            .queue_max_requests
-            .saturating_sub(self.queue_requests.available_permits());
-        let max_kib = self.config.queue_max_bytes.div_ceil(1024);
-        let used_kib = max_kib.saturating_sub(self.queue_kib.available_permits());
-        (requests, used_kib.saturating_mul(1024))
+        (
+            self.queued_requests.load(AtomicOrdering::Relaxed),
+            self.queued_bytes.load(AtomicOrdering::Relaxed),
+        )
     }
 
     pub fn notify_state_change(&self) {
@@ -308,11 +466,69 @@ impl Scheduler {
     }
 
     pub fn has_alternative(&self, model: Option<&str>, excluded: &HashSet<String>) -> bool {
-        self.nodes.iter().any(|node| {
+        self.nodes().iter().any(|node| {
             !excluded.contains(node.id())
                 && node.is_routable()
                 && node.upstream_model(model).is_some()
         })
+    }
+
+    pub fn node(&self, node_id: &str) -> Option<Arc<Node>> {
+        self.nodes().into_iter().find(|node| node.id() == node_id)
+    }
+
+    pub fn add_node(&self, node: Arc<Node>) -> Result<(), GatewayError> {
+        let mut nodes = self.nodes.write();
+        if nodes.iter().any(|current| current.id() == node.id()) {
+            return Err(GatewayError::InvalidRequest(format!(
+                "node {:?} already exists",
+                node.id()
+            )));
+        }
+        if let Some(events) = node.provider().kv_events.as_ref() {
+            self.exact_cache
+                .configure_node_owned(node.id(), events.max_blocks, node.instance_id());
+        }
+        nodes.push(node);
+        nodes.sort_by(|left, right| left.id().cmp(right.id()));
+        drop(nodes);
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
+    pub fn replace_node(&self, node: &Arc<Node>) -> Result<Arc<Node>, GatewayError> {
+        let mut nodes = self.nodes.write();
+        let Some(index) = nodes.iter().position(|current| current.id() == node.id()) else {
+            return Err(GatewayError::InvalidRequest(format!(
+                "node {:?} does not exist",
+                node.id()
+            )));
+        };
+        let previous = std::mem::replace(&mut nodes[index], Arc::clone(node));
+        previous.retire();
+        self.prefix.clear_node(node.id());
+        self.exact_cache
+            .remove_node_owned(node.id(), previous.instance_id());
+        if let Some(events) = node.provider().kv_events.as_ref() {
+            self.exact_cache
+                .configure_node_owned(node.id(), events.max_blocks, node.instance_id());
+        }
+        drop(nodes);
+        self.notify.notify_waiters();
+        Ok(previous)
+    }
+
+    pub fn remove_node(&self, node_id: &str) -> Option<Arc<Node>> {
+        let mut nodes = self.nodes.write();
+        let index = nodes.iter().position(|node| node.id() == node_id)?;
+        let node = nodes.remove(index);
+        node.retire();
+        self.prefix.clear_node(node_id);
+        self.exact_cache
+            .remove_node_owned(node_id, node.instance_id());
+        drop(nodes);
+        self.notify.notify_waiters();
+        Some(node)
     }
 }
 
@@ -324,6 +540,7 @@ mod tests {
 
     use crate::{
         config::{NodeConfig, PrefixConfig},
+        kv_cache::{BlockHash, CacheMutation},
         prefix,
     };
 
@@ -410,6 +627,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(selected.node.id(), "a-idle");
+        assert_eq!(selected.prefix_match_chars, 0);
+    }
+
+    #[tokio::test]
+    async fn exact_vllm_tokens_take_precedence_over_character_affinity() {
+        let approximate = node("a-approximate", 4);
+        let exact = node("z-exact", 4);
+        let scheduler = Scheduler::new(vec![approximate, exact], RoutingConfig::default());
+        let prefix_config = PrefixConfig::default();
+        let mut request = prefix::routing_text(
+            "chat/completions",
+            Some("model"),
+            Some(&json!({"messages": [{"role": "user", "content": "shared prompt"}]})),
+            &prefix_config,
+        );
+        scheduler
+            .prefix_directory()
+            .record("a-approximate", &request);
+        scheduler
+            .exact_cache_directory()
+            .configure_node("z-exact", 10);
+        scheduler
+            .exact_cache_directory()
+            .apply(
+                "z-exact",
+                vec![CacheMutation::Store {
+                    hashes: vec![BlockHash::Integer(1)],
+                    parent: None,
+                    token_ids: vec![1, 2, 3, 4],
+                    block_size: 4,
+                    group: 0,
+                }],
+            )
+            .unwrap();
+        request.set_token_ids(vec![1, 2, 3, 4, 5]);
+
+        let selected = scheduler
+            .acquire(Some("model"), request, &HashSet::new(), 128)
+            .await
+            .unwrap();
+        assert_eq!(selected.node.id(), "z-exact");
+        assert_eq!(selected.prefix_match_tokens, 4);
         assert_eq!(selected.prefix_match_chars, 0);
     }
 }

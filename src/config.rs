@@ -1,8 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs,
     net::SocketAddr,
-    path::Path,
     time::Duration,
 };
 
@@ -16,21 +14,12 @@ pub struct Settings {
     pub server: ServerConfig,
     pub routing: RoutingConfig,
     pub health: HealthConfig,
+    pub circuit_breaker: CircuitBreakerConfig,
     pub retry: RetryConfig,
     pub nodes: Vec<NodeConfig>,
 }
 
 impl Settings {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read config {}", path.display()))?;
-        let settings: Self = serde_yaml_ng::from_str(&raw)
-            .with_context(|| format!("failed to parse config {}", path.display()))?;
-        settings.validate()?;
-        Ok(settings)
-    }
-
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<()> {
         let public_address = self
@@ -60,13 +49,10 @@ impl Settings {
         if self.server.max_request_body_bytes == 0 {
             bail!("server.max_request_body_bytes must be greater than zero");
         }
+        if self.server.max_non_streaming_response_bytes == 0 {
+            bail!("server.max_non_streaming_response_bytes must be greater than zero");
+        }
 
-        if self.nodes.is_empty() {
-            bail!("at least one upstream node is required");
-        }
-        if self.routing.queue_timeout_ms == 0 {
-            bail!("routing.queue_timeout_ms must be greater than zero");
-        }
         if self.routing.queue_max_requests == 0 || self.routing.queue_max_bytes < 1024 {
             bail!("routing queue limits must be greater than zero");
         }
@@ -75,6 +61,9 @@ impl Settings {
         }
         if self.routing.queue_max_bytes.div_ceil(1024) > u32::MAX as usize {
             bail!("routing.queue_max_bytes exceeds the supported 4 TiB limit");
+        }
+        if self.routing.queue_max_bytes < self.server.max_request_body_bytes {
+            bail!("routing.queue_max_bytes must cover one maximum-sized request body");
         }
         for (name, value) in [
             ("load_weight", self.routing.load_weight),
@@ -117,6 +106,16 @@ impl Settings {
             || self.health.passive_failure_threshold == 0
         {
             bail!("health thresholds must be greater than zero");
+        }
+        if self.circuit_breaker.failure_threshold == 0
+            || self.circuit_breaker.open_ms == 0
+            || self.circuit_breaker.half_open_max_requests == 0
+            || self.circuit_breaker.half_open_success_threshold == 0
+        {
+            bail!("circuit_breaker values must be greater than zero");
+        }
+        if self.circuit_breaker.half_open_max_requests > tokio::sync::Semaphore::MAX_PERMITS {
+            bail!("circuit_breaker.half_open_max_requests exceeds the runtime limit");
         }
         if !(1..=3).contains(&self.retry.max_attempts) {
             bail!("retry.max_attempts must be between 1 and 3");
@@ -196,9 +195,106 @@ impl Settings {
                     bail!("node {} has an empty header environment variable", node.id);
                 }
             }
+            validate_provider(node, &url)?;
         }
         Ok(())
     }
+}
+
+pub fn validate_node_config(node: &NodeConfig) -> Result<()> {
+    Settings {
+        nodes: vec![node.clone()],
+        ..Settings::default()
+    }
+    .validate()
+}
+
+fn validate_provider(node: &NodeConfig, base_url: &Url) -> Result<()> {
+    let provider = &node.provider;
+    if provider.kind == ProviderKind::Openai {
+        if provider.kv_events.is_some() {
+            bail!(
+                "node {} configures KV events without provider.type: vllm",
+                node.id
+            );
+        }
+        return Ok(());
+    }
+
+    if provider.monitor_interval_ms == 0
+        || provider.request_timeout_ms == 0
+        || provider.telemetry_stale_ms == 0
+    {
+        bail!(
+            "node {} vLLM provider timeouts must be greater than zero",
+            node.id
+        );
+    }
+    if provider.waiting_threshold == 0 {
+        bail!(
+            "node {} provider.waiting_threshold must be greater than zero",
+            node.id
+        );
+    }
+    if provider.telemetry_stale_ms < provider.monitor_interval_ms {
+        bail!(
+            "node {} provider.telemetry_stale_ms must not be shorter than monitor_interval_ms",
+            node.id
+        );
+    }
+    if provider.tokenize_cache_entries == 0 {
+        bail!(
+            "node {} provider.tokenize_cache_entries must be greater than zero",
+            node.id
+        );
+    }
+    for (name, path) in [
+        ("version_path", &provider.version_path),
+        ("metrics_path", &provider.metrics_path),
+        ("tokenize_path", &provider.tokenize_path),
+    ] {
+        if !path.starts_with('/') {
+            bail!("node {} provider.{name} must start with '/'", node.id);
+        }
+        let url = base_url
+            .join(path)
+            .with_context(|| format!("node {} has invalid provider.{name}", node.id))?;
+        if url.origin() != base_url.origin() || url.query().is_some() || url.fragment().is_some() {
+            bail!(
+                "node {} provider.{name} must stay on the upstream origin",
+                node.id
+            );
+        }
+    }
+    if let Some(events) = &provider.kv_events {
+        validate_zmq_endpoint(&node.id, "endpoint", &events.endpoint)?;
+        if let Some(endpoint) = &events.replay_endpoint {
+            validate_zmq_endpoint(&node.id, "replay_endpoint", endpoint)?;
+        }
+        if events.reconnect_ms == 0 || events.max_blocks == 0 || events.max_event_bytes == 0 {
+            bail!("node {} KV event limits must be greater than zero", node.id);
+        }
+    }
+    Ok(())
+}
+
+fn validate_zmq_endpoint(node_id: &str, field: &str, endpoint: &str) -> Result<()> {
+    let url = Url::parse(endpoint)
+        .with_context(|| format!("node {node_id} provider.kv_events.{field} is not a valid URL"))?;
+    if url.scheme() != "tcp"
+        || url.host_str().is_none_or(|host| host.contains('*'))
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        bail!(
+            "node {node_id} provider.kv_events.{field} must be a connectable tcp://host:port endpoint"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -213,6 +309,7 @@ pub struct ServerConfig {
     pub downstream_stall_timeout_ms: u64,
     pub shutdown_grace_ms: u64,
     pub max_request_body_bytes: usize,
+    pub max_non_streaming_response_bytes: usize,
     pub expose_node_header: bool,
     pub log_json: bool,
 }
@@ -229,6 +326,7 @@ impl Default for ServerConfig {
             downstream_stall_timeout_ms: 30_000,
             shutdown_grace_ms: 30_000,
             max_request_body_bytes: 16 * 1024 * 1024,
+            max_non_streaming_response_bytes: 64 * 1024 * 1024,
             expose_node_header: false,
             log_json: false,
         }
@@ -238,7 +336,6 @@ impl Default for ServerConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RoutingConfig {
-    pub queue_timeout_ms: u64,
     pub queue_max_requests: usize,
     pub queue_max_bytes: usize,
     pub load_weight: f64,
@@ -251,7 +348,6 @@ pub struct RoutingConfig {
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
-            queue_timeout_ms: 2_000,
             queue_max_requests: 512,
             queue_max_bytes: 256 * 1024 * 1024,
             load_weight: 1.0,
@@ -260,12 +356,6 @@ impl Default for RoutingConfig {
             target_latency_ms: 1_000.0,
             prefix: PrefixConfig::default(),
         }
-    }
-}
-
-impl RoutingConfig {
-    pub fn queue_timeout(&self) -> Duration {
-        Duration::from_millis(self.queue_timeout_ms)
     }
 }
 
@@ -331,6 +421,32 @@ impl HealthConfig {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct CircuitBreakerConfig {
+    pub failure_threshold: u32,
+    pub open_ms: u64,
+    pub half_open_max_requests: usize,
+    pub half_open_success_threshold: u32,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            open_ms: 10_000,
+            half_open_max_requests: 1,
+            half_open_success_threshold: 2,
+        }
+    }
+}
+
+impl CircuitBreakerConfig {
+    pub fn open_duration(&self) -> Duration {
+        Duration::from_millis(self.open_ms)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RetryConfig {
     pub max_attempts: usize,
     pub statuses: Vec<u16>,
@@ -354,9 +470,11 @@ pub struct NodeConfig {
     pub models: HashMap<String, String>,
     pub max_concurrency: usize,
     pub weight: f64,
+    pub draining: bool,
     pub health_path: String,
     pub headers: HashMap<String, String>,
     pub headers_from_env: HashMap<String, String>,
+    pub provider: ProviderConfig,
 }
 
 impl Default for NodeConfig {
@@ -368,9 +486,76 @@ impl Default for NodeConfig {
             models: HashMap::new(),
             max_concurrency: 1,
             weight: 1.0,
+            draining: false,
             health_path: "/v1/models".to_owned(),
             headers: HashMap::new(),
             headers_from_env: HashMap::new(),
+            provider: ProviderConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    #[default]
+    Openai,
+    Vllm,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderConfig {
+    #[serde(rename = "type")]
+    pub kind: ProviderKind,
+    pub version_path: String,
+    pub metrics_path: String,
+    pub tokenize_path: String,
+    pub monitor_interval_ms: u64,
+    pub request_timeout_ms: u64,
+    pub telemetry_stale_ms: u64,
+    pub waiting_threshold: usize,
+    pub tokenize_cache_entries: usize,
+    pub kv_events: Option<VllmKvEventsConfig>,
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            kind: ProviderKind::Openai,
+            version_path: "/version".to_owned(),
+            metrics_path: "/metrics".to_owned(),
+            tokenize_path: "/tokenize".to_owned(),
+            monitor_interval_ms: 1_000,
+            request_timeout_ms: 2_000,
+            telemetry_stale_ms: 5_000,
+            waiting_threshold: 8,
+            tokenize_cache_entries: 4_096,
+            kv_events: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VllmKvEventsConfig {
+    pub endpoint: String,
+    pub replay_endpoint: Option<String>,
+    pub topic: String,
+    pub reconnect_ms: u64,
+    pub max_blocks: usize,
+    pub max_event_bytes: usize,
+}
+
+impl Default for VllmKvEventsConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "tcp://127.0.0.1:5557".to_owned(),
+            replay_endpoint: None,
+            topic: "kv-events".to_owned(),
+            reconnect_ms: 1_000,
+            max_blocks: 1_000_000,
+            max_event_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -432,5 +617,95 @@ mod tests {
         let mut zero_stall_timeout = settings;
         zero_stall_timeout.server.downstream_stall_timeout_ms = 0;
         assert!(zero_stall_timeout.validate().is_err());
+
+        let mut zero_response_limit = zero_stall_timeout;
+        zero_response_limit.server.downstream_stall_timeout_ms = 1;
+        zero_response_limit.server.max_non_streaming_response_bytes = 0;
+        assert!(zero_response_limit.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_circuit_breaker_limits() {
+        let node = NodeConfig {
+            id: "node".to_owned(),
+            base_url: "http://localhost:8000/v1".to_owned(),
+            models: HashMap::from([("model".to_owned(), "model".to_owned())]),
+            ..NodeConfig::default()
+        };
+        let mut settings = Settings {
+            nodes: vec![node],
+            ..Settings::default()
+        };
+        settings.circuit_breaker.failure_threshold = 0;
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn validates_vllm_provider_endpoints() {
+        let mut node = NodeConfig {
+            id: "vllm".to_owned(),
+            base_url: "http://localhost:8000/v1".to_owned(),
+            models: HashMap::from([("model".to_owned(), "model".to_owned())]),
+            ..NodeConfig::default()
+        };
+        node.provider.kind = ProviderKind::Vllm;
+        node.provider.kv_events = Some(VllmKvEventsConfig::default());
+        let settings = Settings {
+            nodes: vec![node.clone()],
+            ..Settings::default()
+        };
+        settings.validate().unwrap();
+
+        node.provider.kv_events.as_mut().unwrap().endpoint = "tcp://*:5557".to_owned();
+        let invalid = Settings {
+            nodes: vec![node],
+            ..Settings::default()
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn defaults_waiting_watermark_for_existing_vllm_json() {
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "type": "vllm"
+        }))
+        .unwrap();
+        assert_eq!(provider.waiting_threshold, 8);
+    }
+
+    #[test]
+    fn rejects_zero_vllm_waiting_watermark() {
+        let mut node = NodeConfig {
+            id: "vllm".to_owned(),
+            base_url: "http://localhost:8000/v1".to_owned(),
+            models: HashMap::from([("model".to_owned(), "model".to_owned())]),
+            ..NodeConfig::default()
+        };
+        node.provider.kind = ProviderKind::Vllm;
+        node.provider.waiting_threshold = 0;
+        let settings = Settings {
+            nodes: vec![node],
+            ..Settings::default()
+        };
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_kv_events_on_generic_provider() {
+        let node = NodeConfig {
+            id: "generic".to_owned(),
+            base_url: "http://localhost:8000/v1".to_owned(),
+            models: HashMap::from([("model".to_owned(), "model".to_owned())]),
+            provider: ProviderConfig {
+                kv_events: Some(VllmKvEventsConfig::default()),
+                ..ProviderConfig::default()
+            },
+            ..NodeConfig::default()
+        };
+        let settings = Settings {
+            nodes: vec![node],
+            ..Settings::default()
+        };
+        assert!(settings.validate().is_err());
     }
 }

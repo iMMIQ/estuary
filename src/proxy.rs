@@ -119,12 +119,26 @@ pub async fn proxy(
     if is_inference_json && public_model.is_none() {
         return Err(GatewayError::MissingModel);
     }
-    let prefix_input = routing_text(
+    let streaming = parsed
+        .as_ref()
+        .and_then(|value| value.get("stream"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut prefix_input = routing_text(
         &endpoint,
         public_model.as_deref(),
         parsed.as_ref(),
         &state.settings.routing.prefix,
     );
+    if let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_ref()) {
+        if let Some(tokens) = state
+            .vllm
+            .tokenize_for_routing(&state.client, &endpoint, model, parsed)
+            .await
+        {
+            prefix_input.set_token_ids(tokens);
+        }
+    }
 
     proxy_with_retries(
         state,
@@ -137,6 +151,7 @@ pub async fn proxy(
             parsed_body: parsed,
             public_model,
             prefix_input,
+            streaming,
             request_id,
         },
     )
@@ -180,6 +195,7 @@ struct ProxyRequest {
     parsed_body: Option<Value>,
     public_model: Option<String>,
     prefix_input: PrefixInput,
+    streaming: bool,
     request_id: RequestId,
 }
 
@@ -209,6 +225,9 @@ async fn proxy_with_retries(
         state
             .metrics
             .observe_prefix_match(selection.prefix_match_chars);
+        state
+            .metrics
+            .observe_prefix_match_tokens(selection.prefix_match_tokens);
 
         let node = Arc::clone(&selection.node);
         let upstream_url = node
@@ -259,7 +278,9 @@ async fn proxy_with_retries(
                         &excluded,
                         node.id(),
                     );
-                node.record_passive_failure(error.to_string(), &state.settings.health);
+                selection
+                    .lease
+                    .record_failure(error.to_string(), &state.settings.health);
                 state.metrics.attempt(node.id(), "transport_error");
                 if retryable {
                     state.metrics.retry(node.id(), "connect_error");
@@ -271,10 +292,9 @@ async fn proxy_with_retries(
                 return Err(GatewayError::Upstream("transport failure".to_owned()));
             }
             Err(_) => {
-                node.record_passive_failure(
-                    "upstream response header timeout",
-                    &state.settings.health,
-                );
+                selection
+                    .lease
+                    .record_failure("upstream response header timeout", &state.settings.health);
                 state.metrics.attempt(node.id(), "header_timeout");
                 return Err(GatewayError::UpstreamTimeout);
             }
@@ -294,14 +314,12 @@ async fn proxy_with_retries(
         if status == StatusCode::TOO_MANY_REQUESTS
             || (configured_retry_status && !status.is_server_error())
         {
-            node.record_overload();
+            selection.lease.record_overload();
         } else if status.is_server_error() {
-            node.record_passive_failure(
+            selection.lease.record_failure(
                 format!("upstream returned {status}"),
                 &state.settings.health,
             );
-        } else {
-            node.record_request_success(header_latency);
         }
         state.metrics.attempt(node.id(), status.as_str());
 
@@ -325,6 +343,9 @@ async fn proxy_with_retries(
         let upstream_body_timeout =
             Duration::from_millis(state.settings.server.upstream_body_timeout_ms);
         if !status.is_success() {
+            if !status.is_server_error() && status != StatusCode::TOO_MANY_REQUESTS {
+                selection.lease.record_success(header_latency);
+            }
             return proxy_error_response(
                 response,
                 selection.lease,
@@ -333,14 +354,50 @@ async fn proxy_with_retries(
             )
             .await;
         }
+        if !request.streaming {
+            let buffered = buffered_success_response(
+                response,
+                &selection.lease,
+                &node,
+                state.scheduler.prefix_directory(),
+                &request.prefix_input,
+                &state.settings.health,
+                header_latency,
+                stream_idle_timeout,
+                upstream_body_timeout,
+                state.settings.server.max_non_streaming_response_bytes,
+                state.settings.server.expose_node_header,
+            )
+            .await;
+            match buffered {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    let retryable = attempt < state.settings.retry.max_attempts
+                        && has_untried_alternative(
+                            &state,
+                            request.public_model.as_deref(),
+                            &excluded,
+                            node.id(),
+                        );
+                    if retryable {
+                        state.metrics.retry(node.id(), "body_error");
+                        excluded.insert(node.id().to_owned());
+                        drop(selection.lease);
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
         return Ok(streaming_response(
             response,
             selection.lease,
-            node,
+            &node,
             Arc::clone(&state.metrics),
             Arc::clone(state.scheduler.prefix_directory()),
             request.prefix_input,
             state.settings.health.clone(),
+            header_latency,
             stream_idle_timeout,
             upstream_body_timeout,
             Duration::from_millis(state.settings.server.downstream_stall_timeout_ms),
@@ -382,15 +439,71 @@ fn mapped_body(
         .map_err(|_| GatewayError::Internal)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn buffered_success_response(
+    upstream: reqwest::Response,
+    lease: &NodeLease,
+    node: &Node,
+    prefix_directory: &crate::prefix::PrefixDirectory,
+    prefix_input: &PrefixInput,
+    health_config: &crate::config::HealthConfig,
+    header_latency: Duration,
+    stream_idle_timeout: Duration,
+    upstream_body_timeout: Duration,
+    max_body_bytes: usize,
+    expose_node_header: bool,
+) -> Result<Response, GatewayError> {
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    let upstream_request_id = headers.get("x-request-id").cloned();
+    let body = match read_limited(
+        upstream,
+        max_body_bytes,
+        stream_idle_timeout,
+        upstream_body_timeout,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(error) => {
+            lease.record_failure(
+                format!("non-streaming upstream body failed: {error}"),
+                health_config,
+            );
+            return Err(error);
+        }
+    };
+    lease.record_success(header_latency);
+    prefix_directory.record(node.id(), prefix_input);
+
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    copy_response_headers(&headers, response.headers_mut());
+    if let Some(value) = upstream_request_id {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-upstream-request-id"), value);
+    }
+    if expose_node_header {
+        if let Ok(value) = HeaderValue::from_str(node.id()) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("x-gateway-node"), value);
+        }
+    }
+    Ok(response)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn streaming_response(
     upstream: reqwest::Response,
     lease: NodeLease,
-    node: Arc<Node>,
+    node: &Node,
     metrics: Arc<Metrics>,
     prefix_directory: Arc<crate::prefix::PrefixDirectory>,
     prefix_input: PrefixInput,
     health_config: crate::config::HealthConfig,
+    header_latency: Duration,
     stream_idle_timeout: Duration,
     upstream_body_timeout: Duration,
     downstream_stall_timeout: Duration,
@@ -407,7 +520,12 @@ fn streaming_response(
     let pump_failure = Arc::clone(&terminal_failure);
 
     tokio::spawn(async move {
-        let mut guard = BodyGuard::new(lease, Arc::clone(&metrics), stream_node_id.clone());
+        let mut guard = BodyGuard::new(
+            lease,
+            Arc::clone(&metrics),
+            stream_node_id.clone(),
+            header_latency,
+        );
         let mut body = upstream.bytes_stream();
         let mut indexed = false;
         let mut received_body_bytes = 0_u64;
@@ -426,7 +544,6 @@ fn streaming_response(
                 () = tokio::time::sleep_until(body_deadline) => {
                     fail_response_stream(
                         &pump_failure,
-                        &node,
                         &health_config,
                         &mut guard,
                         StreamFailure::timed_out("upstream response body total timeout"),
@@ -453,7 +570,6 @@ fn streaming_response(
                 () = tokio::time::sleep_until(body_deadline) => {
                     fail_response_stream(
                         &pump_failure,
-                        &node,
                         &health_config,
                         &mut guard,
                         StreamFailure::timed_out("upstream response body total timeout"),
@@ -464,7 +580,6 @@ fn streaming_response(
                     let Ok(item) = result else {
                         fail_response_stream(
                             &pump_failure,
-                            &node,
                             &health_config,
                             &mut guard,
                             StreamFailure::timed_out(
@@ -494,7 +609,6 @@ fn streaming_response(
                 Some(Err(error)) => {
                     fail_response_stream(
                         &pump_failure,
-                        &node,
                         &health_config,
                         &mut guard,
                         StreamFailure::upstream(error.to_string()),
@@ -577,38 +691,49 @@ impl StreamFailure {
 
 fn fail_response_stream(
     terminal_failure: &parking_lot::Mutex<Option<StreamFailure>>,
-    node: &Node,
     health_config: &crate::config::HealthConfig,
     guard: &mut BodyGuard,
     failure: StreamFailure,
 ) {
-    node.record_passive_failure(failure.message.clone(), health_config);
+    guard.failed(failure.message.clone(), health_config);
     *terminal_failure.lock() = Some(failure);
-    guard.failed();
 }
 
 struct BodyGuard {
-    _lease: Option<NodeLease>,
+    lease: Option<NodeLease>,
     metrics: Arc<Metrics>,
     node_id: String,
+    header_latency: Duration,
     terminal: bool,
 }
 
 impl BodyGuard {
-    fn new(lease: NodeLease, metrics: Arc<Metrics>, node_id: String) -> Self {
+    fn new(
+        lease: NodeLease,
+        metrics: Arc<Metrics>,
+        node_id: String,
+        header_latency: Duration,
+    ) -> Self {
         Self {
-            _lease: Some(lease),
+            lease: Some(lease),
             metrics,
             node_id,
+            header_latency,
             terminal: false,
         }
     }
 
     fn completed(&mut self) {
+        if let Some(lease) = &self.lease {
+            lease.record_success(self.header_latency);
+        }
         self.terminal = true;
     }
 
-    fn failed(&mut self) {
+    fn failed(&mut self, message: String, health_config: &crate::config::HealthConfig) {
+        if let Some(lease) = &self.lease {
+            lease.record_failure(message, health_config);
+        }
         self.metrics.stream_error(&self.node_id);
         self.terminal = true;
     }

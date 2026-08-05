@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicU64};
 
 use anyhow::Result;
 use prometheus_client::{
@@ -12,7 +12,10 @@ use prometheus_client::{
     registry::Registry,
 };
 
-use crate::{node::HealthState, scheduler::Scheduler};
+use crate::{
+    node::{CircuitState, HealthState, LifecycleState, ProviderState},
+    scheduler::Scheduler,
+};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
 struct RequestLabels {
@@ -41,14 +44,25 @@ pub struct Metrics {
     stream_errors: Family<NodeLabels, Counter>,
     node_active: Family<NodeLabels, Gauge>,
     node_health: Family<NodeLabels, Gauge>,
+    node_accepting_requests: Family<NodeLabels, Gauge>,
+    node_circuit_state: Family<NodeLabels, Gauge>,
+    node_provider_ready: Family<NodeLabels, Gauge>,
+    node_provider_state: Family<NodeLabels, Gauge>,
+    node_upstream_running: Family<NodeLabels, Gauge>,
+    node_upstream_waiting: Family<NodeLabels, Gauge>,
+    node_kv_cache_usage: Family<NodeLabels, Gauge<f64, AtomicU64>>,
+    node_exact_kv_blocks: Family<NodeLabels, Gauge>,
+    node_exact_kv_ready: Family<NodeLabels, Gauge>,
     queue_requests: Gauge,
     queue_bytes: Gauge,
     request_duration: Histogram,
     queue_duration: Histogram,
     prefix_match_chars: Histogram,
+    prefix_match_tokens: Histogram,
 }
 
 impl Metrics {
+    #[allow(clippy::too_many_lines)]
     pub fn new() -> Arc<Self> {
         let requests = Family::default();
         let attempts = Family::default();
@@ -57,11 +71,21 @@ impl Metrics {
         let stream_errors = Family::default();
         let node_active = Family::default();
         let node_health = Family::default();
+        let node_accepting_requests = Family::default();
+        let node_circuit_state = Family::default();
+        let node_provider_ready = Family::default();
+        let node_provider_state = Family::default();
+        let node_upstream_running = Family::default();
+        let node_upstream_waiting = Family::default();
+        let node_kv_cache_usage = Family::<NodeLabels, Gauge<f64, AtomicU64>>::default();
+        let node_exact_kv_blocks = Family::default();
+        let node_exact_kv_ready = Family::default();
         let queue_requests = Gauge::default();
         let queue_bytes = Gauge::default();
         let request_duration = Histogram::new(exponential_buckets(0.005, 2.0, 18));
         let queue_duration = Histogram::new(exponential_buckets(0.001, 2.0, 16));
         let prefix_match_chars = Histogram::new(exponential_buckets(128.0, 2.0, 14));
+        let prefix_match_tokens = Histogram::new(exponential_buckets(16.0, 2.0, 16));
 
         let mut registry = Registry::with_prefix("estuary");
         registry.register(
@@ -100,18 +124,63 @@ impl Metrics {
             node_health.clone(),
         );
         registry.register(
+            "node_accepting_requests",
+            "Whether a node is serving, healthy, provider-compatible, and accepted by its circuit breaker.",
+            node_accepting_requests.clone(),
+        );
+        registry.register(
+            "node_circuit_state",
+            "Circuit breaker state: closed=0, open=1, half_open=2.",
+            node_circuit_state.clone(),
+        );
+        registry.register(
+            "node_provider_ready",
+            "Whether provider-specific compatibility checks permit routing to the node.",
+            node_provider_ready.clone(),
+        );
+        registry.register(
+            "node_provider_state",
+            "Provider compatibility state: generic=0, checking=1, ready=2, incompatible=3.",
+            node_provider_state.clone(),
+        );
+        registry.register(
+            "node_upstream_running",
+            "Latest fresh vLLM running-request gauge by node.",
+            node_upstream_running.clone(),
+        );
+        registry.register(
+            "node_upstream_waiting",
+            "Latest fresh vLLM waiting-request gauge by node.",
+            node_upstream_waiting.clone(),
+        );
+        registry.register(
+            "node_kv_cache_usage_ratio",
+            "Latest vLLM KV-cache usage ratio by node.",
+            node_kv_cache_usage.clone(),
+        );
+        registry.register(
+            "node_exact_kv_blocks",
+            "vLLM KV blocks represented in the exact routing directory.",
+            node_exact_kv_blocks.clone(),
+        );
+        registry.register(
+            "node_exact_kv_ready",
+            "Whether the node's exact vLLM KV event directory is currently usable.",
+            node_exact_kv_ready.clone(),
+        );
+        registry.register(
             "queue_requests",
-            "Current requests waiting for an upstream concurrency permit.",
+            "Current requests waiting for queue admission or an upstream concurrency permit.",
             queue_requests.clone(),
         );
         registry.register(
             "queue_bytes",
-            "Reserved raw request-body bytes for requests waiting in the queue.",
+            "KiB-rounded request-body bytes held by all queued requests.",
             queue_bytes.clone(),
         );
         registry.register(
             "request_duration_seconds",
-            "Time from gateway admission to upstream response headers.",
+            "Time from gateway admission to downstream response creation; includes the full buffered body for non-streaming successes.",
             request_duration.clone(),
         );
         registry.register(
@@ -124,6 +193,11 @@ impl Metrics {
             "Longest approximate cached prompt prefix selected, in canonical characters.",
             prefix_match_chars.clone(),
         );
+        registry.register(
+            "prefix_match_tokens",
+            "Longest exact vLLM cached prompt prefix selected, in tokens.",
+            prefix_match_tokens.clone(),
+        );
 
         Arc::new(Self {
             registry,
@@ -134,11 +208,21 @@ impl Metrics {
             stream_errors,
             node_active,
             node_health,
+            node_accepting_requests,
+            node_circuit_state,
+            node_provider_ready,
+            node_provider_state,
+            node_upstream_running,
+            node_upstream_waiting,
+            node_kv_cache_usage,
+            node_exact_kv_blocks,
+            node_exact_kv_ready,
             queue_requests,
             queue_bytes,
             request_duration,
             queue_duration,
             prefix_match_chars,
+            prefix_match_tokens,
         })
     }
 
@@ -197,6 +281,10 @@ impl Metrics {
         self.prefix_match_chars.observe(chars as f64);
     }
 
+    pub fn observe_prefix_match_tokens(&self, tokens: usize) {
+        self.prefix_match_tokens.observe(tokens as f64);
+    }
+
     pub fn encode(&self, scheduler: &Scheduler) -> Result<String> {
         for node in scheduler.nodes() {
             let labels = NodeLabels {
@@ -212,6 +300,54 @@ impl Metrics {
                 HealthState::Unhealthy => 3,
             };
             self.node_health.get_or_create(&labels).set(health);
+            let snapshot = node.snapshot();
+            self.node_accepting_requests
+                .get_or_create(&labels)
+                .set(i64::from(
+                    snapshot.lifecycle == LifecycleState::Serving && node.is_routable(),
+                ));
+            let circuit = match snapshot.circuit {
+                CircuitState::Closed => 0,
+                CircuitState::Open => 1,
+                CircuitState::HalfOpen => 2,
+            };
+            self.node_circuit_state.get_or_create(&labels).set(circuit);
+            self.node_provider_ready
+                .get_or_create(&labels)
+                .set(i64::from(node.provider_is_ready()));
+            let provider_state = match snapshot.provider_state {
+                ProviderState::Generic => 0,
+                ProviderState::Checking => 1,
+                ProviderState::Ready => 2,
+                ProviderState::Incompatible => 3,
+            };
+            self.node_provider_state
+                .get_or_create(&labels)
+                .set(provider_state);
+            self.node_upstream_running.get_or_create(&labels).set(
+                snapshot
+                    .upstream_running
+                    .unwrap_or_default()
+                    .try_into()
+                    .unwrap_or(i64::MAX),
+            );
+            self.node_upstream_waiting.get_or_create(&labels).set(
+                snapshot
+                    .upstream_waiting
+                    .unwrap_or_default()
+                    .try_into()
+                    .unwrap_or(i64::MAX),
+            );
+            self.node_kv_cache_usage
+                .get_or_create(&labels)
+                .set(snapshot.kv_cache_usage.unwrap_or_default());
+            let cache = scheduler.exact_cache_directory().snapshot(node.id());
+            self.node_exact_kv_blocks
+                .get_or_create(&labels)
+                .set(cache.blocks.try_into().unwrap_or(i64::MAX));
+            self.node_exact_kv_ready
+                .get_or_create(&labels)
+                .set(i64::from(cache.authoritative));
         }
         let (queued_requests, queued_bytes) = scheduler.queue_snapshot();
         self.queue_requests
@@ -221,5 +357,33 @@ impl Metrics {
         let mut output = String::new();
         encode(&mut output, &self.registry)?;
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::{
+        config::{NodeConfig, RoutingConfig},
+        node::Node,
+    };
+
+    use super::*;
+
+    #[test]
+    fn encodes_provider_and_exact_cache_metrics() {
+        let node = Node::from_config(&NodeConfig {
+            id: "node".to_owned(),
+            base_url: "http://node.invalid/v1".to_owned(),
+            models: HashMap::from([("model".to_owned(), "model".to_owned())]),
+            ..NodeConfig::default()
+        })
+        .unwrap();
+        let scheduler = Scheduler::new(vec![node], RoutingConfig::default());
+        let output = Metrics::new().encode(&scheduler).unwrap();
+        assert!(output.contains("estuary_node_provider_ready"));
+        assert!(output.contains("estuary_node_exact_kv_blocks"));
+        assert!(output.contains("estuary_node_kv_cache_usage_ratio"));
     }
 }

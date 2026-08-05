@@ -1,24 +1,41 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::Path as FsPath, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request, State},
-    http::{HeaderValue, StatusCode},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    http::{
+        HeaderValue, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE},
+    },
     middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::{any, get},
+    response::{IntoResponse, Redirect, Response},
+    routing::{any, get, put},
 };
 use reqwest::redirect::Policy;
+use rust_embed::RustEmbed;
+use serde::Deserialize;
 use serde_json::json;
-use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex as AsyncMutex, watch},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    Settings, error::GatewayError, health::run_health_monitor, metrics::Metrics, node::Node, proxy,
+    Settings,
+    config::{NodeConfig, validate_node_config},
+    error::GatewayError,
+    health::{preflight_health, run_health_monitor},
+    metrics::Metrics,
+    node::Node,
+    proxy,
     scheduler::Scheduler,
+    store::{NodeStore, StoredNode},
+    vllm::{VllmManager, preflight_vllm},
 };
 
 #[derive(Clone, Debug)]
@@ -29,20 +46,42 @@ pub struct AppState {
     pub(crate) scheduler: Arc<Scheduler>,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) settings: Arc<Settings>,
+    pub(crate) vllm: Arc<VllmManager>,
+    pub(crate) store: Arc<NodeStore>,
+    admin_mutation: AsyncMutex<()>,
 }
 
 pub struct Gateway {
     state: Arc<AppState>,
 }
 
+#[derive(RustEmbed)]
+#[folder = "web/dist"]
+struct AdminAssets;
+
 impl Gateway {
     pub fn build(settings: Settings) -> Result<Self> {
+        let store = NodeStore::memory()?;
+        store.seed_if_empty(&settings.nodes)?;
+        Self::build_with_store(settings, store)
+    }
+
+    pub fn build_with_database(settings: Settings, path: impl AsRef<FsPath>) -> Result<Self> {
+        let store = NodeStore::open(path)?;
+        Self::build_with_store(settings, store)
+    }
+
+    fn build_with_store(settings: Settings, store: Arc<NodeStore>) -> Result<Self> {
         settings.validate()?;
-        let nodes = settings
-            .nodes
-            .iter()
-            .map(|config| {
-                Node::from_config_with_startup_policy(config, settings.health.route_while_starting)
+        let nodes = store
+            .list()?
+            .into_iter()
+            .map(|stored| {
+                Node::from_config_with_policies(
+                    &stored.config,
+                    settings.health.route_while_starting,
+                    settings.circuit_breaker.clone(),
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         let client = reqwest::Client::builder()
@@ -53,13 +92,17 @@ impl Gateway {
             .user_agent(concat!("estuary/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("failed to build upstream HTTP client")?;
-        let scheduler = Arc::new(Scheduler::new(nodes, settings.routing.clone()));
+        let scheduler = Arc::new(Scheduler::new(nodes.clone(), settings.routing.clone()));
+        let vllm = VllmManager::new(Arc::clone(&scheduler));
         Ok(Self {
             state: Arc::new(AppState {
                 client,
                 scheduler,
                 metrics: Metrics::new(),
                 settings: Arc::new(settings),
+                vllm,
+                store,
+                admin_mutation: AsyncMutex::new(()),
             }),
         })
     }
@@ -82,10 +125,27 @@ impl Gateway {
 
     pub fn admin_router(&self) -> Router {
         Router::new()
+            .route("/", get(admin_redirect))
+            .route("/admin", get(admin_redirect))
+            .route("/admin/", get(admin_index))
             .route("/health/live", get(live))
             .route("/health/ready", get(ready))
             .route("/metrics", get(metrics))
             .route("/admin/nodes", get(nodes))
+            .route("/admin/api/nodes", get(admin_nodes).post(create_node))
+            .route(
+                "/admin/api/nodes/{node}",
+                get(admin_node).put(update_node).delete(delete_node),
+            )
+            .route(
+                "/admin/nodes/{node}/drain",
+                put(drain_node).delete(resume_node),
+            )
+            .route(
+                "/admin/api/nodes/{node}/drain",
+                put(drain_node).delete(resume_node),
+            )
+            .route("/admin/{*asset}", get(admin_asset))
             .fallback(proxy::not_found)
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&self.state),
@@ -109,13 +169,16 @@ impl Gateway {
 
         let cancellation = CancellationToken::new();
         let (health_shutdown, health_receiver) = watch::channel(false);
+        let (provider_shutdown, provider_receiver) = watch::channel(false);
         let health_handle = tokio::spawn(run_health_monitor(
             self.state.client.clone(),
-            self.state.scheduler.nodes().to_vec(),
             Arc::clone(&self.state.scheduler),
             self.state.settings.health.clone(),
             health_receiver,
         ));
+        let provider_handle = tokio::spawn(
+            Arc::clone(&self.state.vllm).run(self.state.client.clone(), provider_receiver),
+        );
 
         let public_router = self.public_router();
         let admin_router = self.admin_router();
@@ -153,8 +216,11 @@ impl Gateway {
             }
         }
 
+        self.state.scheduler.drain_all();
+        info!("all upstream nodes are draining");
         cancellation.cancel();
         let _ = health_shutdown.send(true);
+        let _ = provider_shutdown.send(true);
         let shutdown_grace = Duration::from_millis(self.state.settings.server.shutdown_grace_ms);
         if !public_done {
             if let Err(error) = finish_server("public", &mut public_handle, shutdown_grace).await {
@@ -168,6 +234,9 @@ impl Gateway {
         }
         if let Err(error) = health_handle.await {
             error!(error = %error, "health monitor task failed");
+        }
+        if let Err(error) = provider_handle.await {
+            error!(error = %error, "vLLM provider monitor task failed");
         }
         if let Some(error) = first_error {
             return Err(error);
@@ -268,8 +337,53 @@ fn metric_endpoint(path: &str) -> &'static str {
         "/health/ready" => "health_ready",
         "/metrics" => "metrics",
         "/admin/nodes" => "admin_nodes",
+        path if path.starts_with("/admin/nodes/") && path.ends_with("/drain") => "admin_node_drain",
         _ => "other",
     }
+}
+
+async fn admin_redirect() -> Redirect {
+    Redirect::temporary("/admin/")
+}
+
+async fn admin_index() -> Response {
+    embedded_admin_response("index.html", false)
+}
+
+async fn admin_asset(Path(asset): Path<String>) -> Response {
+    if AdminAssets::get(&asset).is_some() {
+        return embedded_admin_response(&asset, asset.starts_with("assets/"));
+    }
+    if !asset.rsplit('/').next().unwrap_or_default().contains('.') {
+        return embedded_admin_response("index.html", false);
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+fn embedded_admin_response(path: &str, immutable: bool) -> Response {
+    let Some(asset) = AdminAssets::get(path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let content_type = mime_guess::from_path(path).first_or_octet_stream();
+    let cache_control = if immutable {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-store"
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type.as_ref())
+        .header(CACHE_CONTROL, cache_control)
+        .header("x-content-type-options", "nosniff")
+        .header("x-frame-options", "DENY")
+        .header("referrer-policy", "no-referrer")
+        .header("permissions-policy", "camera=(), microphone=(), geolocation=()")
+        .header(
+            CONTENT_SECURITY_POLICY,
+            "default-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+        )
+        .body(axum::body::Body::from(asset.data.into_owned()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn live() -> Json<serde_json::Value> {
@@ -314,9 +428,385 @@ async fn nodes(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
             .scheduler
             .nodes()
             .iter()
-            .map(|node| node.snapshot())
+            .map(|node| {
+                let mut snapshot = json!(node.snapshot());
+                let cache = state.scheduler.exact_cache_directory().snapshot(node.id());
+                snapshot["exact_kv_authoritative"] = json!(cache.authoritative);
+                snapshot["exact_kv_blocks"] = json!(cache.blocks);
+                snapshot
+            })
             .collect::<Vec<_>>()
     }))
+}
+
+async fn admin_nodes(State(state): State<Arc<AppState>>) -> Response {
+    match state.store.list() {
+        Ok(nodes) => Json(json!({
+            "nodes": nodes
+                .into_iter()
+                .filter_map(|stored| {
+                    let node = state.scheduler.node(&stored.config.id)?;
+                    Some(admin_node_payload(&state, &stored, &node))
+                })
+                .collect::<Vec<_>>()
+        }))
+        .into_response(),
+        Err(error) => admin_internal_error("could not load node configurations", &error),
+    }
+}
+
+async fn admin_node(State(state): State<Arc<AppState>>, Path(node_id): Path<String>) -> Response {
+    let stored = match state.store.get(&node_id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return admin_node_not_found(&node_id),
+        Err(error) => return admin_internal_error("could not load node configuration", &error),
+    };
+    let Some(node) = state.scheduler.node(&node_id) else {
+        return admin_internal_message("node is persisted but missing from the runtime registry");
+    };
+    Json(admin_node_payload(&state, &stored, &node)).into_response()
+}
+
+fn admin_node_payload(state: &AppState, stored: &StoredNode, node: &Node) -> serde_json::Value {
+    let cache = state.scheduler.exact_cache_directory().snapshot(node.id());
+    json!({
+        "config": stored.config,
+        "revision": stored.revision,
+        "created_at_unix_ms": stored.created_at_unix_ms,
+        "updated_at_unix_ms": stored.updated_at_unix_ms,
+        "runtime": node.snapshot(),
+        "exact_kv_authoritative": cache.authoritative,
+        "exact_kv_blocks": cache.blocks,
+    })
+}
+
+async fn create_node(
+    State(state): State<Arc<AppState>>,
+    Json(config): Json<NodeConfig>,
+) -> Response {
+    let _mutation = state.admin_mutation.lock().await;
+    if state.scheduler.node(&config.id).is_some() {
+        return admin_conflict("node_already_exists", "a node with this id already exists");
+    }
+    let node = match prepare_node(&state, &config).await {
+        Ok(node) => node,
+        Err(error) => return admin_validation_error(&error),
+    };
+    if matches!(state.store.get(&config.id), Ok(Some(_))) {
+        return admin_conflict("node_already_exists", "a node with this id already exists");
+    }
+    let stored = match state.store.insert(&config) {
+        Ok(stored) => stored,
+        Err(error) => return admin_internal_error("could not persist node", &error),
+    };
+    if let Err(error) = state.scheduler.add_node(Arc::clone(&node)) {
+        let _ = state.store.delete(&config.id, Some(stored.revision));
+        return admin_internal_error("could not add node to runtime registry", &error);
+    }
+    (
+        StatusCode::CREATED,
+        Json(admin_node_payload(&state, &stored, &node)),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateNodeRequest {
+    revision: u64,
+    config: NodeConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct MutationQuery {
+    timeout_ms: Option<u64>,
+    revision: Option<u64>,
+}
+
+async fn update_node(
+    State(state): State<Arc<AppState>>,
+    Path(node_id): Path<String>,
+    Query(query): Query<MutationQuery>,
+    Json(request): Json<UpdateNodeRequest>,
+) -> Response {
+    let _mutation = state.admin_mutation.lock().await;
+    if request.config.id != node_id {
+        return admin_message(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "node_id_mismatch",
+            "the request path and config node id must match",
+        );
+    }
+    let stored = match state.store.get(&node_id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return admin_node_not_found(&node_id),
+        Err(error) => return admin_internal_error("could not load node configuration", &error),
+    };
+    if stored.revision != request.revision {
+        return admin_conflict(
+            "revision_conflict",
+            "the node changed after this editor loaded it; refresh and retry",
+        );
+    }
+    let Some(previous) = state.scheduler.node(&node_id) else {
+        return admin_internal_message("node is persisted but missing from the runtime registry");
+    };
+    let replacement = match prepare_node(&state, &request.config).await {
+        Ok(node) => node,
+        Err(error) => return admin_validation_error(&error),
+    };
+    let was_draining = previous.lifecycle() == crate::node::LifecycleState::Draining;
+    previous.set_draining(true);
+    let timeout = mutation_timeout(&state, query.timeout_ms);
+    if !state.scheduler.wait_for_node_idle(&previous, timeout).await {
+        return admin_conflict(
+            "node_still_active",
+            "the node is draining but still has active requests; retry the update later",
+        );
+    }
+    let updated = match state
+        .store
+        .update(&node_id, request.revision, &request.config)
+    {
+        Ok(Some(updated)) => updated,
+        Ok(None) => {
+            previous.set_draining(was_draining);
+            return admin_conflict(
+                "revision_conflict",
+                "the node changed while the update was being applied",
+            );
+        }
+        Err(error) => {
+            previous.set_draining(was_draining);
+            return admin_internal_error("could not persist node update", &error);
+        }
+    };
+    if let Err(error) = state.scheduler.replace_node(&replacement) {
+        return admin_internal_error("could not replace runtime node", &error);
+    }
+    Json(admin_node_payload(&state, &updated, &replacement)).into_response()
+}
+
+async fn delete_node(
+    State(state): State<Arc<AppState>>,
+    Path(node_id): Path<String>,
+    Query(query): Query<MutationQuery>,
+) -> Response {
+    let _mutation = state.admin_mutation.lock().await;
+    let stored = match state.store.get(&node_id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return admin_node_not_found(&node_id),
+        Err(error) => return admin_internal_error("could not load node configuration", &error),
+    };
+    if query
+        .revision
+        .is_some_and(|revision| revision != stored.revision)
+    {
+        return admin_conflict(
+            "revision_conflict",
+            "the node changed after this editor loaded it; refresh and retry",
+        );
+    }
+    let Some(node) = state.scheduler.node(&node_id) else {
+        return admin_internal_message("node is persisted but missing from the runtime registry");
+    };
+    let was_draining = node.lifecycle() == crate::node::LifecycleState::Draining;
+    node.set_draining(true);
+    if !state
+        .scheduler
+        .wait_for_node_idle(&node, mutation_timeout(&state, query.timeout_ms))
+        .await
+    {
+        return admin_conflict(
+            "node_still_active",
+            "the node is draining but still has active requests; retry deletion later",
+        );
+    }
+    match state.store.delete(&node_id, Some(stored.revision)) {
+        Ok(true) => {}
+        Ok(false) => {
+            node.set_draining(was_draining);
+            return admin_conflict(
+                "revision_conflict",
+                "the node changed while deletion was being applied",
+            );
+        }
+        Err(error) => {
+            node.set_draining(was_draining);
+            return admin_internal_error("could not delete persisted node", &error);
+        }
+    }
+    state.scheduler.remove_node(&node_id);
+    Json(json!({"deleted": true, "node": node_id})).into_response()
+}
+
+async fn prepare_node(state: &AppState, config: &NodeConfig) -> Result<Arc<Node>> {
+    validate_node_config(config)?;
+    let node = Node::from_config_with_policies(
+        config,
+        state.settings.health.route_while_starting,
+        state.settings.circuit_breaker.clone(),
+    )?;
+    preflight_vllm(&state.client, &node).await?;
+    preflight_health(&state.client, &node, &state.settings.health).await?;
+    Ok(node)
+}
+
+fn mutation_timeout(state: &AppState, timeout_ms: Option<u64>) -> Duration {
+    Duration::from_millis(
+        timeout_ms
+            .unwrap_or(state.settings.server.shutdown_grace_ms)
+            .min(3_600_000),
+    )
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct DrainQuery {
+    wait: bool,
+    timeout_ms: Option<u64>,
+}
+
+async fn drain_node(
+    State(state): State<Arc<AppState>>,
+    Path(node_id): Path<String>,
+    Query(query): Query<DrainQuery>,
+) -> Response {
+    let _mutation = state.admin_mutation.lock().await;
+    let mut stored = match state.store.get(&node_id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return admin_node_not_found(&node_id),
+        Err(error) => return admin_internal_error("could not load node configuration", &error),
+    };
+    stored.config.draining = true;
+    let stored = match state
+        .store
+        .update(&node_id, stored.revision, &stored.config)
+    {
+        Ok(Some(stored)) => stored,
+        Ok(None) => {
+            return admin_conflict(
+                "revision_conflict",
+                "the node changed while draining was being applied",
+            );
+        }
+        Err(error) => return admin_internal_error("could not persist draining state", &error),
+    };
+    let Some(node) = state.scheduler.set_node_draining(&node_id, true) else {
+        return admin_internal_message("node is persisted but missing from the runtime registry");
+    };
+    let drained = if query.wait {
+        let timeout_ms = query
+            .timeout_ms
+            .unwrap_or(state.settings.server.shutdown_grace_ms)
+            .min(3_600_000);
+        state
+            .scheduler
+            .wait_for_node_idle(&node, Duration::from_millis(timeout_ms))
+            .await
+    } else {
+        node.active() == 0
+    };
+    let status = if drained {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    (
+        status,
+        Json(json!({
+            "node": node.id(),
+            "lifecycle": node.lifecycle(),
+            "active": node.active(),
+            "drained": drained,
+            "revision": stored.revision,
+        })),
+    )
+        .into_response()
+}
+
+async fn resume_node(State(state): State<Arc<AppState>>, Path(node_id): Path<String>) -> Response {
+    let _mutation = state.admin_mutation.lock().await;
+    let mut stored = match state.store.get(&node_id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return admin_node_not_found(&node_id),
+        Err(error) => return admin_internal_error("could not load node configuration", &error),
+    };
+    stored.config.draining = false;
+    let stored = match state
+        .store
+        .update(&node_id, stored.revision, &stored.config)
+    {
+        Ok(Some(stored)) => stored,
+        Ok(None) => {
+            return admin_conflict(
+                "revision_conflict",
+                "the node changed while resume was being applied",
+            );
+        }
+        Err(error) => return admin_internal_error("could not persist serving state", &error),
+    };
+    let Some(node) = state.scheduler.set_node_draining(&node_id, false) else {
+        return admin_internal_message("node is persisted but missing from the runtime registry");
+    };
+    Json(json!({
+        "node": node.id(),
+        "lifecycle": node.lifecycle(),
+        "routable": node.is_routable(),
+        "revision": stored.revision,
+    }))
+    .into_response()
+}
+
+fn admin_node_not_found(node_id: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": {
+                "message": format!("node {node_id:?} does not exist"),
+                "type": "invalid_request_error",
+                "code": "node_not_found"
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn admin_validation_error(error: &anyhow::Error) -> Response {
+    admin_message(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "node_validation_failed",
+        &error.to_string(),
+    )
+}
+
+fn admin_conflict(code: &'static str, message: &'static str) -> Response {
+    admin_message(StatusCode::CONFLICT, code, message)
+}
+
+fn admin_internal_message(message: &'static str) -> Response {
+    error!(message, "admin runtime consistency error");
+    admin_message(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+}
+
+fn admin_internal_error(message: &'static str, error: &dyn std::fmt::Display) -> Response {
+    error!(error = %error, message, "admin operation failed");
+    admin_message(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+}
+
+fn admin_message(status: StatusCode, code: &'static str, message: &str) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "admin_error",
+                "code": code,
+            }
+        })),
+    )
+        .into_response()
 }
 
 async fn shutdown_signal() {

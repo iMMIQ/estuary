@@ -7,4 +7,14 @@
 !.cargo/**
 !src/
 !src/**
-!config.example.yaml
+!web/
+!web/package.json
+!web/bun.lock
+!web/bunfig.toml
+!web/index.html
+!web/tsconfig.json
+!web/tsconfig.app.json
+!web/tsconfig.node.json
+!web/vite.config.ts
+!web/src/
+!web/src/**

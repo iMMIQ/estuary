@@ -8,16 +8,28 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
-    #[arg(short, long, env = "ESTUARY_CONFIG", default_value = "config.yaml")]
-    config: PathBuf,
+    #[arg(long, env = "ESTUARY_DATABASE", default_value = "estuary.db")]
+    database: PathBuf,
+    #[arg(long, env = "ESTUARY_LISTEN", default_value = "0.0.0.0:8080")]
+    listen: String,
+    #[arg(long, env = "ESTUARY_ADMIN_LISTEN", default_value = "127.0.0.1:9090")]
+    admin_listen: String,
+    #[arg(long, env = "ESTUARY_LOG_JSON", default_value_t = false)]
+    log_json: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let settings = Settings::load(&cli.config)?;
-    init_tracing(settings.server.log_json);
-    Gateway::build(settings)?.run().await
+    let mut settings = Settings::default();
+    settings.server.listen = cli.listen;
+    settings.server.admin_listen = cli.admin_listen;
+    settings.server.log_json = cli.log_json;
+    settings.validate()?;
+    init_tracing(cli.log_json);
+    Gateway::build_with_database(settings, cli.database)?
+        .run()
+        .await
 }
 
 fn init_tracing(json: bool) {

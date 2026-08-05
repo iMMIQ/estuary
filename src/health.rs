@@ -3,6 +3,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::{Context, Result, bail};
 use futures_util::future::join_all;
 use reqwest::Client;
 use tokio::{sync::watch, time::MissedTickBehavior};
@@ -12,7 +13,6 @@ use crate::{config::HealthConfig, node::Node, scheduler::Scheduler};
 
 pub async fn run_health_monitor(
     client: Client,
-    nodes: Vec<Arc<Node>>,
     scheduler: Arc<Scheduler>,
     config: HealthConfig,
     mut shutdown: watch::Receiver<bool>,
@@ -22,7 +22,7 @@ pub async fn run_health_monitor(
         .unwrap_or_default()
         .as_nanos()
         .to_le_bytes();
-    probe_all(&client, &nodes, &scheduler, &config, &jitter_seed).await;
+    probe_all(&client, &scheduler, &config, &jitter_seed).await;
     let mut interval = tokio::time::interval(config.interval());
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     interval.tick().await;
@@ -35,7 +35,7 @@ pub async fn run_health_monitor(
                 }
             }
             _ = interval.tick() => {
-                probe_all(&client, &nodes, &scheduler, &config, &jitter_seed).await;
+                probe_all(&client, &scheduler, &config, &jitter_seed).await;
             },
         }
     }
@@ -43,11 +43,11 @@ pub async fn run_health_monitor(
 
 async fn probe_all(
     client: &Client,
-    nodes: &[Arc<Node>],
     scheduler: &Scheduler,
     config: &HealthConfig,
     jitter_seed: &[u8; 16],
 ) {
+    let nodes = scheduler.nodes();
     join_all(nodes.iter().map(|node| async move {
         let delay = probe_jitter(node.id(), config, jitter_seed);
         if !delay.is_zero() {
@@ -107,4 +107,30 @@ async fn probe(client: &Client, node: &Arc<Node>, config: &HealthConfig) {
             warn!(node = node.id(), error = %error, "health probe failed");
         }
     }
+}
+
+pub async fn preflight_health(
+    client: &Client,
+    node: &Arc<Node>,
+    config: &HealthConfig,
+) -> Result<()> {
+    let mut request = client
+        .get(node.health_url().clone())
+        .timeout(config.timeout());
+    for (name, value) in node.headers() {
+        request = request.header(name, value);
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("health check for node {:?} failed", node.id()))?;
+    if !response.status().is_success() {
+        bail!(
+            "health check for node {:?} returned {}",
+            node.id(),
+            response.status()
+        );
+    }
+    node.record_probe_success(config);
+    Ok(())
 }

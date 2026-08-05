@@ -2,7 +2,7 @@
 
 `estuary` is a Rust gateway for a pool of OpenAI-compatible LLM servers. It exposes a stable OpenAI-style endpoint, rewrites public model names to node-specific names, enforces per-node concurrency, and selects a healthy node using current load, recent latency/error signals, and approximate prompt-prefix locality.
 
-This repository is the phase-one foundation. It deliberately does not yet implement client API-key management, tenant quotas or priorities, durable Responses state, or the Anthropic/Claude protocol.
+This repository contains the phase-one gateway foundation plus a native vLLM provider for vLLM 0.25 and newer. It deliberately does not yet implement client API-key management, tenant quotas or priorities, durable Responses state, or the Anthropic/Claude protocol.
 
 ## Supported API surface
 
@@ -38,26 +38,26 @@ Upstream credentials are configured independently per node through environment-v
 
 ### Concurrency limits are process-local
 
-`max_concurrency` is a hard limit for each node within one gateway process. Its permit is held while an independent pump reads the upstream body into a one-chunk bounded buffer, and is released on upstream EOF, error, configured timeout, or client cancellation. A client that stops draining the buffer cannot hold a node slot beyond `downstream_stall_timeout_ms`. With `N` active-active gateway replicas, a node can receive up to `N * max_concurrency` requests.
+`max_concurrency` is a hard limit for each node within one gateway process. Streaming responses use an independent one-chunk bounded pump; non-streaming successes are buffered up to `max_non_streaming_response_bytes` before downstream commit. The permit is released on upstream EOF, error, configured timeout, or client cancellation. A client that stops draining a stream cannot hold a node slot beyond `downstream_stall_timeout_ms`. With `N` active-active gateway replicas, a node can receive up to `N * max_concurrency` requests.
 
 Use one active gateway instance in phase one. If multiple active instances are required, divide each node's total budget among the instances and accept that each instance has independent queue and prefix state. A distributed lease service is required for a strict fleet-wide limit.
 
-### Prefix locality is approximate
+### Prefix locality and vLLM
 
-The gateway does not receive real KV-cache events from generic OpenAI-compatible servers. Following vLLM Router's cache-aware policy, it stores canonical prompt material in an in-memory multi-tenant radix tree and estimates which node handled the longest matching character prefix:
+For generic OpenAI-compatible servers, the gateway stores canonical prompt material in an in-memory multi-tenant radix tree and estimates which node handled the longest matching character prefix:
 
 - it improves repeated-system-prompt and multi-turn locality;
 - it never bypasses model, health, or concurrency checks;
 - it switches completely to load-first routing when both configured load-imbalance thresholds are exceeded;
 - it is lost on restart and can differ from the server's real tokenizer or cache eviction state.
 
-For exact KV-aware routing, a later provider adapter must consume server-specific cache events or metrics.
+Nodes configured with `provider.type: vllm` are version-gated to vLLM 0.25.0 or newer. Estuary scrapes native running, waiting, and KV-use metrics; calls `/tokenize` for Chat Completions and string Completions; and consumes vLLM's ZMQ KV events. Exact token-block matches take precedence over the character estimate. A missing metric, tokenize failure, event disconnect, sequence gap, or unsupported request shape degrades safely to local load and approximate affinity instead of blocking inference.
 
 ### Retry semantics
 
-Retries are limited to configured statuses and connection failures, use a different eligible node, and stop at `retry.max_attempts`. Once a successful response body is returned to the client, a stream is never switched or spliced.
+Retries are limited to configured statuses, connection failures, and failed or invalid non-streaming success bodies. They use a different eligible node and stop at `retry.max_attempts`. Non-streaming success bodies are committed atomically; streaming responses are fixed to one node as soon as successful response headers arrive and are never switched or spliced.
 
-The default `max_attempts: 1` never replays a generation inside the gateway. Setting it above one explicitly selects at-least-once behavior: a retry after an upstream status can duplicate work or billing, and client SDK retries can multiply gateway retries. Forwarded idempotency headers help only when the upstream nodes share an implementation that honors them.
+The default `max_attempts: 1` never replays a generation inside the gateway. Setting it above one explicitly selects at-least-once upstream execution: atomic downstream delivery prevents mixed or partial non-streaming responses, but a retry after an upstream status or body failure can still duplicate model work or billing. Client SDK retries can multiply gateway retries. Forwarded idempotency headers help only when the upstream nodes share an implementation that honors them.
 
 ## Scheduling model
 
@@ -66,12 +66,15 @@ The implementation-level request flow, scoring formula, state transitions, and p
 For each request the gateway:
 
 1. filters nodes by model mapping, exclusion set, and health;
-2. detects load imbalance using the configured absolute and relative active-request thresholds;
-3. while balanced, prefers the radix-tree owner only when the longest-prefix match ratio exceeds `prefix.cache_threshold`; otherwise it uses the load/latency/error score;
-4. tries candidates in score order and atomically acquires a node permit;
-5. if every eligible node is full, waits in a request-count and byte-bounded queue until capacity is released or `queue_timeout_ms` expires.
+2. holds a vLLM node out of admission while fresh `waiting` telemetry is at or above its `provider.waiting_threshold`;
+3. detects load imbalance using the configured absolute and relative active-request thresholds;
+4. while balanced, prefers the radix-tree owner only when the longest-prefix match ratio exceeds `prefix.cache_threshold`; otherwise it uses the load/latency/error score;
+5. tries candidates in score order and atomically acquires a node permit;
+6. if every eligible node is full or above the vLLM waiting watermark, keeps the request pending until capacity becomes available or the client disconnects.
 
-Queued requests register in each eligible node semaphore's FIFO wait list. A newly arriving fast-path request cannot take a permit already assigned to an older waiter, while requests for independent model pools do not share a global head-of-line lock. Queue admission failures return `429` with `Retry-After`. No healthy node returns `503`. Upstream transport/protocol failures return `502`, and the upstream response-header timeout returns `504`. Errors generated by the gateway use the OpenAI `{"error": {...}}` envelope.
+Queued requests use one scheduling class and register in each eligible node semaphore's FIFO wait list. A newly arriving fast-path request cannot take a permit already assigned to an older waiter, while requests for independent model pools do not share a global head-of-line lock. The count and byte limits bound how many requests simultaneously register with node semaphores; excess requests wait for queue admission instead of receiving a gateway-generated `429`. No healthy node returns `503`. Upstream transport/protocol failures return `502`, and the upstream response-header timeout returns `504`. Errors generated by the gateway use the OpenAI `{"error": {...}}` envelope.
+
+Each node also has an independent circuit breaker. Consecutive transport, 5xx, or upstream-body failures open it and remove the node from routing. After `open_ms`, a bounded number of real inference requests enter half-open state; the configured success streak closes the circuit, while any half-open failure reopens it. Upstream `429` is treated as load pressure rather than a circuit failure.
 
 ## Quick start
 
@@ -80,13 +83,14 @@ Rust 1.85 or newer is required.
 This repository routes Cargo's crates.io sparse index and crate downloads through the USTC mirror in [`.cargo/config.toml`](.cargo/config.toml). CI also uses USTC's Rust distribution mirror, and the runtime image installs Debian packages from USTC.
 
 ```bash
-cp config.example.yaml config.yaml
-export UPSTREAM_A_API_KEY='replace-me'
-export UPSTREAM_B_API_KEY='replace-me'
-cargo run --release -- --config config.yaml
+mkdir -p data
+cargo run --release -- \
+  --database ./data/estuary.db \
+  --listen 0.0.0.0:8080 \
+  --admin-listen 127.0.0.1:9090
 ```
 
-The config path can also be supplied with `ESTUARY_CONFIG`. Logging is controlled with `RUST_LOG`; `server.log_json` selects JSON or compact formatting.
+Open `http://127.0.0.1:9090/admin/` and add the first upstream. The process starts normally with an empty database; readiness remains `503` until a routable node exists. `ESTUARY_DATABASE`, `ESTUARY_LISTEN`, `ESTUARY_ADMIN_LISTEN`, and `ESTUARY_LOG_JSON` are the environment-variable equivalents. Logging filters use `RUST_LOG`.
 
 Check the model catalog:
 
@@ -134,49 +138,37 @@ curl -sS http://127.0.0.1:8080/v1/responses \
 
 For a streaming Response, add `"stream": true` and use `curl -N`. The gateway forwards upstream SSE bytes and unknown events without rebuilding them.
 
-## Configuration
+## Configuration and persistence
 
-Configuration is strict YAML: unknown fields and invalid values stop startup. It is loaded once; changing the file requires a restart. See [`config.example.yaml`](config.example.yaml) for every available field.
+SQLite is the only node-configuration source. The schema is initialized automatically, uses WAL mode and optimistic revisions, and supports an empty first boot. Node create/update requests are validated and probed before entering the scheduler. Updating or deleting a node first drains it and waits for active leases; a timeout leaves the node safely draining for a later retry.
 
-### Server
+The management UI at `/admin/` edits node URLs, model aliases, concurrency, weights, provider settings, environment-backed credentials, and vLLM KV event endpoints. `api_key_env` and `headers_from_env` store environment-variable names, never secret values. The corresponding environment variables must exist in the Estuary process before a node using them can pass validation.
 
-| Field | Meaning |
-| --- | --- |
-| `listen` | Public OpenAI-compatible listener. |
-| `admin_listen` | Health, metrics, and node-status listener. Keep it private. Use `0.0.0.0` inside a container when the port must be probed externally. |
-| `connect_timeout_ms` | Upstream TCP/TLS connection timeout. |
-| `upstream_header_timeout_ms` | Maximum time to receive upstream response headers. A timeout returns `504`. |
-| `stream_idle_timeout_ms` | Maximum idle gap between upstream response-body chunks. It applies to SSE and non-SSE bodies and closes a stalled body. |
-| `upstream_body_timeout_ms` | Absolute deadline for reading a complete upstream body, including a streaming generation. |
-| `downstream_stall_timeout_ms` | Maximum wait for a client to drain the one-chunk response buffer before the upstream reader is cancelled. |
-| `shutdown_grace_ms` | Time allowed for active requests/streams to finish after shutdown starts; remaining server tasks are aborted when it expires. |
-| `max_request_body_bytes` | Axum request-body hard limit. Queued bodies are additionally controlled by `queue_max_bytes`. |
-| `expose_node_header` | Adds `x-gateway-node` to responses. Leave disabled when topology is sensitive. |
-| `log_json` | Emit structured JSON logs when true. Prompt and response bodies are not logged. |
+The public and admin listeners are process bootstrap settings because they are needed before SQLite and the UI can be reached. Keep the admin listener on a private network. Routing, health, retry, circuit, and response-limit values currently use the validated defaults in `src/config.rs`.
 
-### Routing and prefix affinity
+Model mappings associate a public model name with a node-specific upstream name. The special upstream value `"*"` preserves the requested public name; a wildcard public key routes unlisted models. Only explicit public names appear in `/v1/models`.
 
-`queue_max_requests` and `queue_max_bytes` bound requests waiting for node capacity. `load_weight`, `latency_weight`, and `error_weight` control the fallback score; lower is better. A larger node `weight` makes the node relatively more attractive.
+### Native vLLM provider
 
-`prefix.cache_threshold` is the strict minimum `matched_chars / input_chars` ratio for cache routing. The scheduler enters load-first mode only when both `max_load - min_load > balance_abs_threshold` and `max_load > min_load * balance_rel_threshold`. `max_request_chars` caps matching work, while `max_tree_chars_per_node` bounds each node's approximate radix-tree footprint with leaf-LRU eviction. Canonical prompt text is stored in process memory, so treat gateway memory as sensitive.
+Declare `provider.type: vllm` on each independently addressable vLLM engine. Estuary checks the origin-root `/version` endpoint and keeps versions below 0.25.0 out of rotation. `/metrics` supplies `vllm:num_requests_running`, `vllm:num_requests_waiting`, and `vllm:kv_cache_usage_perc`; stale telemetry is ignored for scheduling. Fresh waiting depth at or above the routing watermark stops new admission to that node, including cache-affine requests, until a later scrape reports recovery.
 
-### Nodes and model aliases
+The full compatibility contract and failure semantics are in [`docs/vllm.md`](docs/vllm.md).
 
-`base_url` should include the upstream API prefix, normally `/v1`. The gateway appends `chat/completions`, `responses`, and other endpoint paths. `health_path` is requested with the node headers and credentials.
+Enable KV events on vLLM with a replay endpoint:
 
-`api_key_env` is the name of an environment variable containing a Bearer token, not the key itself and not `${VARIABLE}` syntax. For non-Bearer credentials, `headers_from_env` maps a header name to an environment-variable name, for example `api-key: AZURE_OPENAI_API_KEY`. The process fails startup if any referenced variable is missing or empty.
-
-`headers` contains literal static values and should be used only for non-secret metadata. YAML does not perform environment substitution. If both mechanisms set the same header, environment-backed headers replace static values; `api_key_env` finally sets `Authorization: Bearer ...`.
-
-Model mappings are `public-name: upstream-name`. The special value `"*"` preserves the requested public name. A wildcard public key routes models not explicitly listed:
-
-```yaml
-models:
-  gateway-chat: vendor-model-name
-  "*": "*"
+```bash
+vllm serve MODEL \
+  --kv-events-config \
+  '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","topic":"kv-events","buffer_steps":10000}'
 ```
 
-Only explicit public names appear in `/v1/models`.
+The vLLM process uses bind addresses such as `tcp://*:5557`. Estuary configuration must use concrete connect addresses visible from the gateway, such as `tcp://vllm-0.internal:5557`. ZMQ KV event ports have no application-level authentication in this protocol; expose them only on a private network.
+
+vLLM 0.25 and 0.26 use different replay frame layouts; Estuary accepts both. Estuary actively requests replay after connecting. Sequence gaps and disconnects suspend exact affinity until history is recovered contiguously. Replay-buffer overflow, invalid payloads, and sequence rollback clear learned state and remain degraded until replay from sequence zero succeeds or `AllBlocksCleared` establishes a new baseline. The current exact path intentionally ignores remote/non-GPU blocks, LoRA-specific blocks, and blocks with multimodal or salted extra keys. Responses requests and unsupported prompt shapes retain approximate affinity.
+
+For data parallel deployments, each Estuary node must map to a vLLM cache domain that the gateway can actually select. If one HTTP endpoint randomly dispatches across multiple hidden DP ranks, rank-level KV locality is not actionable. vLLM offsets event ports by DP rank; expose ranks separately when exact rank affinity is required.
+
+Every vLLM node advertising the same public model must use tokenization-equivalent model revisions, chat templates, and prompt-processing settings. Give incompatible pools different public model names; Estuary does not assume that two different token sequences are interchangeable.
 
 ## Health, metrics, and operations
 
@@ -185,9 +177,14 @@ The admin listener exposes:
 | Endpoint | Meaning |
 | --- | --- |
 | `GET /health/live` | Process liveness only; always `200` while the server can answer. |
-| `GET /health/ready` | `200` when at least one node is healthy or degraded, otherwise `503`. |
+| `GET /health/ready` | `200` when at least one node is serving and passes health, provider, and circuit gates; otherwise `503`. |
 | `GET /metrics` | OpenMetrics text exposition. |
+| `GET /admin/` | Embedded management application. |
 | `GET /admin/nodes` | Node URL, health, active/available permits, weights, EWMA values, and last error. Treat as sensitive operational data. |
+| `GET/POST /admin/api/nodes` | List or preflight and create persisted nodes. |
+| `GET/PUT/DELETE /admin/api/nodes/{id}` | Read, revision-checked update, or graceful deletion. |
+| `PUT /admin/nodes/{id}/drain` | Stop new assignments while active requests finish. Add `?wait=true&timeout_ms=30000` to wait for zero active leases; timeout returns `202`. |
+| `DELETE /admin/nodes/{id}/drain` | Resume assignments, subject to health, provider, and circuit gates. |
 
 Do not use upstream availability as a liveness probe: restarting the gateway cannot repair an unavailable model server. Use `/health/live` for container liveness and `/health/ready` for traffic admission.
 
@@ -202,23 +199,31 @@ Important metric families include:
 - `estuary_stream_errors_total`
 - `estuary_node_active`
 - `estuary_node_health`
+- `estuary_node_accepting_requests`
+- `estuary_node_circuit_state`
+- `estuary_node_provider_ready`
+- `estuary_node_provider_state`
+- `estuary_node_upstream_running`
+- `estuary_node_upstream_waiting`
+- `estuary_node_kv_cache_usage_ratio`
+- `estuary_node_exact_kv_ready`
+- `estuary_node_exact_kv_blocks`
 - `estuary_request_duration_seconds`
 - `estuary_queue_duration_seconds`
 - `estuary_prefix_match_chars`
+- `estuary_prefix_match_tokens`
 
-Request duration currently ends when the response headers/body handle is created; it is not the full lifetime of a streaming response. Node permits remain held by the upstream pump until EOF, error, cancellation, or a configured body/stall timeout.
+Request duration includes the complete buffered body for non-streaming successes, but ends when the streaming response handle is created. Streaming node permits remain held by the upstream pump until EOF, error, cancellation, or a configured body/stall timeout. SIGINT/SIGTERM first drains all nodes, stops accepting new connections, and then allows existing responses to finish within `shutdown_grace_ms`.
 
 ## Docker Compose
 
-Compose binds both ports to loopback by default and requires both example upstream keys:
+Compose binds both ports to loopback by default and persists SQLite in the `estuary-data` named volume:
 
 ```bash
-export UPSTREAM_A_API_KEY='replace-me'
-export UPSTREAM_B_API_KEY='replace-me'
 docker compose up --build
 ```
 
-Set `ESTUARY_CONFIG_FILE` to mount another YAML file. The included example addresses upstreams through `host.docker.internal`; Compose maps that hostname to the Docker host on Linux.
+Open `http://127.0.0.1:9090/admin/`. Add any upstream credential environment variables to the service before registering nodes that reference them. Removing the container does not remove the named volume; use `docker compose down -v` only when the database should be deleted.
 
 The image runs as UID/GID `10001`, has a read-only root filesystem under Compose, does not follow upstream redirects, and uses `/health/live` for its image health check. For Kubernetes, keep the admin port behind a NetworkPolicy and set the pod termination grace period above `shutdown_grace_ms`; after that application grace period, remaining public or admin server tasks and their active streams are aborted.
 
@@ -228,6 +233,7 @@ The image runs as UID/GID `10001`, has a read-only root filesystem under Compose
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
+cd web && bun install --frozen-lockfile && bun run test && bun run build
 ```
 
 Contract tests should additionally exercise slow/cancelled SSE clients, split SSE frames, retry boundaries, queue byte exhaustion, and the concurrency limit with real TCP mock upstreams.
@@ -239,6 +245,6 @@ The existing separation between request metadata, scheduling, node runtime, and 
 - gateway API-key lifecycle, tenant identity, quota, and priority/fair queues;
 - durable Responses state-to-node affinity and background operations;
 - Anthropic Messages/Claude Code protocol adapters;
-- provider-specific tokenizers, KV-cache events, queue-depth, and GPU telemetry;
+- additional provider adapters and local tokenizer implementations;
 - shared prefix/admission state or distributed node leases for active-active gateways;
-- atomic configuration reload and controlled node draining.
+- persisted global policy management and fleet-coordinated node lifecycle state.

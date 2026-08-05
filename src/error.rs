@@ -16,10 +16,6 @@ pub enum GatewayError {
     UnknownModel(String),
     #[error("no healthy upstream is available for model '{0}'")]
     NoHealthyNode(String),
-    #[error("all upstreams are at capacity; queue wait expired")]
-    CapacityTimeout,
-    #[error("the gateway request queue is full")]
-    QueueFull,
     #[error("request body exceeds the configured gateway limit")]
     PayloadTooLarge,
     #[error("this feature is not supported by the gateway yet: {0}")]
@@ -49,7 +45,6 @@ impl GatewayError {
             | Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             Self::UnknownModel(_) | Self::RouteNotFound => StatusCode::NOT_FOUND,
             Self::NoHealthyNode(_) => StatusCode::SERVICE_UNAVAILABLE,
-            Self::CapacityTimeout | Self::QueueFull => StatusCode::TOO_MANY_REQUESTS,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::InvalidUpstreamResponse | Self::Upstream(_) => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
@@ -66,8 +61,6 @@ impl GatewayError {
             Self::MissingModel => "missing_model",
             Self::UnknownModel(_) => "model_not_found",
             Self::NoHealthyNode(_) => "no_healthy_upstream",
-            Self::CapacityTimeout => "upstream_capacity_timeout",
-            Self::QueueFull => "gateway_queue_full",
             Self::PayloadTooLarge => "request_too_large",
             Self::UnsupportedFeature(_) => "unsupported_feature",
             Self::InvalidRequest(_) => "invalid_request",
@@ -96,10 +89,7 @@ struct ErrorBody {
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
         let status = self.status();
-        let retryable = matches!(
-            self,
-            Self::NoHealthyNode(_) | Self::CapacityTimeout | Self::QueueFull
-        );
+        let retryable = matches!(self, Self::NoHealthyNode(_));
         let error_type = match self {
             Self::InvalidJson
             | Self::MissingModel
@@ -108,7 +98,6 @@ impl IntoResponse for GatewayError {
             | Self::UnsupportedFeature(_)
             | Self::InvalidRequest(_)
             | Self::RouteNotFound => "invalid_request_error",
-            Self::CapacityTimeout | Self::QueueFull => "rate_limit_error",
             _ => "api_error",
         };
         let body = Json(ErrorEnvelope {

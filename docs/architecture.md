@@ -1,15 +1,23 @@
 # Architecture
 
-This document describes the phase-one implementation as it exists. Configuration defaults mentioned here come from `src/config.rs`; operators can override them in YAML.
+This document describes the current gateway foundation, SQLite-backed control plane, and native vLLM provider. Process policy defaults come from `src/config.rs`; upstream nodes are managed dynamically through the admin API and embedded web application.
 
 ## Invariants and scope
 
 - Public inference routes are an allowlist: Chat Completions, foreground Responses create, legacy Completions, and Embeddings. Model list/get are generated locally.
-- A node's `max_concurrency` permit covers the upstream request and complete upstream response body. Slow downstream consumers are isolated by a one-chunk bounded pump and a stall timeout.
+- A node's `max_concurrency` permit covers the upstream request and complete upstream response body. Streaming consumers are isolated by a one-chunk bounded pump and a stall timeout; non-streaming successes use a separately bounded complete buffer.
 - Scheduling, permits, queued-body accounting, health, and prefix knowledge are process-local. The production topology is single-active unless node budgets are explicitly divided between gateway replicas.
-- Prefix knowledge is an approximation derived from requests assigned by this gateway, not a claim about the upstream server's current KV cache.
+- Generic-node prefix knowledge is an approximation derived from requests assigned by this gateway. vLLM 0.25+ nodes can additionally supply exact local GPU block events.
 - The gateway preserves unknown request fields. When a model alias must be rewritten, it changes only the top-level `model` field and serializes the JSON again.
 - Upstream SSE/body bytes pass through a one-chunk bounded channel with backpressure. The gateway does not parse and reconstruct OpenAI or Responses events.
+
+## Control plane and persistence
+
+SQLite is the sole persisted node registry. Schema initialization and version checks happen before listeners start; WAL mode and a busy timeout bound writer contention. Each row stores a strictly validated `NodeConfig` JSON document plus an optimistic revision and timestamps. Secret values are never accepted as credential fields: persisted credential configuration contains environment-variable names.
+
+Create and update operations build a candidate node and perform its authenticated health check before mutation. vLLM candidates additionally have to pass the fixed 0.25.0 version gate and a metrics scrape. Creation persists the validated row before adding it to the scheduler. Update validates the replacement while the old node remains live, then drains the old node, waits for active leases to reach zero, revision-checks the SQLite update, and swaps the runtime `Arc<Node>`. Deletion follows the same drain-and-wait rule before removing persistence and runtime state. A timeout leaves the existing node draining instead of cancelling inference.
+
+The scheduler stores a snapshot-friendly dynamic node registry. Existing requests retain their node and semaphore permit independently of registry changes. The health loop reads a fresh registry snapshot each interval. A vLLM task reconciler starts and cancels version, metrics, tokenization, and KV subscriber state when node identities are added, replaced, or removed.
 
 ## Request flow
 
@@ -20,26 +28,32 @@ flowchart LR
     P --> S[Scheduler]
     H[Active probes and passive outcomes] --> S
     D[Approximate prefix directory] --> S
+    V[vLLM metrics, tokenize, and KV events] --> S
     S -->|immediate capacity| L[NodeLease]
-    S -->|all permits busy| Q[Bounded count and byte queue]
+    S -->|busy or waiting watermark| Q[Single pending queue]
     Q --> L
     L --> U[Reqwest upstream request]
-    U -->|headers before deadline| B[Bounded response pump]
-    B -->|one-chunk channel| C
+    U -->|streaming success| B[One-chunk response pump]
+    U -->|non-streaming success| N[Bounded complete buffer]
+    B --> C
+    N --> C
     B -->|first data or successful EOF| D
+    N -->|complete body| D
     B -->|EOF, error, idle timeout, or client drop| R[Release NodeLease]
+    N -->|complete body or error| R
 ```
 
 The request is read into a bounded `Bytes` value, then parsed as `serde_json::Value` only for routing metadata, model rewriting, and prefix extraction. Client credentials and hop-by-hop headers are removed. Node headers and environment-backed secrets are injected after client headers, and redirects are disabled.
 
-The scheduler first attempts an immediate permit. Only a request that cannot acquire any eligible node enters the queue, where one semaphore bounds request count and another accounts for body size in KiB. A queued request registers a cancel-safe acquisition future in every currently eligible node semaphore. Tokio's FIFO semaphore assignment prevents a new `try_acquire` fast path from taking a permit promised to an older waiter; the first candidate to become available wins and all losing reservations are dropped. Health notifications add newly routable candidates without rebuilding existing waits. This avoids a global FIFO lock, so a saturated model pool does not head-of-line block an independent pool.
+The scheduler first attempts an immediate permit. Only a request that cannot acquire any eligible node enters the single queue. Count and KiB semaphores bound how many requests simultaneously register against node semaphores; reaching either bound waits asynchronously for queue admission and never generates an overload response. A queued request registers a cancel-safe acquisition future in every currently eligible node semaphore and has no scheduler deadline. Tokio's FIFO semaphore assignment prevents a new `try_acquire` fast path from taking a permit promised to an older waiter; the first candidate to become available wins and all losing reservations are dropped. Client cancellation drops queue and node reservations. Health and telemetry notifications add newly admissible candidates without rebuilding existing waits. This avoids a global FIFO lock, so a saturated model pool does not head-of-line block an independent pool.
 
 ## Scoring and locality gate
 
 Nodes are first filtered by retry exclusion, public-model mapping, and `Node::is_routable()`. For each remaining node, lower scores are better:
 
 ```text
-load = ((active_requests + 1) / max_concurrency) / node_weight
+observed_load = max(local_active_requests, fresh_vllm_running + fresh_vllm_waiting)
+load = ((observed_load + 1) / max_concurrency) / node_weight
 
 latency = 1                                      if no EWMA sample exists
           response_header_latency_ewma_ms
@@ -52,14 +66,22 @@ base = load_weight * load
      + error_weight * (error_ewma + health_penalty)
 ```
 
-Starting nodes are present only when `route_while_starting` is enabled. For the remaining candidates, the scheduler follows vLLM Router's cache-aware mode switch. It enters load-first mode only when both conditions hold:
+Starting nodes are present only when `route_while_starting` is enabled. Draining nodes and nodes with an open circuit are excluded; half-open circuits admit only their configured number of real inference probes. A native vLLM node is additionally excluded until `/version` proves it is vLLM 0.25.0 or newer. Fresh `num_requests_waiting >= provider.waiting_threshold` temporarily removes the node from admission, so cache affinity spills to another candidate or waits at the gateway. Metrics failures do not exclude an already verified node; after `telemetry_stale_ms`, both the watermark and upstream load are ignored and scheduling returns to process-local active requests.
+
+For the remaining candidates, the scheduler follows vLLM Router's cache-aware mode switch. It enters load-first mode only when both conditions hold:
 
 ```text
 max_active - min_active > prefix.balance_abs_threshold
 max_active > min_active * prefix.balance_rel_threshold
 ```
 
-In load-first mode, candidates are ordered by `base`. While load is balanced, the radix tree supplies the owner of the longest matching prefix and its match ratio:
+In load-first mode, candidates are ordered by `base`. While load is balanced, a tokenized request first queries the exact KV directory:
+
+```text
+exact_match_ratio = longest_confirmed_cached_tokens / input_tokens
+```
+
+When this ratio exceeds `prefix.cache_threshold`, nodes tied for the longest exact match are preferred. Otherwise the radix tree supplies the owner of the longest approximate prefix and its match ratio:
 
 ```text
 match_ratio = matched_prefix_chars / input_chars
@@ -67,19 +89,29 @@ match_ratio = matched_prefix_chars / input_chars
 
 When `match_ratio > prefix.cache_threshold`, healthy matching owners are ordered before other candidates; otherwise all candidates remain in base-score order. Candidates are acquired with non-blocking semaphore operations. Health is checked again after permit acquisition to close the selection race.
 
-The current latency signal ends at upstream response headers. It is useful for gross load differences but is not a token-normalized TTFT or throughput model. Provider queue depth, actual cached blocks, token load, and model-specific prefill/decode rates are future inputs.
+The current latency signal ends at upstream response headers. It is useful for gross load differences but is not treated as a completion-time prediction. Requests are not divided into prompt-length classes: a long Agent prompt can have nearly all tokens cached and therefore should not be penalized solely for its raw length. vLLM queue depth and actual cached blocks are the authoritative routing inputs when available.
+
+## Native vLLM state
+
+The vLLM provider has three independent HTTP inputs: `/version` is a compatibility gate fixed at vLLM 0.25.0 or newer, `/metrics` supplies running, waiting, and KV-use gauges, and `/tokenize` renders supported Chat Completions or string Completions exactly as the model server does.
+
+KV events arrive as ZMQ multipart messages containing a topic, an eight-byte monotonic sequence, and a MessagePack batch. The decoder accepts the 0.25 replay shape `(seq, payload)` and the 0.26+ shape `(topic, seq, payload)`. A bounded token trie is maintained per Estuary node and vLLM KV group. Block hashes point to trie terminals, parent hashes extend existing paths, removals delete terminals, and `AllBlocksCleared` resets both exact and approximate knowledge for that node. A request's usable match is the minimum match across all learned KV groups.
+
+The subscriber connects to PUB before actively replaying from its next expected sequence, then ignores overlapping queued PUB frames through the replay high-water mark. A disconnect immediately suspends the directory. Only contiguous replay, replay from sequence zero, or `AllBlocksCleared` can establish a trustworthy baseline. Sequence rollback, replay-buffer overflow, invalid MessagePack, conflicting hashes, or the configured memory limit clears the directory; later unanchored incremental events remain non-authoritative. This prefers a cache miss over a false cache hit.
+
+Only local GPU events without LoRA or non-null `extra_keys` currently enter the exact directory. This excludes remote/offloaded, salted, and multimodal-specific cache keys until the routing request carries equivalent identity dimensions. Exact tokenization currently covers Chat Completions and single string or pre-tokenized Completions; other request shapes use the approximate tree.
 
 ## Approximate radix tree
 
 Prefix material includes the endpoint, public model, prompt/input, and prompt-affecting fields such as instructions, tools, tool choice, response format, parallel tool calls, and reasoning configuration. Parsed JSON gives deterministic object-key ordering; segment separators preserve boundaries.
 
-Each endpoint and public model has a multi-tenant compressed radix tree. Nodes contain canonical Unicode text and the upstream node IDs believed to own that prefix. Lookups return the owners at the deepest matching radix node. `max_request_chars` caps request work, and leaf-LRU eviction keeps each upstream node at or below `max_tree_chars_per_node`. A successful assignment is recorded on the first non-empty upstream body chunk, or on clean EOF for an empty successful body.
+Each endpoint and public model has a multi-tenant compressed radix tree. Nodes contain canonical Unicode text and the upstream node IDs believed to own that prefix. Lookups return the owners at the deepest matching radix node. `max_request_chars` caps request work, and leaf-LRU eviction keeps each upstream node at or below `max_tree_chars_per_node`. A successful streaming assignment is recorded on the first non-empty upstream body chunk, or on clean EOF for an empty successful body. A non-streaming assignment is recorded only after the complete bounded body reaches EOF, immediately before the response is committed downstream.
 
-This remains best-effort and can briefly contain both false positives and false negatives. It cannot observe upstream restart, tokenizer differences, cache capacity, or eviction. The size bound approximates vLLM Router's cache pressure, health and load always take precedence, and all prefix state disappears on gateway restart. Unlike the previous fingerprint directory, canonical prompt text is present in gateway memory.
+This remains best-effort and can briefly contain both false positives and false negatives. Native vLLM reset and eviction events clear the corresponding approximate entries, but generic nodes cannot expose those changes. The size bound approximates vLLM Router's cache pressure, health and load always take precedence, and all prefix state disappears on gateway restart. Canonical prompt text is present in gateway memory.
 
 ## Concurrency, streaming, and cancellation
 
-`NodeLease` owns an `OwnedSemaphorePermit`. A detached Tokio pump owns the lease and upstream body while a capacity-one channel feeds Axum. The pump watches for receiver closure even while the upstream is idle, so a disconnected client cancels the reader and releases the permit. If the client remains connected but stops draining, the channel reservation deadline terminates the pump; already-buffered bytes drain before the downstream observes a body error.
+`NodeLease` owns an `OwnedSemaphorePermit` and, in half-open state, a circuit probe ticket. Non-streaming successes are read completely into a bounded buffer before the response is committed downstream. Streaming successes use a detached Tokio pump that owns the lease and upstream body while a capacity-one channel feeds Axum. The pump watches for receiver closure even while the upstream is idle, so a disconnected client cancels the reader and releases the permit. If the client remains connected but stops draining, the channel reservation deadline terminates the pump; already-buffered bytes drain before the downstream observes a body error.
 
 Five independent time bounds are used:
 
@@ -89,7 +121,7 @@ Five independent time bounds are used:
 - `upstream_body_timeout_ms`: absolute lifetime of the complete upstream body;
 - `downstream_stall_timeout_ms`: each wait for space in the bounded downstream channel.
 
-The body and stall deadlines release the node permit even if either peer keeps a connection open indefinitely. A timeout after response headers cannot be replaced with a fresh OpenAI JSON envelope; the HTTP body terminates with an error instead. On SIGINT/SIGTERM, Axum stops accepting new connections and drains until `shutdown_grace_ms`; remaining server tasks and streams are then aborted.
+The body and stall deadlines release the node permit even if either peer keeps a connection open indefinitely. A streaming timeout after successful response headers cannot be replaced with a fresh OpenAI JSON envelope; the HTTP body terminates with an error instead. On SIGINT/SIGTERM, every node first enters draining, Axum stops accepting new connections, and active work gets `shutdown_grace_ms`; remaining server tasks and streams are then aborted.
 
 ## Health and retry state
 
@@ -106,15 +138,17 @@ Node health is `Starting`, `Healthy`, `Degraded`, or `Unhealthy`.
 
 Active probes use node credentials and have deterministic per-node jitter of up to `jitter_percent` of the interval. With the production default `route_while_starting: false`, initial traffic waits for a successful probe.
 
-Retries require another routable node and are capped to one through three total attempts by validation. The production default is one attempt. Connection failures retry only when reqwest classifies them as connect failures. With retries explicitly enabled, configured transient statuses are retried before their body is exposed. A header timeout returns `504`; a body error, idle timeout, total deadline, or downstream stall terminates the already-started body and is never retried. Any enabled generation retry is at-least-once and may duplicate upstream work or billing.
+The circuit breaker is independent of active health. Consecutive transport, 5xx, or body failures open the circuit. When `open_ms` elapses it moves to `HalfOpen`; bounded inference probes close it after `half_open_success_threshold` successes, and any half-open failure reopens it. Draining is a third, operator-controlled gate: it rejects new leases without changing health or cancelling active leases.
 
-## Phase-one boundaries
+Retries require another routable node and are capped to one through three total attempts by validation. The production default is one attempt. Connection failures retry only when reqwest classifies them as connect failures. With retries explicitly enabled, configured transient statuses are retried before their body is exposed. A header timeout returns `504`. A failed or invalid non-streaming success body can retry because no downstream bytes have been committed; a streaming body error, idle timeout, total deadline, or downstream stall terminates the already-started body and is never retried. Any enabled generation retry is at-least-once upstream and may duplicate work or billing even though downstream non-streaming delivery is atomic.
+
+## Current boundaries
 
 - No inbound API-key authentication, tenant quotas, or priorities.
 - No global concurrency guarantee across active-active replicas.
 - No shared queue, health, or prefix state.
-- No configuration hot reload or node draining across generations.
-- No exact tokenization, KV-cache event stream, GPU metrics, or upstream queue telemetry.
+- Node configuration and lifecycle are persisted and dynamically applied; process-wide routing and timeout policy changes still require a restart.
+- Exact vLLM routing is process-local and deliberately excludes remote/offloaded, LoRA, salted, and multimodal cache keys.
 - No Responses background mode, `previous_response_id`, conversation state, or `/responses/{id}` operations. Callers should set `store: false`; an object stored by an upstream is not retrievable through this gateway.
 - No Anthropic Messages/Claude Code protocol endpoint.
 - No exactly-once guarantee for retried generation requests.
@@ -125,13 +159,13 @@ Retries require another routable node and are capped to one through three total 
 
 Authentication middleware will resolve a presented key to an internal principal before request metadata reaches admission. Client-supplied tenant or priority headers must be stripped; only trusted identity policy may set `principal_id`, quota class, and priority.
 
-Admission can evolve from one bounded queue to strict priority bands with starvation controls. Within a band, per-principal weighted fair queuing or deficit round robin should use an estimated token cost instead of raw request count. Node selection remains late-bound at dispatch, preserving prefix and load decisions. Metrics must label bounded policy classes, never raw API keys.
+Future API-key priority can add principal-aware fairness without classifying requests by prompt length. Node selection remains late-bound, preserving prefix and observed-load decisions. Metrics must label bounded policy classes, never raw API keys.
 
 ### Claude and additional protocols
 
 An inbound `ProtocolAdapter` should parse protocol-specific metadata and produce a protocol-neutral routing request plus an opaque or translated upstream payload. OpenAI-to-OpenAI remains the zero-copy fast path. A Claude adapter owns Messages request conversion, Anthropic error mapping, and named SSE event translation; the scheduler, node lease, health, queue, and metrics remain protocol-independent.
 
-Durable Responses support similarly belongs in a state-affinity adapter backed by a response-ID-to-node store and node generation checks. Provider adapters can later add tokenizer parity, precise KV events, queue depth, and capability discovery without changing the public admission contract.
+Durable Responses support similarly belongs in a state-affinity adapter backed by a response-ID-to-node store and node generation checks. Additional provider adapters can reuse the current tokenizer, telemetry, and precise-cache extension points without changing the public admission contract.
 
 ## References
 
@@ -140,6 +174,8 @@ Durable Responses support similarly belongs in a state-affinity adapter backed b
 - [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses/create)
 - [vLLM Router cache-aware policy](https://github.com/vllm-project/router/blob/main/src/policies/cache_aware.rs)
 - [vLLM Router multi-tenant radix tree](https://github.com/vllm-project/router/blob/main/src/tree.rs)
+- [vLLM 0.25 KV event protocol](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/distributed/kv_events.py)
+- [vLLM tokenize protocol](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/entrypoints/serve/tokenize/protocol.py)
 - [llm-d request scheduler](https://github.com/llm-d/llm-d/blob/main/docs/architecture/core/router/epp/scheduling.md)
 - [llm-d flow control](https://github.com/llm-d/llm-d/blob/main/docs/architecture/core/router/epp/flow-control.md)
 - [llm-d prefix-cache affinity filter](https://github.com/llm-d/llm-d-router/blob/main/pkg/epp/framework/plugins/scheduling/filter/prefixcacheaffinity/README.md)

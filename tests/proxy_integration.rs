@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     future::pending,
+    io,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -10,7 +11,7 @@ use std::{
 };
 
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
     extract::State,
     http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
@@ -105,7 +106,6 @@ fn gateway_settings(nodes: Vec<NodeConfig>) -> Settings {
         },
         ..Settings::default()
     };
-    settings.routing.queue_timeout_ms = 1_500;
     settings.health.route_while_starting = true;
     settings
 }
@@ -682,7 +682,6 @@ async fn unpolled_downstream_body_stalls_then_releases_node_permit() {
     );
     upstream_node.max_concurrency = 1;
     let mut settings = gateway_settings(vec![upstream_node]);
-    settings.routing.queue_timeout_ms = 2_500;
     settings.server.stream_idle_timeout_ms = 1_000;
     settings.server.upstream_body_timeout_ms = 10_000;
     settings.server.downstream_stall_timeout_ms = 75;
@@ -945,4 +944,172 @@ async fn dropping_downstream_body_releases_node_permit() {
         .expect("second body JSON");
     assert_eq!(body["id"], "chatcmpl_2");
     assert_eq!(state.requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn admin_drain_and_resume_change_readiness() {
+    let upstream = TestServer::spawn(Router::new()).await;
+    let gateway = Gateway::build(gateway_settings(vec![node(
+        "drainable",
+        &upstream,
+        [("model", "model")],
+    )]))
+    .expect("build gateway");
+    let admin = TestServer::spawn(gateway.admin_router()).await;
+    let client = test_client();
+
+    let drained = client
+        .put(admin.url("/admin/nodes/drainable/drain"))
+        .send()
+        .await
+        .expect("drain response");
+    assert_eq!(drained.status(), StatusCode::OK);
+    let drained: Value = drained.json().await.expect("drain JSON");
+    assert_eq!(drained["lifecycle"], "draining");
+    assert_eq!(drained["drained"], true);
+
+    let readiness = client
+        .get(admin.url("/health/ready"))
+        .send()
+        .await
+        .expect("readiness response");
+    assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let resumed = client
+        .delete(admin.url("/admin/nodes/drainable/drain"))
+        .send()
+        .await
+        .expect("resume response");
+    assert_eq!(resumed.status(), StatusCode::OK);
+    let resumed: Value = resumed.json().await.expect("resume JSON");
+    assert_eq!(resumed["lifecycle"], "serving");
+    assert_eq!(resumed["routable"], true);
+}
+
+#[tokio::test]
+async fn non_streaming_body_failure_retries_before_downstream_commit() {
+    let broken_requests = Arc::new(AtomicUsize::new(0));
+    let broken_counter = Arc::clone(&broken_requests);
+    let broken = TestServer::spawn(Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let broken_counter = Arc::clone(&broken_counter);
+            async move {
+                broken_counter.fetch_add(1, Ordering::SeqCst);
+                let chunks = async_stream::stream! {
+                    yield Ok::<_, io::Error>(Bytes::from_static(b"{\"partial\":"));
+                    sleep(Duration::from_millis(20)).await;
+                    yield Err(io::Error::other("truncated upstream body"));
+                };
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from_stream(chunks))
+                    .unwrap()
+            }
+        }),
+    ))
+    .await;
+    let fallback_requests = Arc::new(AtomicUsize::new(0));
+    let fallback_counter = Arc::clone(&fallback_requests);
+    let fallback = TestServer::spawn(Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let fallback_counter = Arc::clone(&fallback_counter);
+            async move {
+                fallback_counter.fetch_add(1, Ordering::SeqCst);
+                Json(json!({
+                    "id": "chatcmpl_fallback",
+                    "object": "chat.completion",
+                    "choices": []
+                }))
+            }
+        }),
+    ))
+    .await;
+    let mut settings = gateway_settings(vec![
+        node("broken", &broken, [("model", "model")]),
+        node("fallback", &fallback, [("model", "model")]),
+    ]);
+    settings.retry.max_attempts = 2;
+    let gateway = TestServer::spawn(
+        Gateway::build(settings)
+            .expect("build gateway")
+            .public_router(),
+    )
+    .await;
+
+    let response = test_client()
+        .post(gateway.url("/v1/chat/completions"))
+        .json(&json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("gateway response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("complete fallback JSON");
+    assert_eq!(body["id"], "chatcmpl_fallback");
+    assert_eq!(broken_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(fallback_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn streaming_body_failure_never_switches_nodes_after_headers() {
+    let broken = TestServer::spawn(Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let chunks = async_stream::stream! {
+                yield Ok::<_, io::Error>(Bytes::from_static(b"data: {\"partial\":true}\n\n"));
+                sleep(Duration::from_millis(20)).await;
+                yield Err(io::Error::other("stream failed"));
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(chunks))
+                .unwrap()
+        }),
+    ))
+    .await;
+    let fallback_requests = Arc::new(AtomicUsize::new(0));
+    let fallback_counter = Arc::clone(&fallback_requests);
+    let fallback = TestServer::spawn(Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let fallback_counter = Arc::clone(&fallback_counter);
+            async move {
+                fallback_counter.fetch_add(1, Ordering::SeqCst);
+                "data: [DONE]\n\n"
+            }
+        }),
+    ))
+    .await;
+    let mut settings = gateway_settings(vec![
+        node("broken", &broken, [("model", "model")]),
+        node("fallback", &fallback, [("model", "model")]),
+    ]);
+    settings.retry.max_attempts = 2;
+    let gateway = TestServer::spawn(
+        Gateway::build(settings)
+            .expect("build gateway")
+            .public_router(),
+    )
+    .await;
+
+    let response = test_client()
+        .post(gateway.url("/v1/chat/completions"))
+        .json(&json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("streaming response headers");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.bytes().await.is_err());
+    assert_eq!(fallback_requests.load(Ordering::SeqCst), 0);
 }

@@ -4,15 +4,18 @@ services:
       context: .
       args:
         RUST_VERSION: "1.97.1"
+        IMAGE_REGISTRY: "${IMAGE_REGISTRY:-docker.m.daocloud.io}"
     image: estuary:local
     init: true
     restart: unless-stopped
     environment:
-      UPSTREAM_A_API_KEY: "${UPSTREAM_A_API_KEY:?UPSTREAM_A_API_KEY is required}"
-      UPSTREAM_B_API_KEY: "${UPSTREAM_B_API_KEY:?UPSTREAM_B_API_KEY is required}"
+      ESTUARY_DATABASE: /var/lib/estuary/estuary.db
+      ESTUARY_LISTEN: 0.0.0.0:8080
+      ESTUARY_ADMIN_LISTEN: 0.0.0.0:9090
+      ESTUARY_LOG_JSON: "true"
       RUST_LOG: "${RUST_LOG:-estuary=info}"
     volumes:
-      - "${ESTUARY_CONFIG_FILE:-./config.example.yaml}:/etc/estuary/config.yaml:ro"
+      - estuary-data:/var/lib/estuary
     ports:
       - "127.0.0.1:${ESTUARY_PORT:-8080}:8080"
       - "127.0.0.1:${ESTUARY_ADMIN_PORT:-9090}:9090"
@@ -30,3 +33,6 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+
+volumes:
+  estuary-data:
