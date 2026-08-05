@@ -1,5 +1,8 @@
 # Estuary
 
+[![CI](https://github.com/iMMIQ/estuary/actions/workflows/ci.yml/badge.svg)](https://github.com/iMMIQ/estuary/actions/workflows/ci.yml)
+[![Release](https://github.com/iMMIQ/estuary/actions/workflows/release.yml/badge.svg)](https://github.com/iMMIQ/estuary/actions/workflows/release.yml)
+
 `estuary` is a Rust gateway for a pool of OpenAI-compatible LLM servers. It exposes a stable OpenAI-style endpoint, rewrites public model names to node-specific names, enforces per-node concurrency, and selects a healthy node using current load, recent latency/error signals, and approximate prompt-prefix locality.
 
 This repository contains the phase-one gateway foundation plus a native vLLM provider for vLLM 0.25 and newer. It deliberately does not yet implement client API-key management, tenant quotas or priorities, durable Responses state, or the Anthropic/Claude protocol.
@@ -224,6 +227,14 @@ docker compose up --build
 ```
 
 Open `http://127.0.0.1:9090/admin/`. Add any upstream credential environment variables to the service before registering nodes that reference them. Removing the container does not remove the named volume; use `docker compose down -v` only when the database should be deleted.
+
+Release images are published for `linux/amd64` and `linux/arm64` in GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/immiq/estuary:latest
+```
+
+Use an immutable version such as `ghcr.io/immiq/estuary:0.1.0` in production. The image also carries major/minor and major tags.
 
 The image runs as UID/GID `10001`, has a read-only root filesystem under Compose, does not follow upstream redirects, and uses `/health/live` for its image health check. For Kubernetes, keep the admin port behind a NetworkPolicy and set the pod termination grace period above `shutdown_grace_ms`; after that application grace period, remaining public or admin server tasks and their active streams are aborted.
 
