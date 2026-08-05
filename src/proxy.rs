@@ -18,7 +18,7 @@ use axum::{
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -88,7 +88,8 @@ pub async fn proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let is_anthropic = matches!(endpoint.as_str(), "messages" | "messages/count_tokens");
+    let is_anthropic = matches!(endpoint.as_str(), "messages" | "messages/count_tokens")
+        || endpoint.starts_with("files/");
     let gateway_request_id = request_id.0.clone();
     match proxy_inner(state, endpoint, request_id, method, uri, headers, body).await {
         Ok(response) => response,
@@ -107,6 +108,11 @@ async fn proxy_inner(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, GatewayError> {
+    if endpoint.starts_with("files/") {
+        return Err(GatewayError::UnsupportedFeature(
+            "Claude Code file downloads require a file service; vLLM does not provide one",
+        ));
+    }
     if endpoint.starts_with("responses/") {
         return Err(GatewayError::UnsupportedFeature(
             "Responses retrieve, delete, and cancel endpoints require durable node affinity",
@@ -136,10 +142,16 @@ async fn proxy_inner(
     if endpoint == "responses" {
         reject_stateful_responses(parsed.as_ref())?;
     }
-    let original_body = if parsed
+    let mut body_changed = false;
+    if matches!(endpoint.as_str(), "messages" | "messages/count_tokens") {
+        body_changed |= normalize_context_management(
+            parsed.as_mut().expect("inference JSON was validated above"),
+        )?;
+    }
+    body_changed |= parsed
         .as_mut()
-        .is_some_and(strip_claude_code_billing_blocks)
-    {
+        .is_some_and(strip_claude_code_billing_blocks);
+    let original_body = if body_changed {
         serde_json::to_vec(parsed.as_ref().expect("parsed body exists"))
             .map(Bytes::from)
             .map_err(|_| GatewayError::Internal)?
@@ -337,6 +349,104 @@ async fn proxy_inner(
 }
 
 const CLAUDE_CODE_BILLING_PREFIX: &str = "x-anthropic-billing-header:";
+const THINKING_BUDGET_WARNING: &str = "approximated-by-max-tokens";
+
+fn normalize_context_management(body: &mut Value) -> Result<bool, GatewayError> {
+    let object = body.as_object_mut().ok_or_else(|| {
+        GatewayError::InvalidRequest("JSON request body must be an object".to_owned())
+    })?;
+    let Some(context) = object.get("context_management") else {
+        return Ok(false);
+    };
+    if context.is_null() {
+        object.remove("context_management");
+        return Ok(true);
+    }
+    let context = context.as_object().ok_or_else(|| {
+        GatewayError::InvalidRequest("Anthropic context_management must be an object".to_owned())
+    })?;
+    let edits = context
+        .get("edits")
+        .map(|edits| {
+            edits.as_array().ok_or_else(|| {
+                GatewayError::InvalidRequest(
+                    "Anthropic context_management.edits must be an array".to_owned(),
+                )
+            })
+        })
+        .transpose()?
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let all_noop = edits.iter().all(|edit| {
+        let Some(edit) = edit.as_object() else {
+            return false;
+        };
+        if edit.get("type").and_then(Value::as_str) != Some("clear_thinking_20251015") {
+            return false;
+        }
+        matches!(edit.get("keep"), Some(Value::String(keep)) if keep == "all")
+            || edit
+                .get("keep")
+                .and_then(Value::as_object)
+                .and_then(|keep| keep.get("type"))
+                .and_then(Value::as_str)
+                == Some("all")
+    });
+    if !all_noop {
+        return Err(GatewayError::UnsupportedFeature(
+            "vLLM 0.25 cannot apply Anthropic context-management edits",
+        ));
+    }
+    object.remove("context_management");
+    Ok(true)
+}
+
+fn apply_vllm_native_thinking_compat(
+    object: &mut Map<String, Value>,
+) -> Result<bool, GatewayError> {
+    let Some(thinking) = object.get("thinking").filter(|value| !value.is_null()) else {
+        return Ok(false);
+    };
+    let thinking = thinking.as_object().ok_or_else(|| {
+        GatewayError::InvalidRequest("Anthropic thinking must be an object".to_owned())
+    })?;
+    let kind = thinking
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            GatewayError::InvalidRequest("Anthropic thinking.type must be a string".to_owned())
+        })?;
+    let (enable_thinking, approximated_budget) = match kind {
+        "disabled" => (false, false),
+        "adaptive" => (true, false),
+        "enabled" => {
+            thinking
+                .get("budget_tokens")
+                .and_then(Value::as_u64)
+                .filter(|budget| *budget > 0)
+                .ok_or_else(|| {
+                    GatewayError::InvalidRequest(
+                        "Anthropic enabled thinking requires positive budget_tokens".to_owned(),
+                    )
+                })?;
+            (true, true)
+        }
+        _ => {
+            return Err(GatewayError::InvalidRequest(format!(
+                "unsupported Anthropic thinking type '{kind}'"
+            )));
+        }
+    };
+    let template_kwargs = object
+        .entry("chat_template_kwargs".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            GatewayError::InvalidRequest("vLLM chat_template_kwargs must be an object".to_owned())
+        })?;
+    template_kwargs.insert("enable_thinking".to_owned(), Value::Bool(enable_thinking));
+    Ok(approximated_budget)
+}
 
 fn strip_claude_code_billing_blocks(body: &mut Value) -> bool {
     let Some(object) = body.as_object_mut() else {
@@ -509,9 +619,32 @@ fn prepared_payload(endpoint: &str, parsed: Value) -> PreparedPayload {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UpstreamResponseMode {
     Passthrough,
-    ChatToAnthropic { expose_thinking: bool },
-    ResponsesToAnthropic { expose_thinking: bool },
-    NativeAnthropic,
+    ChatToAnthropic {
+        expose_thinking: bool,
+    },
+    ResponsesToAnthropic {
+        expose_thinking: bool,
+    },
+    NativeAnthropic {
+        expose_thinking: bool,
+        thinking_budget_approximated: bool,
+    },
+}
+
+impl UpstreamResponseMode {
+    fn is_anthropic(self) -> bool {
+        self != Self::Passthrough
+    }
+
+    fn thinking_budget_approximated(self) -> bool {
+        matches!(
+            self,
+            Self::NativeAnthropic {
+                thinking_budget_approximated: true,
+                ..
+            }
+        )
+    }
 }
 
 enum ResponseStreamAdapter {
@@ -616,35 +749,40 @@ async fn proxy_with_retries(
                     )
                 },
             );
-        let response_mode = match selected_protocol {
-            None => UpstreamResponseMode::Passthrough,
-            Some(AnthropicProtocol::Native) => UpstreamResponseMode::NativeAnthropic,
-            Some(AnthropicProtocol::Responses) => UpstreamResponseMode::ResponsesToAnthropic {
-                expose_thinking: request
-                    .anthropic_payloads
-                    .as_ref()
-                    .is_some_and(|payloads| payloads.expose_thinking),
-            },
-            Some(AnthropicProtocol::Chat) => UpstreamResponseMode::ChatToAnthropic {
-                expose_thinking: request
-                    .anthropic_payloads
-                    .as_ref()
-                    .is_some_and(|payloads| payloads.expose_thinking),
-            },
-            Some(AnthropicProtocol::Auto) => unreachable!("Anthropic protocol must be resolved"),
-        };
         let upstream_url = node
             .upstream_url(upstream_endpoint, upstream_query)
             .map_err(|error| {
                 warn!(node = node.id(), error = %error, "failed to build upstream URL");
                 GatewayError::Internal
             })?;
-        let upstream_body = mapped_body(
+        let native_vllm_messages = selected_protocol == Some(AnthropicProtocol::Native)
+            && node.provider().kind == crate::config::ProviderKind::Vllm
+            && upstream_endpoint == "messages";
+        let (upstream_body, thinking_budget_approximated) = mapped_body(
             upstream_original,
             upstream_parsed,
             selection.upstream_model.as_deref(),
             request.public_model.as_deref(),
+            native_vllm_messages,
         )?;
+        let expose_thinking = request
+            .anthropic_payloads
+            .as_ref()
+            .is_some_and(|payloads| payloads.expose_thinking);
+        let response_mode = match selected_protocol {
+            None => UpstreamResponseMode::Passthrough,
+            Some(AnthropicProtocol::Native) => UpstreamResponseMode::NativeAnthropic {
+                expose_thinking,
+                thinking_budget_approximated,
+            },
+            Some(AnthropicProtocol::Responses) => {
+                UpstreamResponseMode::ResponsesToAnthropic { expose_thinking }
+            }
+            Some(AnthropicProtocol::Chat) => {
+                UpstreamResponseMode::ChatToAnthropic { expose_thinking }
+            }
+            Some(AnthropicProtocol::Auto) => unreachable!("Anthropic protocol must be resolved"),
+        };
         let mut upstream_headers = HeaderMap::new();
         let connection_headers = connection_header_names(&request.headers);
         for (name, value) in &request.headers {
@@ -836,21 +974,29 @@ fn mapped_body(
     parsed: Option<&Value>,
     upstream_model: Option<&str>,
     public_model: Option<&str>,
-) -> Result<Bytes, GatewayError> {
-    if upstream_model == public_model || upstream_model.is_none() {
-        return Ok(original.clone());
+    native_vllm_messages: bool,
+) -> Result<(Bytes, bool), GatewayError> {
+    if !native_vllm_messages && (upstream_model == public_model || upstream_model.is_none()) {
+        return Ok((original.clone(), false));
     }
     let mut value = parsed.cloned().ok_or(GatewayError::InvalidJson)?;
     let object = value.as_object_mut().ok_or_else(|| {
         GatewayError::InvalidRequest("JSON request body must be an object".to_owned())
     })?;
-    object.insert(
-        "model".to_owned(),
-        Value::String(upstream_model.unwrap_or_default().to_owned()),
-    );
-    serde_json::to_vec(&value)
+    let thinking_budget_approximated = if native_vllm_messages {
+        apply_vllm_native_thinking_compat(object)?
+    } else {
+        false
+    };
+    if upstream_model != public_model
+        && let Some(upstream_model) = upstream_model
+    {
+        object.insert("model".to_owned(), Value::String(upstream_model.to_owned()));
+    }
+    let body = serde_json::to_vec(&value)
         .map(Bytes::from)
-        .map_err(|_| GatewayError::Internal)
+        .map_err(|_| GatewayError::Internal)?;
+    Ok((body, thinking_budget_approximated))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -898,9 +1044,9 @@ async fn buffered_success_response(
         UpstreamResponseMode::ResponsesToAnthropic { expose_thinking } => {
             anthropic_responses::convert_response(&body, public_model, expose_thinking)
         }
-        UpstreamResponseMode::NativeAnthropic => {
-            anthropic::rewrite_native_response(&body, public_model)
-        }
+        UpstreamResponseMode::NativeAnthropic {
+            expose_thinking, ..
+        } => anthropic::rewrite_native_response(&body, public_model, expose_thinking),
     };
     let body = match body {
         Ok(body) => body,
@@ -919,10 +1065,11 @@ async fn buffered_success_response(
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     copy_response_headers(&headers, response.headers_mut());
-    if response_mode != UpstreamResponseMode::Passthrough {
+    if response_mode.is_anthropic() {
         response.headers_mut().remove(CONTENT_LENGTH);
         anthropic::set_anthropic_content_type(&mut response, false);
     }
+    set_thinking_budget_warning(response_mode, response.headers_mut());
     if let Some(value) = upstream_request_id {
         response
             .headers_mut()
@@ -974,11 +1121,7 @@ fn streaming_response(
             header_latency,
         );
         let mut body = upstream.bytes_stream();
-        let converted_anthropic = matches!(
-            response_mode,
-            UpstreamResponseMode::ChatToAnthropic { .. }
-                | UpstreamResponseMode::ResponsesToAnthropic { .. }
-        );
+        let anthropic_stream = response_mode.is_anthropic();
         let keepalive_period = Duration::from_secs(10);
         let mut keepalive = tokio::time::interval_at(
             tokio::time::Instant::now() + keepalive_period,
@@ -1001,8 +1144,10 @@ fn streaming_response(
                     anthropic_responses::StreamConverter::new(public_model, expose_thinking),
                 ))
             }
-            UpstreamResponseMode::NativeAnthropic => Some(ResponseStreamAdapter::Native(
-                anthropic::NativeStreamRewriter::new(public_model),
+            UpstreamResponseMode::NativeAnthropic {
+                expose_thinking, ..
+            } => Some(ResponseStreamAdapter::Native(
+                anthropic::NativeStreamRewriter::new(public_model, expose_thinking),
             )),
         };
 
@@ -1056,7 +1201,7 @@ fn streaming_response(
                         );
                         return;
                 },
-                _ = keepalive.tick(), if converted_anthropic => {
+                _ = keepalive.tick(), if anthropic_stream => {
                     permit.send(anthropic::ping_event());
                     continue;
                 },
@@ -1156,7 +1301,7 @@ fn streaming_response(
         }
     });
 
-    let is_anthropic = response_mode != UpstreamResponseMode::Passthrough;
+    let is_anthropic = response_mode.is_anthropic();
     let stream = async_stream::stream! {
         while let Some(bytes) = receiver.recv().await {
             yield Ok::<Bytes, io::Error>(bytes);
@@ -1177,6 +1322,7 @@ fn streaming_response(
         response.headers_mut().remove(CONTENT_LENGTH);
         anthropic::set_anthropic_content_type(&mut response, true);
     }
+    set_thinking_budget_warning(response_mode, response.headers_mut());
     if let Some(value) = upstream_request_id {
         response
             .headers_mut()
@@ -1200,6 +1346,15 @@ fn streaming_response(
         );
     }
     response
+}
+
+fn set_thinking_budget_warning(response_mode: UpstreamResponseMode, headers: &mut HeaderMap) {
+    if response_mode.thinking_budget_approximated() {
+        headers.insert(
+            HeaderName::from_static("x-estuary-thinking-budget"),
+            HeaderValue::from_static(THINKING_BUDGET_WARNING),
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -1561,5 +1716,44 @@ mod tests {
         assert!(
             reject_stateful_responses(Some(&json!({"previous_response_id": "resp_1"}))).is_err()
         );
+    }
+
+    #[test]
+    fn removes_only_noop_claude_context_management() {
+        let mut request = json!({
+            "context_management": {
+                "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+            }
+        });
+        assert!(normalize_context_management(&mut request).unwrap());
+        assert!(request.get("context_management").is_none());
+
+        let mut unsupported = json!({
+            "context_management": {
+                "edits": [{
+                    "type": "clear_tool_uses_20250919",
+                    "keep": {"type": "tool_uses", "value": 5}
+                }]
+            }
+        });
+        assert!(normalize_context_management(&mut unsupported).is_err());
+    }
+
+    #[test]
+    fn maps_anthropic_thinking_to_vllm_template_control() {
+        let mut enabled = json!({
+            "max_tokens": 32000,
+            "thinking": {"type": "enabled", "budget_tokens": 31999},
+            "chat_template_kwargs": {"custom": true}
+        });
+        let approximated =
+            apply_vllm_native_thinking_compat(enabled.as_object_mut().unwrap()).unwrap();
+        assert!(approximated);
+        assert_eq!(enabled["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(enabled["chat_template_kwargs"]["custom"], true);
+
+        let mut disabled = json!({"thinking": {"type": "disabled"}});
+        assert!(!apply_vllm_native_thinking_compat(disabled.as_object_mut().unwrap()).unwrap());
+        assert_eq!(disabled["chat_template_kwargs"]["enable_thinking"], false);
     }
 }

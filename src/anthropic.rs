@@ -625,6 +625,7 @@ pub(crate) fn convert_response(
 pub(crate) fn rewrite_native_response(
     body: &[u8],
     public_model: &str,
+    expose_thinking: bool,
 ) -> Result<Bytes, GatewayError> {
     let mut value: Value =
         serde_json::from_slice(body).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
@@ -633,6 +634,13 @@ pub(crate) fn rewrite_native_response(
         .ok_or(GatewayError::InvalidUpstreamResponse)?;
     if object.get("type").and_then(Value::as_str) == Some("message") {
         object.insert("model".to_owned(), Value::String(public_model.to_owned()));
+        if !expose_thinking
+            && let Some(content) = object.get_mut("content").and_then(Value::as_array_mut)
+        {
+            for block in content {
+                suppress_native_thinking(block);
+            }
+        }
     } else if object.get("input_tokens").and_then(Value::as_u64).is_none() {
         return Err(GatewayError::InvalidUpstreamResponse);
     }
@@ -751,13 +759,15 @@ pub(crate) struct StreamConverter {
 pub(crate) struct NativeStreamRewriter {
     buffer: BytesMut,
     public_model: String,
+    expose_thinking: bool,
 }
 
 impl NativeStreamRewriter {
-    pub(crate) fn new(public_model: String) -> Self {
+    pub(crate) fn new(public_model: String, expose_thinking: bool) -> Self {
         Self {
             buffer: BytesMut::new(),
             public_model,
+            expose_thinking,
         }
     }
 
@@ -779,6 +789,17 @@ impl NativeStreamRewriter {
                     .ok_or(GatewayError::InvalidUpstreamResponse)?;
                 message.insert("model".to_owned(), Value::String(self.public_model.clone()));
             }
+            if !self.expose_thinking {
+                if value.get("type").and_then(Value::as_str) == Some("content_block_start") {
+                    if let Some(block) = value.get_mut("content_block") {
+                        suppress_native_thinking(block);
+                    }
+                } else if value.get("type").and_then(Value::as_str) == Some("content_block_delta")
+                    && let Some(delta) = value.get_mut("delta")
+                {
+                    suppress_native_thinking(delta);
+                }
+            }
             let name = event_name(&frame)
                 .or_else(|| value.get("type").and_then(Value::as_str))
                 .ok_or(GatewayError::InvalidUpstreamResponse)?
@@ -793,6 +814,18 @@ impl NativeStreamRewriter {
             return Err(GatewayError::InvalidUpstreamResponse);
         }
         Ok(Bytes::new())
+    }
+}
+
+fn suppress_native_thinking(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("thinking" | "thinking_delta")
+    ) {
+        object.insert("thinking".to_owned(), Value::String(String::new()));
     }
 }
 
@@ -1339,6 +1372,7 @@ mod tests {
         let response = rewrite_native_response(
             br#"{"id":"msg_1","type":"message","role":"assistant","model":"internal","content":[{"type":"thinking","thinking":"work","signature":"sig"},{"type":"text","text":"done"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2},"future":true}"#,
             "public",
+            true,
         )
         .unwrap();
         let value: Value = serde_json::from_slice(&response).unwrap();
@@ -1346,7 +1380,17 @@ mod tests {
         assert_eq!(value["content"][0]["signature"], "sig");
         assert_eq!(value["future"], true);
 
-        let count = rewrite_native_response(br#"{"input_tokens":42}"#, "public").unwrap();
+        let hidden = rewrite_native_response(
+            br#"{"id":"msg_1","type":"message","role":"assistant","model":"internal","content":[{"type":"thinking","thinking":"private","signature":"sig"},{"type":"text","text":"done"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}"#,
+            "public",
+            false,
+        )
+        .unwrap();
+        let hidden: Value = serde_json::from_slice(&hidden).unwrap();
+        assert_eq!(hidden["content"][0]["thinking"], "");
+        assert_eq!(hidden["content"][0]["signature"], "sig");
+
+        let count = rewrite_native_response(br#"{"input_tokens":42}"#, "public", true).unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&count).unwrap()["input_tokens"],
             42
@@ -1360,7 +1404,7 @@ mod tests {
             "event: ping\ndata: {\"type\":\"ping\"}\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
         );
-        let mut rewriter = NativeStreamRewriter::new("public".to_owned());
+        let mut rewriter = NativeStreamRewriter::new("public".to_owned(), true);
         let split = source.len() / 2;
         let mut output = Vec::new();
         output.extend_from_slice(&rewriter.push(&source.as_bytes()[..split]).unwrap());
@@ -1371,6 +1415,22 @@ mod tests {
         assert!(output.contains("event: ping"));
         assert!(output.contains("event: message_stop"));
         assert!(!output.contains("internal"));
+    }
+
+    #[test]
+    fn hides_native_stream_thinking_but_preserves_signature() {
+        let source = concat!(
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"private\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"private delta\",\"estimated_tokens\":16}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\n\n"
+        );
+        let mut rewriter = NativeStreamRewriter::new("public".to_owned(), false);
+        let output = rewriter.push(source.as_bytes()).unwrap();
+        let output = String::from_utf8(output.to_vec()).unwrap();
+        assert!(!output.contains("private"));
+        assert!(output.contains(r#""thinking":"""#));
+        assert!(output.contains(r#""estimated_tokens":16"#));
+        assert!(output.contains(r#""signature":"sig""#));
     }
 
     #[test]

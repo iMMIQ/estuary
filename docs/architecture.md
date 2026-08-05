@@ -8,8 +8,8 @@ This document describes the current gateway foundation, SQLite-backed control pl
 - A node's `max_concurrency` permit covers the upstream request and complete upstream response body. Streaming consumers are isolated by a one-chunk bounded pump and a stall timeout; non-streaming successes use a separately bounded complete buffer.
 - Scheduling, permits, queued-body accounting, health, and prefix knowledge are process-local. The supported multi-process topology divides each node budget among fixed gateway slots and replaces one slot at a time.
 - Generic-node prefix knowledge is an approximation derived from requests assigned by this gateway. vLLM 0.25+ nodes can additionally supply exact local GPU block events.
-- OpenAI fast paths preserve unknown request fields. Native Anthropic requests do the same and use Messages and count-tokens routes. When a model alias must be rewritten, these paths change only the top-level `model` field and serialize the JSON again. Converted Anthropic requests are rebuilt for either OpenAI Responses or Chat Completions.
-- OpenAI Responses client SSE/body bytes pass through a one-chunk bounded channel unchanged. Native Anthropic SSE is incrementally framed only to rewrite the public model in `message_start`; the Responses and Chat adapters emit correctly ordered named Messages events through the same bounded backpressure path.
+- OpenAI fast paths preserve unknown request fields. Native Anthropic requests use Messages and count-tokens routes and preserve unknown fields while applying narrow Claude Code/vLLM compatibility changes: billing-marker removal, no-op context-edit removal, model alias rewriting, and `enable_thinking` template control. Converted Anthropic requests are rebuilt for either OpenAI Responses or Chat Completions.
+- OpenAI Responses client SSE/body bytes pass through a one-chunk bounded channel unchanged. Native Anthropic SSE is incrementally framed to rewrite the public model and suppress thinking text when the client requests omitted display; the Responses and Chat adapters emit correctly ordered named Messages events through the same bounded backpressure path. Every Anthropic streaming mode receives gateway-generated keep-alive pings.
 
 ## Control plane and persistence
 
@@ -43,7 +43,7 @@ flowchart LR
     N -->|complete body or error| R
 ```
 
-The request is read into a bounded `Bytes` value, then parsed as `serde_json::Value` only for routing metadata, model rewriting, prefix extraction, and narrow prompt normalization. A standalone single-line Claude Code `x-anthropic-billing-header:` text block is removed from a top-level system value or an adapter-produced system message before the same parsed value reaches local prefix routing, vLLM tokenization, and upstream serialization. No environment, tool, user, or multiline system content is stripped. Client credentials and hop-by-hop headers are removed. The stored node Bearer key, configured node headers, and legacy environment-backed secrets are injected after client headers, and redirects are disabled.
+The request is read into a bounded `Bytes` value, then parsed as `serde_json::Value` only for routing metadata, model rewriting, prefix extraction, and narrow prompt normalization. A standalone single-line Claude Code `x-anthropic-billing-header:` text block is removed from a top-level system value or an adapter-produced system message before the same parsed value reaches local prefix routing, vLLM tokenization, and upstream serialization. Claude Code's `clear_thinking_20251015` with `keep: all` is removed as a semantic no-op; other context-management edits fail explicitly because vLLM 0.25 cannot apply them. No environment, tool, user, or multiline system content is stripped. Client credentials and hop-by-hop headers are removed. The stored node Bearer key, configured node headers, and legacy environment-backed secrets are injected after client headers, and redirects are disabled.
 
 For Anthropic Messages, request conversion is attempted before scheduling. The node's `provider.anthropic_protocol` resolves `auto` to native for vLLM and Chat for generic providers, or selects an explicit `native`, `responses`, or `chat` adapter. Nodes whose adapter cannot preserve the request are included in the initial exclusion set. The remaining nodes still use the same scheduling class and queue.
 
@@ -152,7 +152,7 @@ Retries require another routable node and are capped to one through three total 
 - Node configuration and lifecycle are persisted and reconciled across same-host process slots; process-wide routing and timeout policy changes still require a restart.
 - Exact vLLM routing is process-local and deliberately excludes remote/offloaded, LoRA, salted, and multimodal cache keys.
 - No Responses background mode, `previous_response_id`, conversation state, or `/responses/{id}` operations. Callers should set `store: false`; an object stored by an upstream is not retrievable through this gateway.
-- Native vLLM Anthropic capability follows the installed vLLM 0.25+ version. Responses and Chat conversion cannot represent every Messages feature; server tools, document/citation blocks, Files, and redacted thinking require a native-capable node.
+- Native vLLM Anthropic capability follows the installed vLLM 0.25+ version. Estuary maps thinking enablement, but vLLM 0.25 does not expose exact Anthropic thinking budgets through its native request model; the response carries an approximation warning. Responses and Chat conversion cannot represent every Messages feature. vLLM has no Files storage service, and Estuary currently returns an explicit Anthropic error for Claude Code file downloads.
 - No exactly-once guarantee for retried generation requests.
 
 ## Planned extension seams

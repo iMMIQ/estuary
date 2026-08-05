@@ -628,6 +628,61 @@ async fn native_anthropic_count(
     Json(json!({"input_tokens": 73, "context_management": {"original_input_tokens": 81}}))
 }
 
+async fn slow_native_anthropic_stream() -> Response {
+    let body = async_stream::stream! {
+        yield Ok::<_, Infallible>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_slow\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"internal-model\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+        ));
+        sleep(Duration::from_millis(10_200)).await;
+        yield Ok::<_, Infallible>(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ));
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(body))
+        .expect("slow native Anthropic SSE")
+}
+
+#[tokio::test]
+async fn native_anthropic_stream_injects_keepalive_ping() {
+    let upstream =
+        TestServer::spawn(Router::new().route("/v1/messages", post(slow_native_anthropic_stream)))
+            .await;
+    let mut native_node = node(
+        "native-stream-node",
+        &upstream,
+        [("claude", "internal-model")],
+    );
+    native_node.provider.anthropic_protocol = AnthropicProtocol::Native;
+    let gateway = spawn_gateway(vec![native_node]).await;
+    let response = test_client()
+        .post(gateway.url("/v1/messages"))
+        .json(&json!({
+            "model": "claude", "max_tokens": 16, "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("native Anthropic SSE response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = timeout(Duration::from_secs(15), response.text())
+        .await
+        .expect("native Anthropic keepalive timeout")
+        .expect("native Anthropic SSE body");
+    let start = body
+        .find("event: message_start")
+        .unwrap_or_else(|| panic!("missing message_start in {body:?}"));
+    let ping = body
+        .find("event: ping")
+        .unwrap_or_else(|| panic!("missing ping in {body:?}"));
+    let stop = body
+        .find("event: message_stop")
+        .unwrap_or_else(|| panic!("missing message_stop in {body:?}"));
+    assert!(start < ping && ping < stop);
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn vllm_native_anthropic_supports_hello_messages_and_count_tokens() {
@@ -690,7 +745,10 @@ async fn vllm_native_anthropic_supports_hello_messages_and_count_tokens() {
                 {"role": "system", "content": "inline native system"},
                 {"role": "user", "content": "hello"}
             ],
-            "thinking": {"type": "adaptive"},
+            "thinking": {"type": "enabled", "budget_tokens": 2048, "display": "omitted"},
+            "context_management": {
+                "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+            },
             "output_config": {"effort": "high"},
             "future_claude_code_field": {"preserved": true}
         }))
@@ -698,8 +756,13 @@ async fn vllm_native_anthropic_supports_hello_messages_and_count_tokens() {
         .await
         .expect("native Messages response");
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-estuary-thinking-budget").unwrap(),
+        "approximated-by-max-tokens"
+    );
     let response: Value = response.json().await.expect("native Messages JSON");
     assert_eq!(response["model"], "claude-public");
+    assert_eq!(response["content"][0]["thinking"], "");
     assert_eq!(response["content"][0]["signature"], "native-signature");
     assert_eq!(response["future_native_field"], true);
     let captured = timeout(IO_TIMEOUT, message_receiver.recv())
@@ -707,7 +770,9 @@ async fn vllm_native_anthropic_supports_hello_messages_and_count_tokens() {
         .expect("native Messages capture timeout")
         .expect("native Messages missing");
     assert_eq!(captured["model"], "internal-model");
-    assert_eq!(captured["thinking"]["type"], "adaptive");
+    assert_eq!(captured["thinking"]["type"], "enabled");
+    assert_eq!(captured["chat_template_kwargs"]["enable_thinking"], true);
+    assert!(captured.get("context_management").is_none());
     assert_eq!(captured["future_claude_code_field"]["preserved"], true);
     assert_eq!(captured["system"].as_array().unwrap().len(), 1);
     assert_eq!(captured["messages"][0]["role"], "system");
@@ -739,6 +804,22 @@ async fn vllm_native_anthropic_supports_hello_messages_and_count_tokens() {
     assert_eq!(
         captured["messages"][0]["content"][0]["type"],
         "tool_reference"
+    );
+
+    let file = client
+        .get(format!("http://{public}/v1/files/file_capture/content"))
+        .send()
+        .await
+        .expect("Claude Code file error response");
+    assert_eq!(file.status(), StatusCode::BAD_REQUEST);
+    let file: Value = file.json().await.expect("Anthropic file error JSON");
+    assert_eq!(file["type"], "error");
+    assert_eq!(file["error"]["type"], "invalid_request_error");
+    assert!(
+        file["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("file service")
     );
 
     gateway.abort();
