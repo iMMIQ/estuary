@@ -55,7 +55,7 @@ jobs:
           echo "release=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
           echo "sysroot=$(rustc --print sysroot)" >> "$GITHUB_OUTPUT"
       - name: Cache musl standard library
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ steps.rust.outputs.sysroot }}/lib/rustlib/x86_64-unknown-linux-musl
           key: rust-std-${{ runner.os }}-${{ steps.rust.outputs.release }}-x86_64-unknown-linux-musl

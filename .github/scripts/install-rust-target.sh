@@ -13,14 +13,11 @@ if find "$target_libdir" -maxdepth 1 -name 'libstd-*.rlib' -print -quit 2>/dev/n
 fi
 
 release="$(rustc -Vv | sed -n 's/^release: //p')"
-release_date="$(rustc -Vv | sed -n 's/^commit-date: //p')"
-if [[ -z "$release" || -z "$release_date" ]]; then
-  echo "Unable to determine the active Rust release and commit date" >&2
+if [[ -z "$release" ]]; then
+  echo "Unable to determine the active Rust release" >&2
   exit 1
 fi
 
-archive="rust-std-${release}-${target}.tar.xz"
-url="${dist_server%/}/dist/${release_date}/${archive}"
 temp_dir="$(mktemp -d)"
 trap 'rm -rf "$temp_dir"' EXIT
 
@@ -39,6 +36,18 @@ curl_args=(
   --user-agent "$user_agent"
 )
 
+manifest="channel-rust-${release}.toml"
+curl "${curl_args[@]}" \
+  --output "$temp_dir/$manifest" \
+  "${dist_server%/}/dist/$manifest"
+release_date="$(sed -n 's/^date = "\([^"]*\)"/\1/p' "$temp_dir/$manifest" | head -n 1)"
+if [[ -z "$release_date" ]]; then
+  echo "Unable to resolve the distribution date for Rust $release" >&2
+  exit 1
+fi
+
+archive="rust-std-${release}-${target}.tar.xz"
+url="${dist_server%/}/dist/${release_date}/${archive}"
 echo "Downloading $target standard library from $dist_server"
 curl "${curl_args[@]}" --output "$temp_dir/$archive" "$url"
 curl "${curl_args[@]}" --output "$temp_dir/$archive.sha256" "$url.sha256"
