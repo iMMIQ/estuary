@@ -43,7 +43,7 @@ Upstream credentials are configured independently per node through environment-v
 
 `max_concurrency` is a hard limit for each node within one gateway process. Streaming responses use an independent one-chunk bounded pump; non-streaming successes are buffered up to `max_non_streaming_response_bytes` before downstream commit. The permit is released on upstream EOF, error, configured timeout, or client cancellation. A client that stops draining a stream cannot hold a node slot beyond `downstream_stall_timeout_ms`. With `N` active-active gateway replicas, a node can receive up to `N * max_concurrency` requests.
 
-Use one active gateway instance in phase one. If multiple active instances are required, divide each node's total budget among the instances and accept that each instance has independent queue and prefix state. A distributed lease service is required for a strict fleet-wide limit.
+The supported production layout runs two or more fixed process slots on one host. Divide each node's total budget among the serving slots; queues, health, circuits, and prefix state remain process-local. The rolling deployer replaces one slot at a time without overlapping generations in that slot. A distributed lease service is still required for a strict fleet-wide limit across arbitrary replicas.
 
 ### Prefix locality and vLLM
 
@@ -83,7 +83,7 @@ Each node also has an independent circuit breaker. Consecutive transport, 5xx, o
 
 Rust 1.85 or newer is required.
 
-This repository routes Cargo's crates.io sparse index and crate downloads through the USTC mirror in [`.cargo/config.toml`](.cargo/config.toml). CI also uses USTC's Rust distribution mirror, and the runtime image installs Debian packages from USTC.
+This repository routes Cargo's crates.io sparse index and crate downloads through the USTC mirror in [`.cargo/config.toml`](.cargo/config.toml). GitHub Actions deliberately uses the official Cargo, Rust, npm, and GitHub sources.
 
 ```bash
 mkdir -p data
@@ -93,7 +93,7 @@ cargo run --release -- \
   --admin-listen 127.0.0.1:9090
 ```
 
-Open `http://127.0.0.1:9090/admin/` and add the first upstream. The process starts normally with an empty database; readiness remains `503` until a routable node exists. `ESTUARY_DATABASE`, `ESTUARY_LISTEN`, `ESTUARY_ADMIN_LISTEN`, and `ESTUARY_LOG_JSON` are the environment-variable equivalents. Logging filters use `RUST_LOG`.
+Open `http://127.0.0.1:9090/admin/` and add the first upstream. The process starts normally with an empty database; readiness remains `503` until a routable node exists. CLI options have `ESTUARY_*` environment-variable equivalents. In particular, `ESTUARY_WITHDRAWAL_DELAY_MS` controls load-balancer propagation and `ESTUARY_SHUTDOWN_GRACE_MS` bounds response draining. Logging filters use `RUST_LOG`.
 
 Check the model catalog:
 
@@ -143,7 +143,7 @@ For a streaming Response, add `"stream": true` and use `curl -N`. The gateway fo
 
 ## Configuration and persistence
 
-SQLite is the only node-configuration source. The schema is initialized automatically, uses WAL mode and optimistic revisions, and supports an empty first boot. Node create/update requests are validated and probed before entering the scheduler. Updating or deleting a node first drains it and waits for active leases; a timeout leaves the node safely draining for a later retry.
+SQLite is the only node-configuration source. The schema is initialized automatically, uses WAL mode and optimistic revisions, and supports an empty first boot. Additive triggers maintain a database-wide control revision; processes sharing the same local database poll that revision and reconcile node create, update, delete, drain, and resume operations into their own schedulers. Node candidates are validated and probed before entering any scheduler. Updating or deleting a node first drains it and waits for active leases; a timeout leaves the node safely draining for a later retry.
 
 The management UI at `/admin/` edits node URLs, model aliases, concurrency, weights, provider settings, environment-backed credentials, and vLLM KV event endpoints. `api_key_env` and `headers_from_env` store environment-variable names, never secret values. The corresponding environment variables must exist in the Estuary process before a node using them can pass validation.
 
@@ -183,13 +183,15 @@ The admin listener exposes:
 | `GET /health/ready` | `200` when at least one node is serving and passes health, provider, and circuit gates; otherwise `503`. |
 | `GET /metrics` | OpenMetrics text exposition. |
 | `GET /admin/` | Embedded management application. |
+| `GET /admin/api/process` | Process lifecycle, in-flight response, and local queue status. |
+| `PUT /admin/api/process/drain` | Disable readiness, wait for LB withdrawal, stop accepting new connections, finish accepted responses, and exit. |
 | `GET /admin/nodes` | Node URL, health, active/available permits, weights, EWMA values, and last error. Treat as sensitive operational data. |
 | `GET/POST /admin/api/nodes` | List or preflight and create persisted nodes. |
 | `GET/PUT/DELETE /admin/api/nodes/{id}` | Read, revision-checked update, or graceful deletion. |
 | `PUT /admin/nodes/{id}/drain` | Stop new assignments while active requests finish. Add `?wait=true&timeout_ms=30000` to wait for zero active leases; timeout returns `202`. |
 | `DELETE /admin/nodes/{id}/drain` | Resume assignments, subject to health, provider, and circuit gates. |
 
-Do not use upstream availability as a liveness probe: restarting the gateway cannot repair an unavailable model server. Use `/health/live` for container liveness and `/health/ready` for traffic admission.
+Do not use upstream availability as a liveness probe: restarting the gateway cannot repair an unavailable model server. Use `/health/live` for process supervision and `/health/ready` for traffic admission.
 
 With the production default `health.route_while_starting: false`, a node is not routable until its first successful active probe; that first success immediately marks it healthy. After a node becomes unhealthy, `healthy_threshold` consecutive successful probes are required for recovery. Active probes are spread by up to `jitter_percent` of the interval to avoid synchronized bursts.
 
@@ -216,27 +218,25 @@ Important metric families include:
 - `estuary_prefix_match_chars`
 - `estuary_prefix_match_tokens`
 
-Request duration includes the complete buffered body for non-streaming successes, but ends when the streaming response handle is created. Streaming node permits remain held by the upstream pump until EOF, error, cancellation, or a configured body/stall timeout. SIGINT/SIGTERM first drains all nodes, stops accepting new connections, and then allows existing responses to finish within `shutdown_grace_ms`.
+Request duration includes the complete buffered body for non-streaming successes, but ends when the streaming response handle is created. Streaming node permits remain held by the upstream pump until EOF, error, cancellation, or a configured body/stall timeout. SIGINT, SIGTERM, and the process-drain API first make readiness fail, wait `withdrawal_delay_ms`, stop the public listener, and then let accepted queue entries and complete response bodies finish within `shutdown_grace_ms`. Upstream nodes remain routable to accepted requests during this process drain.
 
-## Docker Compose
+## Zero-downtime binary deployment
 
-Compose binds both ports to loopback by default and persists SQLite in the `estuary-data` named volume:
+GitHub Releases contain static Linux binaries for `amd64` and `arm64`, together with the files under [`deploy/`](deploy/). The supported deployment uses HAProxy on stable ports and two fixed systemd process slots on one host:
 
-```bash
-docker compose up --build
+```console
+sudo ./deploy/install.sh ./estuary
 ```
 
-Open `http://127.0.0.1:9090/admin/`. Add any upstream credential environment variables to the service before registering nodes that reference them. Removing the container does not remove the named volume; use `docker compose down -v` only when the database should be deleted.
+Review `/etc/estuary/common.env` before registering nodes that reference credential environment variables. HAProxy exposes the public API on `:8080` and management on loopback `:9090`; slot listeners stay on loopback-only internal ports.
 
-Release images are published for `linux/amd64` and `linux/arm64` in GitHub Container Registry:
+Roll out a staged binary one slot at a time:
 
-```bash
-docker pull ghcr.io/immiq/estuary:latest
+```console
+sudo ./deploy/rollout.sh ./estuary
 ```
 
-Use an immutable version such as `ghcr.io/immiq/estuary:0.2.0` in production. The image also carries major/minor and major tags.
-
-The image runs as UID/GID `10001`, has a read-only root filesystem under Compose, does not follow upstream redirects, and uses `/health/live` for its image health check. For Kubernetes, keep the admin port behind a NetworkPolicy and set the pod termination grace period above `shutdown_grace_ms`; after that application grace period, remaining public or admin server tasks and their active streams are aborted.
+The script drains slot A and waits for every accepted response before replacing it, verifies readiness, then repeats for slot B. Failed replacements automatically restore the previous binary for that slot. A stream exceeding the configured deploy deadline leaves its old process alive and drained instead of being killed. Full topology, capacity, package, and rollback details are in [`deploy/README.md`](deploy/README.md).
 
 ## Development checks
 

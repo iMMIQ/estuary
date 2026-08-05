@@ -6,14 +6,14 @@ This document describes the current gateway foundation, SQLite-backed control pl
 
 - Public inference routes are an allowlist: Chat Completions, foreground Responses create, legacy Completions, and Embeddings. Model list/get are generated locally.
 - A node's `max_concurrency` permit covers the upstream request and complete upstream response body. Streaming consumers are isolated by a one-chunk bounded pump and a stall timeout; non-streaming successes use a separately bounded complete buffer.
-- Scheduling, permits, queued-body accounting, health, and prefix knowledge are process-local. The production topology is single-active unless node budgets are explicitly divided between gateway replicas.
+- Scheduling, permits, queued-body accounting, health, and prefix knowledge are process-local. The supported multi-process topology divides each node budget among fixed gateway slots and replaces one slot at a time.
 - Generic-node prefix knowledge is an approximation derived from requests assigned by this gateway. vLLM 0.25+ nodes can additionally supply exact local GPU block events.
 - The gateway preserves unknown request fields. When a model alias must be rewritten, it changes only the top-level `model` field and serializes the JSON again.
 - Upstream SSE/body bytes pass through a one-chunk bounded channel with backpressure. The gateway does not parse and reconstruct OpenAI or Responses events.
 
 ## Control plane and persistence
 
-SQLite is the sole persisted node registry. Schema initialization and version checks happen before listeners start; WAL mode and a busy timeout bound writer contention. Each row stores a strictly validated `NodeConfig` JSON document plus an optimistic revision and timestamps. Secret values are never accepted as credential fields: persisted credential configuration contains environment-variable names.
+SQLite is the sole persisted node registry. Schema initialization and version checks happen before listeners start; WAL mode and a busy timeout bound writer contention. Each row stores a strictly validated `NodeConfig` JSON document plus an optimistic revision and timestamps. Additive triggers update a global control revision for every write, including writes from an older process. Each process polls this revision and reconciles changed rows into its local scheduler. The database must live on a local filesystem shared by the process slots, never NFS. Secret values are never accepted as credential fields: persisted credential configuration contains environment-variable names.
 
 Create and update operations build a candidate node and perform its authenticated health check before mutation. vLLM candidates additionally have to pass the fixed 0.25.0 version gate and a metrics scrape. Creation persists the validated row before adding it to the scheduler. Update validates the replacement while the old node remains live, then drains the old node, waits for active leases to reach zero, revision-checks the SQLite update, and swaps the runtime `Arc<Node>`. Deletion follows the same drain-and-wait rule before removing persistence and runtime state. A timeout leaves the existing node draining instead of cancelling inference.
 
@@ -121,7 +121,7 @@ Five independent time bounds are used:
 - `upstream_body_timeout_ms`: absolute lifetime of the complete upstream body;
 - `downstream_stall_timeout_ms`: each wait for space in the bounded downstream channel.
 
-The body and stall deadlines release the node permit even if either peer keeps a connection open indefinitely. A streaming timeout after successful response headers cannot be replaced with a fresh OpenAI JSON envelope; the HTTP body terminates with an error instead. On SIGINT/SIGTERM, every node first enters draining, Axum stops accepting new connections, and active work gets `shutdown_grace_ms`; remaining server tasks and streams are then aborted.
+The body and stall deadlines release the node permit even if either peer keeps a connection open indefinitely. A streaming timeout after successful response headers cannot be replaced with a fresh OpenAI JSON envelope; the HTTP body terminates with an error instead. On SIGINT, SIGTERM, or process drain, process readiness is disabled first. After `withdrawal_delay_ms`, Axum stops accepting public connections while existing queue entries keep using serving upstream nodes. A response-body guard covers buffered and streaming responses until EOF or downstream cancellation. The process exits after all accepted responses finish, or aborts them only when `shutdown_grace_ms` expires.
 
 ## Health and retry state
 
@@ -147,7 +147,7 @@ Retries require another routable node and are capped to one through three total 
 - No inbound API-key authentication, tenant quotas, or priorities.
 - No global concurrency guarantee across active-active replicas.
 - No shared queue, health, or prefix state.
-- Node configuration and lifecycle are persisted and dynamically applied; process-wide routing and timeout policy changes still require a restart.
+- Node configuration and lifecycle are persisted and reconciled across same-host process slots; process-wide routing and timeout policy changes still require a restart.
 - Exact vLLM routing is process-local and deliberately excludes remote/offloaded, LoRA, salted, and multimodal cache keys.
 - No Responses background mode, `previous_response_id`, conversation state, or `/responses/{id}` operations. Callers should set `store: false`; an object stored by an upstream is not retrievable through this gateway.
 - No Anthropic Messages/Claude Code protocol endpoint.

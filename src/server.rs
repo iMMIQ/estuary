@@ -1,13 +1,18 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     path::Path as FsPath,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{
         HeaderValue, StatusCode,
@@ -17,6 +22,8 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{any, get, put},
 };
+use futures_util::StreamExt;
+use parking_lot::RwLock;
 use reqwest::redirect::Policy;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -35,6 +42,7 @@ use crate::{
     config::{NodeConfig, validate_node_config},
     error::GatewayError,
     health::{preflight_health, run_health_monitor},
+    lifecycle::ProcessLifecycle,
     metrics::Metrics,
     node::{CircuitState, LifecycleState, Node, NodeSnapshot},
     proxy,
@@ -53,6 +61,9 @@ pub struct AppState {
     pub(crate) settings: Arc<Settings>,
     pub(crate) vllm: Arc<VllmManager>,
     pub(crate) store: Arc<NodeStore>,
+    pub(crate) process: Arc<ProcessLifecycle>,
+    runtime_revisions: RwLock<HashMap<String, u64>>,
+    control_revision: AtomicU64,
     admin_mutation: AsyncMutex<()>,
 }
 
@@ -78,8 +89,13 @@ impl Gateway {
 
     fn build_with_store(settings: Settings, store: Arc<NodeStore>) -> Result<Self> {
         settings.validate()?;
-        let nodes = store
-            .list()?
+        let stored_nodes = store.list()?;
+        let runtime_revisions = stored_nodes
+            .iter()
+            .map(|stored| (stored.config.id.clone(), stored.revision))
+            .collect();
+        let control_revision = store.revision()?;
+        let nodes = stored_nodes
             .into_iter()
             .map(|stored| {
                 Node::from_config_with_policies(
@@ -107,6 +123,9 @@ impl Gateway {
                 settings: Arc::new(settings),
                 vllm,
                 store,
+                process: ProcessLifecycle::new(),
+                runtime_revisions: RwLock::new(runtime_revisions),
+                control_revision: AtomicU64::new(control_revision),
                 admin_mutation: AsyncMutex::new(()),
             }),
         })
@@ -125,6 +144,10 @@ impl Gateway {
                 observe_request,
             ))
             .layer(middleware::from_fn(assign_request_id))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&self.state),
+                track_public_response,
+            ))
             .with_state(Arc::clone(&self.state))
     }
 
@@ -138,6 +161,8 @@ impl Gateway {
             .route("/metrics", get(metrics))
             .route("/admin/nodes", get(nodes))
             .route("/admin/api/status", get(admin_status))
+            .route("/admin/api/process", get(process_status))
+            .route("/admin/api/process/drain", put(drain_process))
             .route(
                 "/admin/api/nodes/preflight",
                 axum::routing::post(preflight_node),
@@ -177,9 +202,11 @@ impl Gateway {
         info!(address = %public_address, "public API listening");
         info!(address = %admin_address, "admin API listening");
 
-        let cancellation = CancellationToken::new();
+        let public_cancellation = CancellationToken::new();
+        let admin_cancellation = CancellationToken::new();
         let (health_shutdown, health_receiver) = watch::channel(false);
         let (provider_shutdown, provider_receiver) = watch::channel(false);
+        let (control_shutdown, control_receiver) = watch::channel(false);
         let health_handle = tokio::spawn(run_health_monitor(
             self.state.client.clone(),
             Arc::clone(&self.state.scheduler),
@@ -189,16 +216,20 @@ impl Gateway {
         let provider_handle = tokio::spawn(
             Arc::clone(&self.state.vllm).run(self.state.client.clone(), provider_receiver),
         );
+        let control_handle = tokio::spawn(run_control_reconciler(
+            Arc::clone(&self.state),
+            control_receiver,
+        ));
 
         let public_router = self.public_router();
         let admin_router = self.admin_router();
-        let public_token = cancellation.clone();
+        let public_token = public_cancellation.clone();
         let mut public_handle: JoinHandle<std::io::Result<()>> = tokio::spawn(async move {
             axum::serve(public_listener, public_router)
                 .with_graceful_shutdown(public_token.cancelled_owned())
                 .await
         });
-        let admin_token = cancellation.clone();
+        let admin_token = admin_cancellation.clone();
         let mut admin_handle: JoinHandle<std::io::Result<()>> = tokio::spawn(async move {
             axum::serve(admin_listener, admin_router)
                 .with_graceful_shutdown(admin_token.cancelled_owned())
@@ -214,58 +245,229 @@ impl Gateway {
                 if let Err(error) = flatten_server_result(result) {
                     first_error = Some(error);
                 }
+                self.state.process.request_shutdown();
             }
             result = &mut admin_handle => {
                 admin_done = true;
                 if let Err(error) = flatten_server_result(result) {
                     first_error = Some(error);
                 }
+                self.state.process.request_shutdown();
             }
             () = shutdown_signal() => {
                 info!("shutdown signal received");
+                self.state.process.request_shutdown();
+            }
+            () = self.state.process.shutdown_requested() => {
+                info!("process drain requested");
             }
         }
 
-        self.state.scheduler.drain_all();
-        info!("all upstream nodes are draining");
-        cancellation.cancel();
+        if let Some(error) = self
+            .drain_http_servers(
+                public_done,
+                admin_done,
+                &mut public_handle,
+                &mut admin_handle,
+                &public_cancellation,
+                &admin_cancellation,
+            )
+            .await
+        {
+            first_error.get_or_insert(error);
+        }
         let _ = health_shutdown.send(true);
         let _ = provider_shutdown.send(true);
-        let shutdown_grace = Duration::from_millis(self.state.settings.server.shutdown_grace_ms);
-        if !public_done {
-            if let Err(error) = finish_server("public", &mut public_handle, shutdown_grace).await {
-                first_error.get_or_insert(error);
-            }
-        }
-        if !admin_done {
-            if let Err(error) = finish_server("admin", &mut admin_handle, shutdown_grace).await {
-                first_error.get_or_insert(error);
-            }
-        }
+        let _ = control_shutdown.send(true);
         if let Err(error) = health_handle.await {
             error!(error = %error, "health monitor task failed");
         }
         if let Err(error) = provider_handle.await {
             error!(error = %error, "vLLM provider monitor task failed");
         }
+        if let Err(error) = control_handle.await {
+            error!(error = %error, "control-plane reconciler task failed");
+        }
+        self.state.process.mark_drained();
         if let Some(error) = first_error {
             return Err(error);
         }
         Ok(())
+    }
+
+    async fn drain_http_servers(
+        &self,
+        public_done: bool,
+        admin_done: bool,
+        public_handle: &mut JoinHandle<std::io::Result<()>>,
+        admin_handle: &mut JoinHandle<std::io::Result<()>>,
+        public_cancellation: &CancellationToken,
+        admin_cancellation: &CancellationToken,
+    ) -> Option<anyhow::Error> {
+        let withdrawal_delay =
+            Duration::from_millis(self.state.settings.server.withdrawal_delay_ms);
+        if !public_done && !withdrawal_delay.is_zero() {
+            info!(
+                ?withdrawal_delay,
+                "readiness disabled; waiting for load balancer withdrawal"
+            );
+            tokio::time::sleep(withdrawal_delay).await;
+        }
+
+        self.state.process.mark_draining();
+        public_cancellation.cancel();
+        let shutdown_grace = Duration::from_millis(self.state.settings.server.shutdown_grace_ms);
+        let deadline = tokio::time::Instant::now() + shutdown_grace;
+        let mut first_error = None;
+        if !public_done {
+            if let Err(error) = finish_server("public", public_handle, deadline).await {
+                first_error = Some(error);
+            }
+        }
+        if tokio::time::timeout_at(deadline, self.state.process.wait_for_idle())
+            .await
+            .is_err()
+        {
+            warn!(
+                in_flight = self.state.process.in_flight_responses(),
+                "response drain timed out"
+            );
+        }
+
+        admin_cancellation.cancel();
+        if !admin_done {
+            if let Err(error) = finish_server("admin", admin_handle, deadline).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error
+    }
+}
+
+async fn run_control_reconciler(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+    let mut interval = tokio::time::interval(Duration::from_millis(
+        state.settings.server.control_sync_interval_ms,
+    ));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                if let Err(error) = reconcile_control_plane(&state).await {
+                    warn!(error = %error, "failed to reconcile shared node configuration");
+                }
+            }
+        }
+    }
+}
+
+async fn reconcile_control_plane(state: &Arc<AppState>) -> Result<()> {
+    let observed = state.store.revision()?;
+    if observed == state.control_revision.load(AtomicOrdering::Acquire) {
+        return Ok(());
+    }
+
+    let _mutation = state.admin_mutation.lock().await;
+    let before = state.store.revision()?;
+    let stored_nodes = state.store.list()?;
+    let after = state.store.revision()?;
+    if before != after {
+        return Ok(());
+    }
+
+    let persisted_ids = stored_nodes
+        .iter()
+        .map(|stored| stored.config.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut failures = Vec::new();
+    for stored in stored_nodes {
+        let current_revision = state
+            .runtime_revisions
+            .read()
+            .get(&stored.config.id)
+            .copied();
+        if current_revision == Some(stored.revision)
+            && state.scheduler.node(&stored.config.id).is_some()
+        {
+            continue;
+        }
+
+        let replacement = match prepare_node(state, &stored.config).await {
+            Ok(node) => node,
+            Err(error) => {
+                if let Some(previous) = state.scheduler.node(&stored.config.id) {
+                    previous.set_draining(true);
+                    state.scheduler.notify_state_change();
+                }
+                failures.push(format!("{}: {error:#}", stored.config.id));
+                continue;
+            }
+        };
+        if let Some(previous) = state.scheduler.node(&stored.config.id) {
+            previous.set_draining(true);
+            state.scheduler.notify_state_change();
+            let timeout = Duration::from_millis(state.settings.server.node_mutation_timeout_ms);
+            if !state.scheduler.wait_for_node_idle(&previous, timeout).await {
+                failures.push(format!(
+                    "{}: active requests did not drain",
+                    stored.config.id
+                ));
+                continue;
+            }
+            if let Err(error) = state.scheduler.replace_node(&replacement) {
+                failures.push(format!("{}: {error}", stored.config.id));
+                continue;
+            }
+        } else if let Err(error) = state.scheduler.add_node(Arc::clone(&replacement)) {
+            failures.push(format!("{}: {error}", stored.config.id));
+            continue;
+        }
+        state
+            .runtime_revisions
+            .write()
+            .insert(stored.config.id, stored.revision);
+    }
+
+    for node in state.scheduler.nodes() {
+        if persisted_ids.contains(node.id()) {
+            continue;
+        }
+        node.set_draining(true);
+        state.scheduler.notify_state_change();
+        let timeout = Duration::from_millis(state.settings.server.node_mutation_timeout_ms);
+        if !state.scheduler.wait_for_node_idle(&node, timeout).await {
+            failures.push(format!(
+                "{}: active requests did not drain before removal",
+                node.id()
+            ));
+            continue;
+        }
+        state.scheduler.remove_node(node.id());
+        state.runtime_revisions.write().remove(node.id());
+    }
+
+    if failures.is_empty() {
+        state.control_revision.store(after, AtomicOrdering::Release);
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
     }
 }
 
 async fn finish_server(
     name: &'static str,
     handle: &mut JoinHandle<std::io::Result<()>>,
-    grace: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<()> {
-    if let Ok(result) = tokio::time::timeout(grace, &mut *handle).await {
+    if let Ok(result) = tokio::time::timeout_at(deadline, &mut *handle).await {
         flatten_server_result(result)
     } else {
         warn!(
             server = name,
-            ?grace,
             "graceful shutdown timed out; aborting server task"
         );
         handle.abort();
@@ -294,6 +496,24 @@ async fn assign_request_id(mut request: Request, next: Next) -> Response {
         response.headers_mut().insert("x-request-id", value);
     }
     response
+}
+
+async fn track_public_response(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let guard = state.process.track_response();
+    let response = next.run(request).await;
+    let (parts, body) = response.into_parts();
+    let stream = async_stream::stream! {
+        let _guard = guard;
+        let mut body = body.into_data_stream();
+        while let Some(item) = body.next().await {
+            yield item;
+        }
+    };
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 async fn observe_request(
@@ -403,7 +623,7 @@ async fn live() -> Json<serde_json::Value> {
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> Response {
-    let ready = state.scheduler.ready();
+    let ready = state.process.accepting_traffic() && state.scheduler.ready();
     (
         if ready {
             StatusCode::OK
@@ -412,6 +632,28 @@ async fn ready(State(state): State<Arc<AppState>>) -> Response {
         },
         Json(json!({
             "status": if ready { "ready" } else { "not_ready" }
+        })),
+    )
+        .into_response()
+}
+
+async fn process_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(json!({
+        "process": state.process.snapshot(),
+        "queue": {
+            "requests": state.scheduler.queue_snapshot().0,
+            "bytes": state.scheduler.queue_snapshot().1,
+        }
+    }))
+}
+
+async fn drain_process(State(state): State<Arc<AppState>>) -> Response {
+    let initiated = state.process.request_shutdown();
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "initiated": initiated,
+            "process": state.process.snapshot(),
         })),
     )
         .into_response()
@@ -544,13 +786,14 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
         }
     }
     let (queued_requests, queued_bytes) = state.scheduler.queue_snapshot();
-    let ready = routable_nodes > 0;
+    let ready = state.process.accepting_traffic() && routable_nodes > 0;
 
     Json(json!({
         "status": if ready { "ready" } else { "not_ready" },
         "live": true,
         "ready": ready,
         "version": env!("CARGO_PKG_VERSION"),
+        "process": state.process.snapshot(),
         "generated_at_unix_ms": unix_millis(),
         "fleet": {
             "total_nodes": nodes.len(),
@@ -647,6 +890,10 @@ async fn create_node(
         let _ = state.store.delete(&config.id, Some(stored.revision));
         return admin_internal_error("could not add node to runtime registry", &error);
     }
+    state
+        .runtime_revisions
+        .write()
+        .insert(config.id.clone(), stored.revision);
     (
         StatusCode::CREATED,
         Json(admin_node_payload(&state, &stored, &node)),
@@ -702,6 +949,7 @@ async fn update_node(
     };
     let was_draining = previous.lifecycle() == crate::node::LifecycleState::Draining;
     previous.set_draining(true);
+    state.scheduler.notify_state_change();
     let timeout = mutation_timeout(&state, query.timeout_ms);
     if !state.scheduler.wait_for_node_idle(&previous, timeout).await {
         return admin_conflict(
@@ -729,6 +977,10 @@ async fn update_node(
     if let Err(error) = state.scheduler.replace_node(&replacement) {
         return admin_internal_error("could not replace runtime node", &error);
     }
+    state
+        .runtime_revisions
+        .write()
+        .insert(node_id, updated.revision);
     Json(admin_node_payload(&state, &updated, &replacement)).into_response()
 }
 
@@ -757,6 +1009,7 @@ async fn delete_node(
     };
     let was_draining = node.lifecycle() == crate::node::LifecycleState::Draining;
     node.set_draining(true);
+    state.scheduler.notify_state_change();
     if !state
         .scheduler
         .wait_for_node_idle(&node, mutation_timeout(&state, query.timeout_ms))
@@ -782,6 +1035,7 @@ async fn delete_node(
         }
     }
     state.scheduler.remove_node(&node_id);
+    state.runtime_revisions.write().remove(&node_id);
     Json(json!({"deleted": true, "node": node_id})).into_response()
 }
 
@@ -800,7 +1054,7 @@ async fn prepare_node(state: &AppState, config: &NodeConfig) -> Result<Arc<Node>
 fn mutation_timeout(state: &AppState, timeout_ms: Option<u64>) -> Duration {
     Duration::from_millis(
         timeout_ms
-            .unwrap_or(state.settings.server.shutdown_grace_ms)
+            .unwrap_or(state.settings.server.node_mutation_timeout_ms)
             .min(3_600_000),
     )
 }
@@ -840,10 +1094,14 @@ async fn drain_node(
     let Some(node) = state.scheduler.set_node_draining(&node_id, true) else {
         return admin_internal_message("node is persisted but missing from the runtime registry");
     };
+    state
+        .runtime_revisions
+        .write()
+        .insert(node_id.clone(), stored.revision);
     let drained = if query.wait {
         let timeout_ms = query
             .timeout_ms
-            .unwrap_or(state.settings.server.shutdown_grace_ms)
+            .unwrap_or(state.settings.server.node_mutation_timeout_ms)
             .min(3_600_000);
         state
             .scheduler
@@ -894,6 +1152,10 @@ async fn resume_node(State(state): State<Arc<AppState>>, Path(node_id): Path<Str
     let Some(node) = state.scheduler.set_node_draining(&node_id, false) else {
         return admin_internal_message("node is persisted but missing from the runtime registry");
     };
+    state
+        .runtime_revisions
+        .write()
+        .insert(node_id, stored.revision);
     Json(json!({
         "node": node.id(),
         "lifecycle": node.lifecycle(),

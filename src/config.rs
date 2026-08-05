@@ -42,6 +42,9 @@ impl Settings {
             || self.server.stream_idle_timeout_ms == 0
             || self.server.upstream_body_timeout_ms == 0
             || self.server.downstream_stall_timeout_ms == 0
+            || self.server.control_sync_interval_ms == 0
+            || self.server.node_mutation_timeout_ms == 0
+            || self.server.withdrawal_delay_ms == 0
             || self.server.shutdown_grace_ms == 0
         {
             bail!("server timeout values must be greater than zero");
@@ -307,6 +310,9 @@ pub struct ServerConfig {
     pub stream_idle_timeout_ms: u64,
     pub upstream_body_timeout_ms: u64,
     pub downstream_stall_timeout_ms: u64,
+    pub control_sync_interval_ms: u64,
+    pub node_mutation_timeout_ms: u64,
+    pub withdrawal_delay_ms: u64,
     pub shutdown_grace_ms: u64,
     pub max_request_body_bytes: usize,
     pub max_non_streaming_response_bytes: usize,
@@ -324,7 +330,10 @@ impl Default for ServerConfig {
             stream_idle_timeout_ms: 300_000,
             upstream_body_timeout_ms: 3_600_000,
             downstream_stall_timeout_ms: 30_000,
-            shutdown_grace_ms: 30_000,
+            control_sync_interval_ms: 500,
+            node_mutation_timeout_ms: 30_000,
+            withdrawal_delay_ms: 10_000,
+            shutdown_grace_ms: 3_660_000,
             max_request_body_bytes: 16 * 1024 * 1024,
             max_non_streaming_response_bytes: 64 * 1024 * 1024,
             expose_node_header: false,

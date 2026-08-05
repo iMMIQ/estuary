@@ -37,7 +37,7 @@ pub struct Selection {
 
 #[derive(Debug)]
 struct Candidate {
-    node_index: usize,
+    node_instance_id: u64,
     node: Arc<Node>,
     upstream_model: Option<String>,
     prefix_match_chars: usize,
@@ -160,7 +160,7 @@ impl Scheduler {
             state_changed.as_mut().enable();
 
             for candidate in self.ranked_candidates(model, &prefix_input, excluded)? {
-                if registered.insert(candidate.node_index) {
+                if registered.insert(candidate.node_instance_id) {
                     acquisitions.push(Box::pin(async move {
                         let reservation = Arc::clone(&candidate.node).reserve().await;
                         (candidate, reservation)
@@ -174,7 +174,7 @@ impl Scheduler {
                     let Some((candidate, reservation)) = acquired else {
                         unreachable!("a guarded acquisition set is not empty");
                     };
-                    registered.remove(&candidate.node_index);
+                    registered.remove(&candidate.node_instance_id);
                     if !candidate.node.is_routable() {
                         drop(reservation);
                         continue;
@@ -186,7 +186,7 @@ impl Scheduler {
                             excluded,
                         )?
                         .into_iter()
-                        .find(|item| item.node_index == candidate.node_index);
+                        .find(|item| item.node_instance_id == candidate.node_instance_id);
                     let Some(candidate) = refreshed else {
                         drop(reservation);
                         continue;
@@ -245,7 +245,7 @@ impl Scheduler {
         let mut candidates = Vec::new();
 
         let nodes = self.nodes();
-        for (node_index, node) in nodes.iter().enumerate() {
+        for node in &nodes {
             if excluded.contains(node.id()) {
                 continue;
             }
@@ -284,7 +284,7 @@ impl Scheduler {
                 + self.config.latency_weight * normalized_latency
                 + self.config.error_weight * (error_ewma + health_penalty);
             candidates.push(Candidate {
-                node_index,
+                node_instance_id: node.instance_id(),
                 node: Arc::clone(node),
                 upstream_model,
                 prefix_match_chars: 0,
@@ -579,6 +579,48 @@ mod tests {
             .unwrap();
         assert_eq!(selected.node.id(), "second");
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn queued_reservations_keep_node_identity_when_registry_is_resorted() {
+        let first = node("a", 1);
+        let second = node("b", 1);
+        let inserted = node("0", 1);
+        let held_first = first.try_acquire(Arc::new(Notify::new())).unwrap();
+        let held_second = second.try_acquire(Arc::new(Notify::new())).unwrap();
+        let held_inserted = inserted.try_acquire(Arc::new(Notify::new())).unwrap();
+        let scheduler = Arc::new(Scheduler::new(
+            vec![Arc::clone(&first), Arc::clone(&second)],
+            RoutingConfig::default(),
+        ));
+        let pending = {
+            let scheduler = Arc::clone(&scheduler);
+            tokio::spawn(async move {
+                scheduler
+                    .acquire(
+                        Some("model"),
+                        prefix::PrefixInput::default(),
+                        &HashSet::new(),
+                        128,
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+        while scheduler.queue_snapshot().0 == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        scheduler.add_node(Arc::clone(&inserted)).unwrap();
+        drop(held_second);
+        let selected = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.node.id(), "b");
+        assert_eq!(selected.lease.node().id(), "b");
+        drop(held_first);
+        drop(held_inserted);
     }
 
     #[tokio::test]

@@ -197,6 +197,53 @@ async fn preflight_checks_a_node_without_persisting_it() {
 }
 
 #[tokio::test]
+async fn process_drain_disables_readiness_without_draining_upstream_nodes() {
+    let mut settings = Settings::default();
+    settings.health.route_while_starting = true;
+    settings.nodes = vec![node("http://127.0.0.1:1")];
+    let gateway = Gateway::build(settings).unwrap();
+    let admin = TestServer::spawn(gateway.admin_router()).await;
+    let client = client();
+
+    assert_eq!(
+        client
+            .get(admin.url("/health/ready"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let response = client
+        .put(admin.url("/admin/api/process/drain"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let payload = response.json::<Value>().await.unwrap();
+    assert_eq!(payload["process"]["state"], "quiescing");
+    assert_eq!(
+        client
+            .get(admin.url("/health/ready"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    let nodes = client
+        .get(admin.url("/admin/nodes"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(nodes["nodes"][0]["lifecycle"], "serving");
+}
+
+#[tokio::test]
 async fn serves_the_embedded_admin_application_with_security_headers() {
     let gateway = Gateway::build(Settings::default()).unwrap();
     let admin = TestServer::spawn(gateway.admin_router()).await;

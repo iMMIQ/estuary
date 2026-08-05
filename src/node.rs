@@ -386,6 +386,7 @@ impl Node {
     }
 
     pub fn set_draining(&self, draining: bool) -> bool {
+        let _circuit = self.circuit.lock();
         let next = if draining {
             LifecycleState::Draining
         } else {
@@ -600,7 +601,7 @@ impl Node {
             return None;
         }
         Self::refresh_circuit_locked(&mut circuit);
-        match circuit.state {
+        let ticket = match circuit.state {
             CircuitState::Closed => Some(CircuitTicket {
                 epoch: circuit.epoch,
                 half_open: false,
@@ -615,7 +616,9 @@ impl Node {
                 })
             }
             CircuitState::Open | CircuitState::HalfOpen => None,
-        }
+        }?;
+        self.active.fetch_add(1, Ordering::AcqRel);
+        Some(ticket)
     }
 
     fn refresh_circuit_locked(circuit: &mut CircuitRuntime) {
@@ -697,7 +700,6 @@ impl Node {
     pub fn try_acquire(self: &Arc<Self>, notify: Arc<Notify>) -> Option<NodeLease> {
         let permit = Arc::clone(&self.semaphore).try_acquire_owned().ok()?;
         let circuit_ticket = self.begin_circuit_request()?;
-        self.active.fetch_add(1, Ordering::AcqRel);
         Some(NodeLease {
             node: Arc::clone(self),
             permit: Some(permit),
@@ -860,7 +862,6 @@ impl NodeReservation {
     pub(crate) fn try_commit(self, notify: Arc<Notify>) -> Option<NodeLease> {
         let Self { node, permit } = self;
         let circuit_ticket = node.begin_circuit_request()?;
-        node.active.fetch_add(1, Ordering::AcqRel);
         Some(NodeLease {
             node,
             permit: Some(permit),

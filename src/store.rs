@@ -54,7 +54,24 @@ impl NodeStore {
                 revision INTEGER NOT NULL CHECK (revision > 0),
                 created_at_unix_ms INTEGER NOT NULL,
                 updated_at_unix_ms INTEGER NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS control_state (
+                singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+                revision INTEGER NOT NULL CHECK (revision > 0)
+            );
+            INSERT OR IGNORE INTO control_state (singleton, revision) VALUES (1, 1);
+            CREATE TRIGGER IF NOT EXISTS node_configs_control_insert
+            AFTER INSERT ON node_configs BEGIN
+                UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS node_configs_control_update
+            AFTER UPDATE ON node_configs BEGIN
+                UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS node_configs_control_delete
+            AFTER DELETE ON node_configs BEGIN
+                UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
+            END;",
         )?;
         let current: i64 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -87,6 +104,17 @@ impl NodeStore {
             .collect()
     }
 
+    pub fn revision(&self) -> Result<u64> {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT revision FROM control_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .context("failed to load control-plane revision")
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<StoredNode>> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
@@ -103,8 +131,9 @@ impl NodeStore {
         validate_node_config(config)?;
         let encoded = serde_json::to_string(config)?;
         let now = unix_millis();
-        let connection = self.connection.lock();
-        connection
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction
             .execute(
                 "INSERT INTO node_configs (
                     id, config_json, revision, created_at_unix_ms, updated_at_unix_ms
@@ -112,6 +141,7 @@ impl NodeStore {
                 params![config.id, encoded, now],
             )
             .with_context(|| format!("failed to insert node {:?}", config.id))?;
+        transaction.commit()?;
         Ok(StoredNode {
             config: config.clone(),
             revision: 1,
@@ -133,8 +163,9 @@ impl NodeStore {
         let encoded = serde_json::to_string(config)?;
         let now = unix_millis();
         let revision = expected_revision.saturating_add(1);
-        let connection = self.connection.lock();
-        let changed = connection.execute(
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
             "UPDATE node_configs
              SET config_json = ?1, revision = ?2, updated_at_unix_ms = ?3
              WHERE id = ?4 AND revision = ?5",
@@ -143,11 +174,12 @@ impl NodeStore {
         if changed == 0 {
             return Ok(None);
         }
-        let created_at_unix_ms = connection.query_row(
+        let created_at_unix_ms = transaction.query_row(
             "SELECT created_at_unix_ms FROM node_configs WHERE id = ?1",
             [id],
             |row| row.get(0),
         )?;
+        transaction.commit()?;
         Ok(Some(StoredNode {
             config: config.clone(),
             revision,
@@ -157,15 +189,17 @@ impl NodeStore {
     }
 
     pub fn delete(&self, id: &str, expected_revision: Option<u64>) -> Result<bool> {
-        let connection = self.connection.lock();
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = if let Some(revision) = expected_revision {
-            connection.execute(
+            transaction.execute(
                 "DELETE FROM node_configs WHERE id = ?1 AND revision = ?2",
                 params![id, revision],
             )?
         } else {
-            connection.execute("DELETE FROM node_configs WHERE id = ?1", [id])?
+            transaction.execute("DELETE FROM node_configs WHERE id = ?1", [id])?
         };
+        transaction.commit()?;
         Ok(changed == 1)
     }
 
@@ -248,6 +282,30 @@ mod tests {
             let store = NodeStore::open(&path).unwrap();
             assert_eq!(store.list().unwrap()[0].config.id, "node-a");
         }
+        for candidate in [
+            path.clone(),
+            path.with_extension("db-wal"),
+            path.with_extension("db-shm"),
+        ] {
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
+    fn revision_triggers_are_visible_to_another_process_connection() {
+        let path = std::env::temp_dir().join(format!("estuary-store-{}.db", uuid::Uuid::now_v7()));
+        let first = NodeStore::open(&path).unwrap();
+        let second = NodeStore::open(&path).unwrap();
+        let initial = second.revision().unwrap();
+
+        first.insert(&node()).unwrap();
+        assert!(second.revision().unwrap() > initial);
+        let after_insert = second.revision().unwrap();
+        first.delete("node-a", Some(1)).unwrap();
+        assert!(second.revision().unwrap() > after_insert);
+
+        drop(first);
+        drop(second);
         for candidate in [
             path.clone(),
             path.with_extension("db-wal"),
