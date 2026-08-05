@@ -445,6 +445,11 @@ fn apply_vllm_native_thinking_compat(
             GatewayError::InvalidRequest("vLLM chat_template_kwargs must be an object".to_owned())
         })?;
     template_kwargs.insert("enable_thinking".to_owned(), Value::Bool(enable_thinking));
+    if let Some(thinking) = object.get_mut("thinking").and_then(Value::as_object_mut)
+        && thinking.get("display").and_then(Value::as_str) == Some("omitted")
+    {
+        thinking.remove("display");
+    }
     Ok(approximated_budget)
 }
 
@@ -772,7 +777,7 @@ async fn proxy_with_retries(
         let response_mode = match selected_protocol {
             None => UpstreamResponseMode::Passthrough,
             Some(AnthropicProtocol::Native) => UpstreamResponseMode::NativeAnthropic {
-                expose_thinking,
+                expose_thinking: native_vllm_messages || expose_thinking,
                 thinking_budget_approximated,
             },
             Some(AnthropicProtocol::Responses) => {
@@ -1743,12 +1748,13 @@ mod tests {
     fn maps_anthropic_thinking_to_vllm_template_control() {
         let mut enabled = json!({
             "max_tokens": 32000,
-            "thinking": {"type": "enabled", "budget_tokens": 31999},
+            "thinking": {"type": "enabled", "budget_tokens": 31999, "display": "omitted"},
             "chat_template_kwargs": {"custom": true}
         });
         let approximated =
             apply_vllm_native_thinking_compat(enabled.as_object_mut().unwrap()).unwrap();
         assert!(approximated);
+        assert!(enabled["thinking"].get("display").is_none());
         assert_eq!(enabled["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(enabled["chat_template_kwargs"]["custom"], true);
 

@@ -762,7 +762,7 @@ async fn vllm_native_anthropic_supports_hello_messages_and_count_tokens() {
     );
     let response: Value = response.json().await.expect("native Messages JSON");
     assert_eq!(response["model"], "claude-public");
-    assert_eq!(response["content"][0]["thinking"], "");
+    assert_eq!(response["content"][0]["thinking"], "reason");
     assert_eq!(response["content"][0]["signature"], "native-signature");
     assert_eq!(response["future_native_field"], true);
     let captured = timeout(IO_TIMEOUT, message_receiver.recv())
@@ -771,6 +771,7 @@ async fn vllm_native_anthropic_supports_hello_messages_and_count_tokens() {
         .expect("native Messages missing");
     assert_eq!(captured["model"], "internal-model");
     assert_eq!(captured["thinking"]["type"], "enabled");
+    assert!(captured["thinking"].get("display").is_none());
     assert_eq!(captured["chat_template_kwargs"]["enable_thinking"], true);
     assert!(captured.get("context_management").is_none());
     assert_eq!(captured["future_claude_code_field"]["preserved"], true);
