@@ -18,3 +18,5 @@
 !web/vite.config.ts
 !web/src/
 !web/src/**
+!docker-bin/
+!docker-bin/**

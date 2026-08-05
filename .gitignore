@@ -33,6 +33,7 @@ lcov.info
 *.sock
 /tmp/
 /.cache/
+/docker-bin/
 
 # Editor and operating-system files
 .idea/
