@@ -28,6 +28,7 @@ export interface ProviderConfig {
 export interface NodeConfig {
   id: string;
   base_url: string;
+  api_key: string | null;
   api_key_env: string | null;
   models: Record<string, string>;
   max_concurrency: number;
@@ -86,6 +87,10 @@ export interface AdmissionSnapshot {
 
 export interface NodeRecord {
   config: NodeConfig;
+  credentials: {
+    api_key_configured: boolean;
+    api_key_source: "database" | "environment" | "none";
+  };
   revision: number;
   created_at_unix_ms: number;
   updated_at_unix_ms: number;
@@ -137,7 +142,9 @@ export interface Pair {
   value: string;
 }
 
-export interface NodeDraft extends Omit<NodeConfig, "models" | "headers_from_env"> {
+export interface NodeDraft extends Omit<NodeConfig, "api_key" | "models" | "headers_from_env"> {
+  api_key: string;
+  preserve_api_key: boolean;
   models: Pair[];
   headers_from_env: Pair[];
 }

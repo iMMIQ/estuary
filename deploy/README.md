@@ -14,8 +14,11 @@ Install the first release:
 sudo ./deploy/install.sh ./estuary
 ```
 
-Review `/etc/estuary/common.env`, add upstream credential environment
-variables, and then open `http://127.0.0.1:9090/admin/`.
+Review `/etc/estuary/common.env` for gateway settings, then open
+`http://127.0.0.1:9090/admin/` and enter each upstream Bearer key with its node.
+Keys are stored unencrypted in `/var/lib/estuary/estuary.db`; protect that file,
+its WAL files, snapshots, and backups. Environment-backed credentials remain
+available for existing configurations.
 
 Roll out another release:
 

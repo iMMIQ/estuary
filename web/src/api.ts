@@ -45,8 +45,9 @@ export function getStatus(): Promise<GatewayStatus> {
   return request("/admin/api/status");
 }
 
-export function preflightNode(config: NodeConfig): Promise<PreflightResponse> {
-  return request("/admin/api/nodes/preflight", {
+export function preflightNode(config: NodeConfig, clearApiKey = false): Promise<PreflightResponse> {
+  const query = clearApiKey ? "?clear_api_key=true" : "";
+  return request(`/admin/api/nodes/preflight${query}`, {
     method: "POST",
     body: JSON.stringify(config),
   });
@@ -59,10 +60,10 @@ export function createNode(config: NodeConfig): Promise<NodeRecord> {
   });
 }
 
-export function updateNode(config: NodeConfig, revision: number): Promise<NodeRecord> {
+export function updateNode(config: NodeConfig, revision: number, clearApiKey: boolean): Promise<NodeRecord> {
   return request(`/admin/api/nodes/${encodeURIComponent(config.id)}?timeout_ms=30000`, {
     method: "PUT",
-    body: JSON.stringify({ config, revision }),
+    body: JSON.stringify({ config, revision, clear_api_key: clearApiKey }),
   });
 }
 

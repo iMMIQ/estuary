@@ -2,6 +2,7 @@ import {
   Alert,
   Button,
   NumberInput,
+  PasswordInput,
   Select,
   Stepper,
   Switch,
@@ -19,7 +20,7 @@ import {
 } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 import * as api from "./api";
-import { draftToConfig, validateDraft } from "./node-config";
+import { draftToConfig, shouldClearApiKey, validateDraft } from "./node-config";
 import type { DraftErrors } from "./node-config";
 import type { KvEventsConfig, NodeDraft, Pair, PreflightResponse, ProviderKind } from "./types";
 
@@ -117,7 +118,7 @@ export function NodeEditor({
     setPreflight(null);
     setPreflightError(null);
     try {
-      setPreflight(await api.preflightNode(draftToConfig(draft)));
+      setPreflight(await api.preflightNode(draftToConfig(draft), shouldClearApiKey(draft)));
     } catch (error) {
       setPreflightError(error instanceof Error ? error.message : "Connection test failed");
     } finally {
@@ -205,9 +206,25 @@ export function NodeEditor({
           </section>
 
           <section className="wizard-section">
-            <div className="section-title"><h2>Credentials</h2><span>Secrets remain environment-backed.</span></div>
-            <TextInput label="Bearer key environment variable" value={draft.api_key_env ?? ""} onChange={(event) => update((current) => ({ ...current, api_key_env: event.target.value || null }))} />
-            <PairEditor rows={draft.headers_from_env} error={errors.headers_from_env} keyLabel="Header name" valueLabel="Environment variable" onChange={(headers_from_env) => update((current) => ({ ...current, headers_from_env }))} />
+            <div className="section-title"><h2>Credentials</h2><span>{draft.api_key.trim() || draft.preserve_api_key ? "Database key configured" : draft.api_key_env ? "Environment key configured" : "No Bearer key"}</span></div>
+            <div className="credential-editor">
+              <PasswordInput
+                label="Bearer API key"
+                autoComplete="new-password"
+                placeholder={draft.preserve_api_key ? "Stored key unchanged" : "Optional"}
+                value={draft.api_key}
+                onChange={(event) => {
+                  const value = event.currentTarget.value;
+                  update((current) => ({
+                    ...current,
+                    api_key: value,
+                    preserve_api_key: value ? false : current.preserve_api_key,
+                  }));
+                }}
+              />
+              {draft.preserve_api_key && <Button variant="default" color="red" leftSection={<Trash2 size={14} />} onClick={() => update((current) => ({ ...current, api_key: "", preserve_api_key: false }))}>Remove key</Button>}
+              {draft.api_key_env && <div className="legacy-credential"><span>Environment fallback</span><strong>{draft.api_key_env}</strong><Button variant="subtle" color="gray" px={6} aria-label="Remove environment fallback" onClick={() => update((current) => ({ ...current, api_key_env: null }))}><Trash2 size={14} /></Button></div>}
+            </div>
           </section>
 
           {draft.provider.type === "vllm" && <section className="wizard-section">
@@ -237,6 +254,7 @@ export function NodeEditor({
             <ReviewRow label="Scheduling weight" value={draft.weight} />
             <ReviewRow label="Model mappings" value={draft.models.filter((row) => row.key && row.value).length} />
             <ReviewRow label="Health path" value={draft.health_path} />
+            <ReviewRow label="Bearer credential" value={draft.api_key.trim() || draft.preserve_api_key || draft.api_key_env ? "Configured" : "Not configured"} />
             <ReviewRow label="Lifecycle" value={draft.draining ? "Draining" : "Serving"} />
           </div>
           <Alert icon={<Info size={16} />} color="indigo" title="Connection verification recommended">Run Test Connection before applying this configuration to verify compatibility and health.</Alert>

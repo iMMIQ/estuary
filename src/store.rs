@@ -258,8 +258,20 @@ mod tests {
     #[test]
     fn persists_nodes_with_optimistic_revisions() {
         let store = NodeStore::memory().unwrap();
-        let inserted = store.insert(&node()).unwrap();
+        let mut initial = node();
+        initial.api_key = Some("stored-secret".to_owned());
+        let inserted = store.insert(&initial).unwrap();
         assert_eq!(inserted.revision, 1);
+        assert_eq!(
+            store
+                .get("node-a")
+                .unwrap()
+                .unwrap()
+                .config
+                .api_key
+                .as_deref(),
+            Some("stored-secret")
+        );
 
         let mut changed = node();
         changed.weight = 2.0;

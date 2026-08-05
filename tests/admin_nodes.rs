@@ -162,6 +162,65 @@ async fn creates_updates_and_deletes_a_live_node() {
 }
 
 #[tokio::test]
+async fn redacts_preserves_and_clears_a_database_api_key() {
+    let upstream = TestServer::spawn(Router::new().route(
+        "/v1/models",
+        get(|| async { Json(json!({"object": "list", "data": []})) }),
+    ))
+    .await;
+    let mut settings = Settings::default();
+    settings.health.timeout_ms = 500;
+    let admin = TestServer::spawn(Gateway::build(settings).unwrap().admin_router()).await;
+    let client = client();
+
+    let mut config = node(&upstream.base_url);
+    config.api_key = Some("stored-secret".to_owned());
+    let created = client
+        .post(admin.url("/admin/api/nodes"))
+        .json(&config)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(created["config"]["api_key"], Value::Null);
+    assert_eq!(created["credentials"]["api_key_configured"], true);
+    assert_eq!(created["credentials"]["api_key_source"], "database");
+
+    config.api_key = None;
+    config.weight = 1.5;
+    let preserved = client
+        .put(admin.url("/admin/api/nodes/dynamic-a"))
+        .json(&json!({"revision": 1, "config": config}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(preserved["revision"], 2);
+    assert_eq!(preserved["config"]["api_key"], Value::Null);
+    assert_eq!(preserved["credentials"]["api_key_configured"], true);
+
+    let cleared = client
+        .put(admin.url("/admin/api/nodes/dynamic-a"))
+        .json(&json!({
+            "revision": 2,
+            "config": config,
+            "clear_api_key": true,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(cleared["revision"], 3);
+    assert_eq!(cleared["credentials"]["api_key_configured"], false);
+}
+
+#[tokio::test]
 async fn preflight_checks_a_node_without_persisting_it() {
     let upstream = TestServer::spawn(Router::new().route(
         "/v1/models",

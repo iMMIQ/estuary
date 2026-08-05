@@ -162,6 +162,13 @@ impl Settings {
                 bail!("node {} health_path must not be empty", node.id);
             }
             if node
+                .api_key
+                .as_deref()
+                .is_some_and(|key| key.trim().is_empty())
+            {
+                bail!("node {} api_key must not be empty", node.id);
+            }
+            if node
                 .api_key_env
                 .as_deref()
                 .is_some_and(|variable| variable.trim().is_empty())
@@ -475,6 +482,7 @@ impl Default for RetryConfig {
 pub struct NodeConfig {
     pub id: String,
     pub base_url: String,
+    pub api_key: Option<String>,
     pub api_key_env: Option<String>,
     pub models: HashMap<String, String>,
     pub max_concurrency: usize,
@@ -491,6 +499,7 @@ impl Default for NodeConfig {
         Self {
             id: String::new(),
             base_url: String::new(),
+            api_key: None,
             api_key_env: None,
             models: HashMap::new(),
             max_concurrency: 1,

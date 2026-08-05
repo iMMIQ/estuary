@@ -19,6 +19,8 @@ export function createDraft(kind: ProviderKind = "vllm"): NodeDraft {
   return {
     id: "",
     base_url: "http://127.0.0.1:8000/v1",
+    api_key: "",
+    preserve_api_key: false,
     api_key_env: null,
     models: [{ key: "", value: "" }],
     max_concurrency: 16,
@@ -45,17 +47,22 @@ export function createDraft(kind: ProviderKind = "vllm"): NodeDraft {
 export function recordToDraft(node: NodeRecord): NodeDraft {
   return {
     ...structuredClone(node.config),
+    api_key: "",
+    preserve_api_key: node.credentials.api_key_source === "database",
     models: recordToPairs(node.config.models),
     headers_from_env: recordToPairs(node.config.headers_from_env),
   };
 }
 
 export function draftToConfig(draft: NodeDraft): NodeConfig {
+  const { preserve_api_key: _, ...config } = draft;
+  const apiKey = draft.api_key.trim();
   return {
-    ...draft,
+    ...config,
     id: draft.id.trim(),
     base_url: draft.base_url.trim(),
-    api_key_env: draft.api_key_env?.trim() || null,
+    api_key: apiKey || null,
+    api_key_env: apiKey ? null : draft.api_key_env?.trim() || null,
     health_path: draft.health_path.trim(),
     models: pairsToRecord(draft.models),
     headers_from_env: pairsToRecord(draft.headers_from_env),
@@ -65,6 +72,10 @@ export function draftToConfig(draft: NodeDraft): NodeConfig {
         draft.provider.type === "vllm" ? draft.provider.kv_events : null,
     },
   };
+}
+
+export function shouldClearApiKey(draft: NodeDraft): boolean {
+  return !draft.preserve_api_key && !draft.api_key.trim();
 }
 
 export function validateDraft(draft: NodeDraft): DraftErrors {

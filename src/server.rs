@@ -832,8 +832,21 @@ fn admin_node_payload(state: &AppState, stored: &StoredNode, node: &Node) -> ser
     let cache = state.scheduler.exact_cache_directory().snapshot(node.id());
     let snapshot = node.snapshot();
     let admission = admin_admission_snapshot(node, &snapshot);
+    let mut public_config = stored.config.clone();
+    public_config.api_key = None;
+    let api_key_source = if stored.config.api_key.is_some() {
+        "database"
+    } else if stored.config.api_key_env.is_some() {
+        "environment"
+    } else {
+        "none"
+    };
     json!({
-        "config": stored.config,
+        "config": public_config,
+        "credentials": {
+            "api_key_configured": api_key_source != "none",
+            "api_key_source": api_key_source,
+        },
         "revision": stored.revision,
         "created_at_unix_ms": stored.created_at_unix_ms,
         "updated_at_unix_ms": stored.updated_at_unix_ms,
@@ -844,10 +857,26 @@ fn admin_node_payload(state: &AppState, stored: &StoredNode, node: &Node) -> ser
     })
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CredentialMutationQuery {
+    clear_api_key: bool,
+}
+
 async fn preflight_node(
     State(state): State<Arc<AppState>>,
-    Json(config): Json<NodeConfig>,
+    Query(query): Query<CredentialMutationQuery>,
+    Json(mut config): Json<NodeConfig>,
 ) -> Response {
+    if config.api_key.is_none() && !query.clear_api_key {
+        match state.store.get(&config.id) {
+            Ok(Some(stored)) => config.api_key = stored.config.api_key,
+            Ok(None) => {}
+            Err(error) => {
+                return admin_internal_error("could not load stored credentials", &error);
+            }
+        }
+    }
     let node = match prepare_node(&state, &config).await {
         Ok(node) => node,
         Err(error) => return admin_validation_error(&error),
@@ -906,6 +935,8 @@ async fn create_node(
 struct UpdateNodeRequest {
     revision: u64,
     config: NodeConfig,
+    #[serde(default)]
+    clear_api_key: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -943,7 +974,11 @@ async fn update_node(
     let Some(previous) = state.scheduler.node(&node_id) else {
         return admin_internal_message("node is persisted but missing from the runtime registry");
     };
-    let replacement = match prepare_node(&state, &request.config).await {
+    let mut requested_config = request.config;
+    if requested_config.api_key.is_none() && !request.clear_api_key {
+        requested_config.api_key.clone_from(&stored.config.api_key);
+    }
+    let replacement = match prepare_node(&state, &requested_config).await {
         Ok(node) => node,
         Err(error) => return admin_validation_error(&error),
     };
@@ -959,7 +994,7 @@ async fn update_node(
     }
     let updated = match state
         .store
-        .update(&node_id, request.revision, &request.config)
+        .update(&node_id, request.revision, &requested_config)
     {
         Ok(Some(updated)) => updated,
         Ok(None) => {

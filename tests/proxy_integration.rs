@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     convert::Infallible,
     future::pending,
     io,
@@ -195,10 +194,7 @@ async fn maps_model_preserves_unknown_fields_and_replaces_credentials() {
     )
     .await;
     let mut upstream_node = node("only-node", &upstream, [("public-model", "internal-model")]);
-    upstream_node.headers = HashMap::from([(
-        "authorization".to_owned(),
-        "Bearer upstream-secret".to_owned(),
-    )]);
+    upstream_node.api_key = Some("upstream-secret".to_owned());
     let gateway = spawn_gateway(vec![upstream_node]).await;
     let request = json!({
         "model": "public-model",

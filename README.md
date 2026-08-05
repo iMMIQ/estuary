@@ -37,7 +37,7 @@ The `store` field is not changed or rejected. If it is true, or an upstream stor
 
 The gateway does not authenticate callers in phase one. Run the public listener only on a trusted network or behind an authenticating reverse proxy/API gateway. Client `Authorization`, `x-api-key`, `OpenAI-Organization`, and `OpenAI-Project` headers are stripped and are never reused as upstream credentials.
 
-Upstream credentials are configured independently per node through environment-variable references. Multi-key lifecycle management, tenant quotas, and priority scheduling are planned follow-up work.
+Upstream Bearer credentials are configured independently per node in the management UI and stored as plaintext inside the SQLite node document. The management API reports whether a key is configured but never returns its value. Existing `api_key_env` and `headers_from_env` references remain supported for compatibility. Multi-key lifecycle management, tenant quotas, and priority scheduling are planned follow-up work.
 
 ### Concurrency limits are process-local
 
@@ -145,7 +145,7 @@ For a streaming Response, add `"stream": true` and use `curl -N`. The gateway fo
 
 SQLite is the only node-configuration source. The schema is initialized automatically, uses WAL mode and optimistic revisions, and supports an empty first boot. Additive triggers maintain a database-wide control revision; processes sharing the same local database poll that revision and reconcile node create, update, delete, drain, and resume operations into their own schedulers. Node candidates are validated and probed before entering any scheduler. Updating or deleting a node first drains it and waits for active leases; a timeout leaves the node safely draining for a later retry.
 
-The management UI at `/admin/` edits node URLs, model aliases, concurrency, weights, provider settings, environment-backed credentials, and vLLM KV event endpoints. `api_key_env` and `headers_from_env` store environment-variable names, never secret values. The corresponding environment variables must exist in the Estuary process before a node using them can pass validation.
+The management UI at `/admin/` edits node URLs, model aliases, concurrency, weights, provider settings, a direct Bearer API key, and vLLM KV event endpoints. Direct keys are persisted unencrypted in the node's SQLite `config_json`; list and detail responses replace the value with `null` and expose only credential status. An empty key while editing preserves the stored value, while **Remove key** explicitly clears it. Treat the database, WAL files, filesystem snapshots, and backups as secrets. Legacy `api_key_env` and `headers_from_env` references remain valid and are used when no direct key is configured.
 
 The public and admin listeners are process bootstrap settings because they are needed before SQLite and the UI can be reached. Keep the admin listener on a private network. Routing, health, retry, circuit, and response-limit values currently use the validated defaults in `src/config.rs`.
 
@@ -228,7 +228,7 @@ GitHub Releases contain static Linux binaries for `amd64` and `arm64`, together 
 sudo ./deploy/install.sh ./estuary
 ```
 
-Review `/etc/estuary/common.env` before registering nodes that reference credential environment variables. HAProxy exposes the public API on `:8080` and management on loopback `:9090`; slot listeners stay on loopback-only internal ports.
+Review `/etc/estuary/common.env` for gateway settings and any legacy environment-backed credentials. HAProxy exposes the public API on `:8080` and management on loopback `:9090`; slot listeners stay on loopback-only internal ports.
 
 Roll out a staged binary one slot at a time:
 

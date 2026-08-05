@@ -167,6 +167,7 @@ export function NodeDetails({
             <DataRow label="Max concurrency" value={node.config.max_concurrency} />
             <DataRow label="Scheduling weight" value={node.config.weight} />
             <DataRow label="Health path" value={node.config.health_path} />
+            <DataRow label="Bearer credential" value={node.credentials.api_key_source === "database" ? "Configured in database" : node.credentials.api_key_source === "environment" ? "Configured by environment" : "Not configured"} />
           </section>
         </Tabs.Panel>
       </Tabs>

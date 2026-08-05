@@ -4,6 +4,7 @@ import {
   draftToConfig,
   pairsToRecord,
   recordToPairs,
+  shouldClearApiKey,
   validateDraft,
 } from "./node-config";
 
@@ -23,6 +24,26 @@ describe("node config mapping", () => {
 
   test("new vLLM nodes use a finite waiting watermark", () => {
     expect(createDraft("vllm").provider.waiting_threshold).toBe(8);
+  });
+
+  test("stores a directly entered Bearer key and drops the legacy fallback", () => {
+    const draft = createDraft("openai");
+    draft.api_key = "  upstream-secret  ";
+    draft.api_key_env = "LEGACY_KEY";
+    const config = draftToConfig(draft);
+    expect(config.api_key).toBe("upstream-secret");
+    expect(config.api_key_env).toBeNull();
+    expect(shouldClearApiKey(draft)).toBeFalse();
+  });
+
+  test("distinguishes preserving and explicitly removing a stored key", () => {
+    const draft = createDraft("openai");
+    draft.preserve_api_key = true;
+    expect(draftToConfig(draft).api_key).toBeNull();
+    expect(shouldClearApiKey(draft)).toBeFalse();
+
+    draft.preserve_api_key = false;
+    expect(shouldClearApiKey(draft)).toBeTrue();
   });
 
   test("generic providers cannot retain KV event settings", () => {

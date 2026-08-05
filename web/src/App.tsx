@@ -31,7 +31,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./api";
 import { NodeDetails } from "./NodeDetails";
 import { NodeEditor, type EditorState } from "./NodeEditor";
-import { createDraft, draftToConfig, formatCompactNumber, recordToDraft } from "./node-config";
+import { createDraft, draftToConfig, formatCompactNumber, recordToDraft, shouldClearApiKey } from "./node-config";
 import type { GatewayStatus, NodeRecord } from "./types";
 import { formatBytes, StatusBadge } from "./ui";
 
@@ -318,7 +318,7 @@ export default function App() {
     try {
       const config = draftToConfig(state.draft);
       if (state.mode === "create") await api.createNode(config);
-      else await api.updateNode(config, state.revision);
+      else await api.updateNode(config, state.revision, shouldClearApiKey(state.draft));
       setEditor(null);
       setView("upstreams");
       setToast({ tone: "success", message: state.mode === "create" ? "Node added" : "Node updated" });

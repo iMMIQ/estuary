@@ -287,15 +287,21 @@ impl Node {
             value.set_sensitive(true);
             headers.insert(name, value);
         }
-        if let Some(variable) = &config.api_key_env {
-            let key = env::var(variable).with_context(|| {
+        let api_key = if let Some(key) = &config.api_key {
+            Some(key.clone())
+        } else if let Some(variable) = &config.api_key_env {
+            Some(env::var(variable).with_context(|| {
                 format!(
                     "node {} requires missing environment variable {variable}",
                     config.id
                 )
-            })?;
+            })?)
+        } else {
+            None
+        };
+        if let Some(key) = api_key {
             if key.trim().is_empty() {
-                bail!("node {} API key environment variable is empty", config.id);
+                bail!("node {} API key is empty", config.id);
             }
             let mut value = HeaderValue::from_str(&format!("Bearer {key}")).with_context(|| {
                 format!("node {} API key is not a valid header value", config.id)
