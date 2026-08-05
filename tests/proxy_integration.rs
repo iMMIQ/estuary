@@ -21,7 +21,7 @@ use axum::{
 use bytes::Bytes;
 use estuary::{
     Gateway, Settings,
-    config::{NodeConfig, ProviderKind, RetryConfig},
+    config::{AnthropicProtocol, NodeConfig, ProviderKind, RetryConfig},
 };
 use futures_util::stream;
 use serde_json::{Value, json};
@@ -265,6 +265,7 @@ async fn maps_model_preserves_unknown_fields_and_replaces_credentials() {
     assert!(!captured.headers.contains_key("openai-organization"));
     assert!(!captured.headers.contains_key("openai-project"));
     assert!(!captured.headers.contains_key("x-api-key"));
+    assert!(!captured.headers.contains_key("anthropic-version"));
     assert_eq!(
         captured
             .headers
@@ -372,7 +373,78 @@ async fn anthropic_messages_maps_request_response_and_claude_code_system() {
     );
     assert_eq!(upstream_body["messages"][1]["role"], "user");
     assert_eq!(upstream_body["tools"][0]["function"]["name"], "Read");
+    assert_eq!(upstream_body["max_completion_tokens"], 128);
+    assert!(upstream_body.get("max_tokens").is_none());
     assert_eq!(upstream_body["stream"], false);
+}
+
+async fn responses_anthropic_response(
+    State(sender): State<mpsc::UnboundedSender<CapturedRequest>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    sender
+        .send(CapturedRequest { headers, body })
+        .expect("capture Responses request");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"id":"resp_1","object":"response","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]},{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"path\":\"a\"}"}],"usage":{"input_tokens":100,"output_tokens":8,"input_tokens_details":{"cached_tokens":40}}}"#,
+        ))
+        .expect("Responses response")
+}
+
+#[tokio::test]
+async fn anthropic_messages_use_configured_responses_adapter() {
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(responses_anthropic_response))
+            .with_state(sender),
+    )
+    .await;
+    let mut upstream_node = node("responses-node", &upstream, [("claude", "gpt-internal")]);
+    upstream_node.provider.anthropic_protocol = AnthropicProtocol::Responses;
+    let gateway = spawn_gateway(vec![upstream_node]).await;
+
+    let response = test_client()
+        .post(gateway.url("/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "prompt-caching-2024-07-31")
+        .json(&json!({
+            "model":"claude", "max_tokens":512,
+            "system":"be concise",
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[{"name":"Read","description":"read a file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]
+        }))
+        .send()
+        .await
+        .expect("Responses-backed Anthropic response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: Value = response.json().await.expect("Anthropic response JSON");
+    assert_eq!(response["model"], "claude");
+    assert_eq!(
+        response["content"][0],
+        json!({"type":"text","text":"hello"})
+    );
+    assert_eq!(response["content"][1]["type"], "tool_use");
+    assert_eq!(response["stop_reason"], "tool_use");
+    assert_eq!(response["usage"]["input_tokens"], 60);
+    assert_eq!(response["usage"]["cache_read_input_tokens"], 40);
+
+    let captured = timeout(IO_TIMEOUT, receiver.recv())
+        .await
+        .expect("Responses capture timeout")
+        .expect("Responses request missing");
+    assert!(!captured.headers.contains_key("anthropic-version"));
+    assert!(!captured.headers.contains_key("anthropic-beta"));
+    let request: Value = serde_json::from_slice(&captured.body).expect("Responses JSON");
+    assert_eq!(request["model"], "gpt-internal");
+    assert_eq!(request["store"], false);
+    assert_eq!(request["max_output_tokens"], 512);
+    assert_eq!(request["instructions"], "be concise");
+    assert_eq!(request["tools"][0]["type"], "function");
 }
 
 static ANTHROPIC_UPSTREAM_SSE: &[u8] = concat!(

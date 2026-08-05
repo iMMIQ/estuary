@@ -16,6 +16,13 @@ import type { ReactNode } from "react";
 import type { NodeRecord } from "./types";
 import { formatPercent, formatTimestamp, StatusBadge } from "./ui";
 
+const anthropicProtocolLabels = {
+  auto: "Automatic",
+  native: "Native Anthropic Messages",
+  responses: "OpenAI Responses",
+  chat: "OpenAI Chat Completions",
+} as const;
+
 function DataRow({ label, value }: { label: string; value: ReactNode }) {
   return <div className="data-row"><span>{label}</span><strong>{value}</strong></div>;
 }
@@ -122,6 +129,7 @@ export function NodeDetails({
             <RuntimeCard title="Provider Compatibility">
               <DataRow label="Status" value={<StatusBadge value={runtime.provider_state} />} />
               <DataRow label="Provider" value={isVllm ? "vLLM 0.25+" : "OpenAI compatible"} />
+              <DataRow label="Anthropic protocol" value={anthropicProtocolLabels[node.config.provider.anthropic_protocol]} />
               <DataRow label="Warnings" value={runtime.provider_last_error ? 1 : 0} />
               <DataRow label="Generation" value={runtime.provider_generation} />
             </RuntimeCard>
@@ -164,6 +172,7 @@ export function NodeDetails({
             <DataRow label="Node ID" value={node.config.id} />
             <DataRow label="Base URL" value={node.config.base_url} />
             <DataRow label="Provider" value={node.config.provider.type} />
+            <DataRow label="Anthropic protocol" value={anthropicProtocolLabels[node.config.provider.anthropic_protocol]} />
             <DataRow label="Max concurrency" value={node.config.max_concurrency} />
             <DataRow label="Scheduling weight" value={node.config.weight} />
             <DataRow label="Health path" value={node.config.health_path} />

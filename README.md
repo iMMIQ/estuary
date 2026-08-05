@@ -17,13 +17,15 @@ This repository contains the phase-one gateway foundation plus a native vLLM pro
 | `POST /v1/responses` | Foreground create, non-streaming and SSE streaming pass-through. Durable follow-up operations are not supported. |
 | `POST /v1/completions` | Compatibility pass-through with model routing and prefix affinity. |
 | `POST /v1/embeddings` | Compatibility pass-through with model routing. |
-| `POST /v1/messages` | Anthropic Messages, including streaming, thinking, tools, model aliases, and Claude Code request cleanup. Uses native vLLM handling when available and an OpenAI conversion fallback otherwise. |
-| `POST /v1/messages/count_tokens` | Exact Anthropic token counting through a vLLM 0.25+ node. |
+| `POST /v1/messages` | Anthropic Messages, including streaming, thinking, tools, model aliases, and Claude Code request cleanup. Each node can use native Messages, OpenAI Responses, or Chat Completions upstream. |
+| `POST /v1/messages/count_tokens` | Exact Anthropic token counting through a node configured for native Messages. |
 | `HEAD /api/hello` | Claude Code gateway capability probe. |
 
 The six POST routes above are an explicit allowlist. Other methods and `/v1/*` paths return a shaped `404` instead of being blindly proxied. OpenAI routes use OpenAI error envelopes; both Messages routes use Anthropic error envelopes and expose `request-id` plus `x-request-id`.
 
-vLLM 0.25's generate router natively exposes `/v1/messages` and `/v1/messages/count_tokens`. Estuary forwards Anthropic requests to those native routes without rebuilding the body, apart from removing Claude Code's billing marker and rewriting the model alias; native responses and SSE retain thinking signatures and future fields while their model name is mapped back to the public alias. This is the preferred Claude Code path. If a request lands on a generic OpenAI-compatible node, Estuary translates system/message text, base64/URL images, tools, tool-use loops, structured output, and extended-thinking controls to Chat Completions and translates buffered or fragmented SSE responses back to Anthropic. Features the fallback cannot represent are restricted to native vLLM nodes instead of being silently discarded.
+vLLM 0.25's generate router natively exposes `/v1/messages` and `/v1/messages/count_tokens`. Estuary forwards Anthropic requests to those native routes without rebuilding the body, apart from removing Claude Code's billing marker and rewriting the model alias; native responses and SSE retain thinking signatures and future fields while their model name is mapped back to the public alias. This is the preferred Claude Code path.
+
+Each node has an `anthropic_protocol` capability mode. `auto` resolves to native Messages for vLLM and Chat Completions for generic OpenAI-compatible nodes; operators can explicitly select `native`, `responses`, or `chat`. The Responses adapter sends the complete conversation with `store: false`, supports multimodal tool results and parallel function calls, and converts both buffered responses and SSE. For adaptive thinking it carries `reasoning.encrypted_content` inside an Estuary-formatted Anthropic signature and restores that state on the next request. The Chat adapter uses the standard `max_completion_tokens` and does not claim thinking continuity. Before queueing, Estuary excludes adapters that cannot represent the request. Server tools, redacted thinking, exact thinking budgets, and other unsupported features therefore fail over only to a capable node instead of being silently removed. Converted streams emit Anthropic keep-alive `ping` events without extending upstream idle deadlines.
 
 Responses state is explicitly rejected with an OpenAI-shaped `400` response:
 
@@ -174,7 +176,7 @@ claude
 
 SQLite is the only node-configuration source. The schema is initialized automatically, uses WAL mode and optimistic revisions, and supports an empty first boot. Additive triggers maintain a database-wide control revision; processes sharing the same local database poll that revision and reconcile node create, update, delete, drain, and resume operations into their own schedulers. Node candidates are validated and probed before entering any scheduler. Updating or deleting a node first drains it and waits for active leases; a timeout leaves the node safely draining for a later retry.
 
-The management UI at `/admin/` edits node URLs, model aliases, concurrency, weights, provider settings, a direct Bearer API key, and vLLM KV event endpoints. Direct keys are persisted unencrypted in the node's SQLite `config_json`; list and detail responses replace the value with `null` and expose only credential status. An empty key while editing preserves the stored value, while **Remove key** explicitly clears it. Treat the database, WAL files, filesystem snapshots, and backups as secrets. Legacy `api_key_env` and `headers_from_env` references remain valid and are used when no direct key is configured.
+The management UI at `/admin/` edits node URLs, model aliases, concurrency, weights, provider settings, the Anthropic upstream protocol, a direct Bearer API key, and vLLM KV event endpoints. Direct keys are persisted unencrypted in the node's SQLite `config_json`; list and detail responses replace the value with `null` and expose only credential status. An empty key while editing preserves the stored value, while **Remove key** explicitly clears it. Treat the database, WAL files, filesystem snapshots, and backups as secrets. Legacy `api_key_env` and `headers_from_env` references remain valid and are used when no direct key is configured.
 
 The public and admin listeners are process bootstrap settings because they are needed before SQLite and the UI can be reached. Keep the admin listener on a private network. Routing, health, retry, circuit, and response-limit values currently use the validated defaults in `src/config.rs`.
 
@@ -284,7 +286,7 @@ The existing separation between request metadata, scheduling, node runtime, and 
 
 - gateway API-key lifecycle, tenant identity, quota, and priority/fair queues;
 - durable Responses state-to-node affinity and background operations;
-- additional non-vLLM Anthropic fallback mappings such as server tools and citations;
+- additional Anthropic mappings for server tools, citations, and Files;
 - additional provider adapters and local tokenizer implementations;
 - shared prefix/admission state or distributed node leases for active-active gateways;
 - persisted global policy management and fleet-coordinated node lifecycle state.

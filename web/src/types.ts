@@ -1,4 +1,5 @@
 export type ProviderKind = "openai" | "vllm";
+export type AnthropicProtocol = "auto" | "native" | "responses" | "chat";
 export type HealthState = "starting" | "healthy" | "degraded" | "unhealthy";
 export type LifecycleState = "serving" | "draining";
 export type CircuitState = "closed" | "open" | "half_open";
@@ -14,6 +15,7 @@ export interface KvEventsConfig {
 
 export interface ProviderConfig {
   type: ProviderKind;
+  anthropic_protocol: AnthropicProtocol;
   version_path: string;
   metrics_path: string;
   tokenize_path: string;

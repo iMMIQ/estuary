@@ -4,6 +4,7 @@ import {
   draftToConfig,
   pairsToRecord,
   recordToPairs,
+  recordToDraft,
   shouldClearApiKey,
   validateDraft,
 } from "./node-config";
@@ -24,6 +25,25 @@ describe("node config mapping", () => {
 
   test("new vLLM nodes use a finite waiting watermark", () => {
     expect(createDraft("vllm").provider.waiting_threshold).toBe(8);
+    expect(createDraft("vllm").provider.anthropic_protocol).toBe("auto");
+  });
+
+  test("preserves an explicit Anthropic upstream protocol", () => {
+    const draft = createDraft("openai");
+    draft.provider.anthropic_protocol = "responses";
+    expect(draftToConfig(draft).provider.anthropic_protocol).toBe("responses");
+  });
+
+  test("defaults legacy node records to automatic Anthropic routing", () => {
+    const config = draftToConfig(createDraft("openai"));
+    const legacyProvider = { ...config.provider } as Partial<typeof config.provider>;
+    delete legacyProvider.anthropic_protocol;
+    const record = {
+      config: { ...config, provider: legacyProvider },
+      credentials: { api_key_source: "none" },
+    };
+    const draft = recordToDraft(record as Parameters<typeof recordToDraft>[0]);
+    expect(draft.provider.anthropic_protocol).toBe("auto");
   });
 
   test("stores a directly entered Bearer key and drops the legacy fallback", () => {

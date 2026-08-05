@@ -41,11 +41,30 @@ pub(crate) fn validate_request_shape(body: &Value, generation: bool) -> Result<(
     Ok(())
 }
 
+pub(crate) fn thinking_requested(body: &Value) -> bool {
+    body.get("thinking")
+        .and_then(Value::as_object)
+        .is_some_and(|thinking| {
+            matches!(
+                thinking.get("type").and_then(Value::as_str),
+                Some("adaptive" | "enabled")
+            ) && thinking.get("display").and_then(Value::as_str) != Some("omitted")
+        })
+}
+
 fn convert_request_inner(body: &Value, generation: bool) -> Result<Value, GatewayError> {
     let object = body.as_object().ok_or_else(|| {
         GatewayError::InvalidRequest("JSON request body must be an object".to_owned())
     })?;
     let model = required_string(object, "model")?;
+    if object
+        .get("context_management")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(GatewayError::UnsupportedFeature(
+            "Anthropic context management requires a native Messages or Responses upstream",
+        ));
+    }
     let max_tokens = generation
         .then(|| {
             object
@@ -84,13 +103,12 @@ fn convert_request_inner(body: &Value, generation: bool) -> Result<Value, Gatewa
     output.insert("model".to_owned(), Value::String(model.to_owned()));
     output.insert("messages".to_owned(), Value::Array(messages));
     if let Some(max_tokens) = max_tokens {
-        output.insert("max_tokens".to_owned(), Value::Number(max_tokens.into()));
+        output.insert(
+            "max_completion_tokens".to_owned(),
+            Value::Number(max_tokens.into()),
+        );
     }
-    copy_fields(
-        object,
-        &mut output,
-        &["temperature", "top_p", "top_k", "seed"],
-    );
+    copy_fields(object, &mut output, &["temperature", "top_p", "seed"]);
     if let Some(stop) = object.get("stop_sequences") {
         output.insert("stop".to_owned(), stop.clone());
     }
@@ -179,29 +197,11 @@ fn apply_thinking(
                 "reasoning_effort".to_owned(),
                 Value::String("none".to_owned()),
             );
-            destination.insert("include_reasoning".to_owned(), Value::Bool(false));
         }
         "adaptive" | "enabled" => {
-            destination
-                .entry("reasoning_effort".to_owned())
-                .or_insert_with(|| Value::String("high".to_owned()));
-            let include = thinking.get("display").and_then(Value::as_str) != Some("omitted");
-            destination.insert("include_reasoning".to_owned(), Value::Bool(include));
-            if kind == "enabled" {
-                let budget = thinking
-                    .get("budget_tokens")
-                    .and_then(Value::as_u64)
-                    .filter(|budget| *budget >= 1024)
-                    .ok_or_else(|| {
-                        GatewayError::InvalidRequest(
-                            "Anthropic enabled thinking requires budget_tokens >= 1024".to_owned(),
-                        )
-                    })?;
-                destination.insert(
-                    "thinking_token_budget".to_owned(),
-                    Value::Number(budget.into()),
-                );
-            }
+            return Err(GatewayError::UnsupportedFeature(
+                "Anthropic thinking requires a native Messages or Responses upstream",
+            ));
         }
         _ => {
             return Err(GatewayError::InvalidRequest(format!(
@@ -301,7 +301,6 @@ fn convert_message(message: &Value, output: &mut Vec<Value>) -> Result<(), Gatew
 
 fn convert_assistant_blocks(blocks: &[Value], output: &mut Vec<Value>) -> Result<(), GatewayError> {
     let mut text = Vec::new();
-    let mut reasoning = Vec::new();
     let mut tool_calls = Vec::new();
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
@@ -325,9 +324,15 @@ fn convert_assistant_blocks(blocks: &[Value], output: &mut Vec<Value>) -> Result
                 }));
             }
             Some("thinking") => {
-                reasoning.push(required_block_string(block, "thinking")?.to_owned());
+                return Err(GatewayError::UnsupportedFeature(
+                    "Anthropic thinking history requires a native Messages or Responses upstream",
+                ));
             }
-            Some("redacted_thinking") => {}
+            Some("redacted_thinking") => {
+                return Err(GatewayError::UnsupportedFeature(
+                    "Anthropic redacted thinking requires a native Messages upstream",
+                ));
+            }
             Some(kind) => {
                 return Err(GatewayError::InvalidRequest(format!(
                     "unsupported Anthropic assistant content block '{kind}'"
@@ -343,9 +348,6 @@ fn convert_assistant_blocks(blocks: &[Value], output: &mut Vec<Value>) -> Result
     let mut message = Map::new();
     message.insert("role".to_owned(), Value::String("assistant".to_owned()));
     message.insert("content".to_owned(), Value::String(text.join("\n")));
-    if !reasoning.is_empty() {
-        message.insert("reasoning".to_owned(), Value::String(reasoning.join("\n")));
-    }
     if !tool_calls.is_empty() {
         message.insert("tool_calls".to_owned(), Value::Array(tool_calls));
     }
@@ -454,7 +456,11 @@ fn tool_result_content(value: &Value, id: &str) -> Result<String, GatewayError> 
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => text.push(required_block_string(block, "text")?.to_owned()),
-            Some("image") => text.push("[image tool result omitted]".to_owned()),
+            Some("image") => {
+                return Err(GatewayError::UnsupportedFeature(
+                    "image tool results require a native Messages or Responses upstream",
+                ));
+            }
             Some(kind) => {
                 return Err(GatewayError::InvalidRequest(format!(
                     "unsupported Anthropic tool result block '{kind}'"
@@ -476,6 +482,20 @@ fn convert_tools(tools: &Value) -> Result<Value, GatewayError> {
             let object = tool.as_object().ok_or_else(|| {
                 GatewayError::InvalidRequest("Anthropic tools must be objects".to_owned())
             })?;
+            if object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "custom")
+            {
+                return Err(GatewayError::UnsupportedFeature(
+                    "Anthropic server tools require a native Messages upstream",
+                ));
+            }
+            if object.get("cache_control").is_some() {
+                return Err(GatewayError::UnsupportedFeature(
+                    "Anthropic tool cache_control requires a native Messages upstream",
+                ));
+            }
             let name = required_string(object, "name")?;
             let schema = object.get("input_schema").ok_or_else(|| {
                 GatewayError::InvalidRequest(format!(
@@ -487,6 +507,9 @@ fn convert_tools(tools: &Value) -> Result<Value, GatewayError> {
             function.insert("parameters".to_owned(), schema.clone());
             if let Some(description) = object.get("description") {
                 function.insert("description".to_owned(), description.clone());
+            }
+            if let Some(strict) = object.get("strict") {
+                function.insert("strict".to_owned(), strict.clone());
             }
             Ok(json!({"type": "function", "function": function}))
         })
@@ -520,7 +543,11 @@ fn convert_tool_choice(choice: &Value) -> Result<(Value, Option<bool>), GatewayE
     Ok((converted, parallel))
 }
 
-pub(crate) fn convert_response(body: &[u8], public_model: &str) -> Result<Bytes, GatewayError> {
+pub(crate) fn convert_response(
+    body: &[u8],
+    public_model: &str,
+    expose_thinking: bool,
+) -> Result<Bytes, GatewayError> {
     let value: Value =
         serde_json::from_slice(body).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
     let choice = value
@@ -533,17 +560,19 @@ pub(crate) fn convert_response(body: &[u8], public_model: &str) -> Result<Bytes,
         .and_then(Value::as_object)
         .ok_or(GatewayError::InvalidUpstreamResponse)?;
     let mut content = Vec::new();
-    if let Some(reasoning) = message
-        .get("reasoning")
-        .or_else(|| message.get("reasoning_content"))
-        .and_then(Value::as_str)
-        .filter(|reasoning| !reasoning.is_empty())
-    {
-        content.push(json!({
-            "type": "thinking",
-            "thinking": reasoning,
-            "signature": synthetic_signature(value.get("id").and_then(Value::as_str))
-        }));
+    if expose_thinking {
+        if let Some(reasoning) = message
+            .get("reasoning")
+            .or_else(|| message.get("reasoning_content"))
+            .and_then(Value::as_str)
+            .filter(|reasoning| !reasoning.is_empty())
+        {
+            content.push(json!({
+                "type": "thinking",
+                "thinking": reasoning,
+                "signature": synthetic_signature(value.get("id").and_then(Value::as_str))
+            }));
+        }
     }
     if let Some(text) = message.get("content").and_then(Value::as_str) {
         if !text.is_empty() {
@@ -640,7 +669,7 @@ fn usage(value: Option<&Value>) -> Value {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     json!({
-        "input_tokens": input,
+        "input_tokens": input.saturating_sub(cached),
         "output_tokens": output,
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": cached
@@ -768,9 +797,9 @@ impl NativeStreamRewriter {
 }
 
 impl StreamConverter {
-    pub(crate) fn new(public_model: String) -> Self {
+    pub(crate) fn new(public_model: String, expose_thinking: bool) -> Self {
         Self {
-            state: StreamState::new(public_model),
+            state: StreamState::new(public_model, expose_thinking),
             ..Self::default()
         }
     }
@@ -847,6 +876,12 @@ pub(crate) fn stream_error_event(message: &str) -> Bytes {
     Bytes::from(output)
 }
 
+pub(crate) fn ping_event() -> Bytes {
+    let mut output = Vec::new();
+    let _ = event(&mut output, "ping", json!({"type": "ping"}));
+    Bytes::from(output)
+}
+
 #[derive(Default)]
 struct StreamState {
     public_model: String,
@@ -859,12 +894,14 @@ struct StreamState {
     next_index: u64,
     finish_reason: Option<String>,
     usage: Option<Value>,
+    expose_thinking: bool,
 }
 
 impl StreamState {
-    fn new(public_model: String) -> Self {
+    fn new(public_model: String, expose_thinking: bool) -> Self {
         Self {
             public_model,
+            expose_thinking,
             ..Self::default()
         }
     }
@@ -893,36 +930,39 @@ impl StreamState {
         let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
             return Ok(());
         };
-        if let Some(reasoning) = delta
-            .get("reasoning")
-            .or_else(|| delta.get("reasoning_content"))
-            .and_then(Value::as_str)
-        {
-            if !reasoning.is_empty() {
-                let index = if let Some(index) = self.thinking_index {
-                    index
-                } else {
-                    let index = self.next_index;
-                    self.next_index += 1;
-                    self.thinking_index = Some(index);
+        if self.expose_thinking {
+            if let Some(reasoning) = delta
+                .get("reasoning")
+                .or_else(|| delta.get("reasoning_content"))
+                .and_then(Value::as_str)
+            {
+                if !reasoning.is_empty() {
+                    self.finish_text(output)?;
+                    let index = if let Some(index) = self.thinking_index {
+                        index
+                    } else {
+                        let index = self.next_index;
+                        self.next_index += 1;
+                        self.thinking_index = Some(index);
+                        event(
+                            output,
+                            "content_block_start",
+                            json!({
+                                "type": "content_block_start", "index": index,
+                                "content_block": {"type": "thinking", "thinking": ""}
+                            }),
+                        )?;
+                        index
+                    };
                     event(
                         output,
-                        "content_block_start",
+                        "content_block_delta",
                         json!({
-                            "type": "content_block_start", "index": index,
-                            "content_block": {"type": "thinking", "thinking": ""}
+                            "type": "content_block_delta", "index": index,
+                            "delta": {"type": "thinking_delta", "thinking": reasoning}
                         }),
                     )?;
-                    index
-                };
-                event(
-                    output,
-                    "content_block_delta",
-                    json!({
-                        "type": "content_block_delta", "index": index,
-                        "delta": {"type": "thinking_delta", "thinking": reasoning}
-                    }),
-                )?;
+                }
             }
         }
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
@@ -960,7 +1000,7 @@ impl StreamState {
                 self.finish_text(output)?;
             }
             for call in calls {
-                self.tool_delta(call);
+                self.tool_delta(call, output)?;
             }
         }
         Ok(())
@@ -987,7 +1027,7 @@ impl StreamState {
         )
     }
 
-    fn tool_delta(&mut self, call: &Value) {
+    fn tool_delta(&mut self, call: &Value, output: &mut Vec<u8>) -> Result<(), GatewayError> {
         let upstream_index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
         let tool = self.tools.entry(upstream_index).or_insert_with(|| {
             let index = self.next_index;
@@ -998,16 +1038,48 @@ impl StreamState {
             }
         });
         if let Some(id) = call.get("id").and_then(Value::as_str) {
-            tool.id.push_str(id);
+            if tool.id.is_empty() {
+                id.clone_into(&mut tool.id);
+            }
         }
         if let Some(function) = call.get("function").and_then(Value::as_object) {
             if let Some(name) = function.get("name").and_then(Value::as_str) {
-                tool.name.push_str(name);
+                if tool.name.is_empty() {
+                    name.clone_into(&mut tool.name);
+                }
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                tool.arguments.push_str(arguments);
+                if tool.started {
+                    if !arguments.is_empty() {
+                        event(
+                            output,
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta", "index": tool.index,
+                                "delta": {"type": "input_json_delta", "partial_json": arguments}
+                            }),
+                        )?;
+                    }
+                } else {
+                    tool.arguments.push_str(arguments);
+                }
             }
         }
+        if !tool.started && !tool.name.is_empty() {
+            tool.start(output)?;
+            if !tool.arguments.is_empty() {
+                event(
+                    output,
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta", "index": tool.index,
+                        "delta": {"type": "input_json_delta", "partial_json": tool.arguments}
+                    }),
+                )?;
+                tool.arguments.clear();
+            }
+        }
+        Ok(())
     }
 
     fn finish_thinking(&mut self, output: &mut Vec<u8>) -> Result<(), GatewayError> {
@@ -1086,7 +1158,7 @@ impl StreamState {
                     "stop_reason": stop_reason(self.finish_reason.as_deref(), has_tools),
                     "stop_sequence": Value::Null
                 },
-                "usage": {"output_tokens": usage["output_tokens"]}
+                "usage": usage
             }),
         )?;
         event(output, "message_stop", json!({"type": "message_stop"}))?;
@@ -1188,7 +1260,6 @@ mod tests {
         let converted = convert_request(&json!({
             "model": "claude-model", "max_tokens": 4096,
             "messages": [{"role": "user", "content": "solve"}],
-            "thinking": {"type": "enabled", "budget_tokens": 2048},
             "output_config": {
                 "effort": "xhigh",
                 "format": {"type": "json_schema", "schema": {
@@ -1198,13 +1269,37 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(converted["reasoning_effort"], "xhigh");
-        assert_eq!(converted["thinking_token_budget"], 2048);
-        assert_eq!(converted["include_reasoning"], true);
         assert_eq!(converted["response_format"]["type"], "json_schema");
         assert_eq!(
             converted["response_format"]["json_schema"]["schema"]["type"],
             "object"
         );
+    }
+
+    #[test]
+    fn rejects_chat_features_that_cannot_be_preserved() {
+        let thinking = convert_request(&json!({
+            "model": "claude-model", "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "solve"}],
+            "thinking": {"type": "enabled", "budget_tokens": 2048}
+        }));
+        assert!(matches!(thinking, Err(GatewayError::UnsupportedFeature(_))));
+
+        let adaptive = convert_request(&json!({
+            "model": "claude-model", "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "solve"}],
+            "thinking": {"type": "adaptive"}
+        }));
+        assert!(matches!(adaptive, Err(GatewayError::UnsupportedFeature(_))));
+
+        let image_result = convert_request(&json!({
+            "model": "claude-model", "max_tokens": 64,
+            "messages": [{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_1","content":[{"type":"image","source":{"type":"url","url":"https://example.test/a.png"}}]}]}]
+        }));
+        assert!(matches!(
+            image_result,
+            Err(GatewayError::UnsupportedFeature(_))
+        ));
     }
 
     #[test]
@@ -1227,6 +1322,7 @@ mod tests {
         let response = convert_response(
             br#"{"id":"chatcmpl_1","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","function":{"name":"Read","arguments":"{\"path\":\"a\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":4}}"#,
             "public-model",
+            true,
         )
         .unwrap();
         let value: Value = serde_json::from_slice(&response).unwrap();
@@ -1303,7 +1399,7 @@ mod tests {
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n",
             "data: [DONE]\n\n"
         );
-        let mut converter = StreamConverter::new("public-model".to_owned());
+        let mut converter = StreamConverter::new("public-model".to_owned(), false);
         let split = source.len() / 3;
         let mut result = Vec::new();
         result.extend_from_slice(&converter.push(&source.as_bytes()[..split]).unwrap());
@@ -1330,7 +1426,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"Read\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
             "data: [DONE]\n\n"
         );
-        let mut converter = StreamConverter::new("public-model".to_owned());
+        let mut converter = StreamConverter::new("public-model".to_owned(), true);
         let output = converter.push(source.as_bytes()).unwrap();
         let output = String::from_utf8(output.to_vec()).unwrap();
 
@@ -1354,8 +1450,30 @@ mod tests {
     }
 
     #[test]
+    fn streaming_text_closes_before_late_reasoning_and_repeated_tool_metadata_is_stable() {
+        let source = concat!(
+            "data: {\"id\":\"chatcmpl_reasoning\",\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_reasoning\",\"choices\":[{\"delta\":{\"reasoning\":\"late\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"Read\",\"arguments\":\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut converter = StreamConverter::new("public-model".to_owned(), true);
+        let output =
+            String::from_utf8(converter.push(source.as_bytes()).unwrap().to_vec()).unwrap();
+        let text = output.find(r#""type":"text""#).unwrap();
+        let text_stop = output[text..].find("event: content_block_stop").unwrap() + text;
+        let thinking = output.find(r#""type":"thinking""#).unwrap();
+        assert!(text < text_stop && text_stop < thinking);
+        assert_eq!(output.matches(r#""id":"call_1""#).count(), 1);
+        assert_eq!(output.matches(r#""name":"Read""#).count(), 1);
+        assert!(output.contains(r#""partial_json":"{""#));
+        assert!(output.contains(r#""partial_json":"}""#));
+    }
+
+    #[test]
     fn rejects_an_empty_upstream_stream() {
-        let mut converter = StreamConverter::new("public-model".to_owned());
+        let mut converter = StreamConverter::new("public-model".to_owned(), false);
         assert!(matches!(
             converter.finish(),
             Err(GatewayError::InvalidUpstreamResponse)

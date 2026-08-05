@@ -31,6 +31,7 @@ export function createDraft(kind: ProviderKind = "vllm"): NodeDraft {
     headers_from_env: [{ key: "", value: "" }],
     provider: {
       type: kind,
+      anthropic_protocol: "auto",
       version_path: "/version",
       metrics_path: "/metrics",
       tokenize_path: "/tokenize",
@@ -47,6 +48,10 @@ export function createDraft(kind: ProviderKind = "vllm"): NodeDraft {
 export function recordToDraft(node: NodeRecord): NodeDraft {
   return {
     ...structuredClone(node.config),
+    provider: {
+      ...structuredClone(node.config.provider),
+      anthropic_protocol: node.config.provider.anthropic_protocol ?? "auto",
+    },
     api_key: "",
     preserve_api_key: node.credentials.api_key_source === "database",
     models: recordToPairs(node.config.models),

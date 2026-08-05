@@ -521,11 +521,33 @@ pub enum ProviderKind {
     Vllm,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicProtocol {
+    #[default]
+    Auto,
+    Native,
+    Responses,
+    Chat,
+}
+
+impl AnthropicProtocol {
+    #[must_use]
+    pub fn resolve(self, provider: ProviderKind) -> Self {
+        match self {
+            Self::Auto if provider == ProviderKind::Vllm => Self::Native,
+            Self::Auto => Self::Chat,
+            protocol => protocol,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderConfig {
     #[serde(rename = "type")]
     pub kind: ProviderKind,
+    pub anthropic_protocol: AnthropicProtocol,
     pub version_path: String,
     pub metrics_path: String,
     pub tokenize_path: String,
@@ -541,6 +563,7 @@ impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             kind: ProviderKind::Openai,
+            anthropic_protocol: AnthropicProtocol::Auto,
             version_path: "/version".to_owned(),
             metrics_path: "/metrics".to_owned(),
             tokenize_path: "/tokenize".to_owned(),
@@ -689,6 +712,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(provider.waiting_threshold, 8);
+        assert_eq!(provider.anthropic_protocol, AnthropicProtocol::Auto);
     }
 
     #[test]

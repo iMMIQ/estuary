@@ -22,7 +22,18 @@ import { useCallback, useMemo, useState } from "react";
 import * as api from "./api";
 import { draftToConfig, shouldClearApiKey, validateDraft } from "./node-config";
 import type { DraftErrors } from "./node-config";
-import type { KvEventsConfig, NodeDraft, Pair, PreflightResponse, ProviderKind } from "./types";
+import type { AnthropicProtocol, KvEventsConfig, NodeDraft, Pair, PreflightResponse, ProviderKind } from "./types";
+
+const anthropicProtocols = [
+  { value: "auto", label: "Automatic" },
+  { value: "native", label: "Native Anthropic Messages" },
+  { value: "responses", label: "OpenAI Responses" },
+  { value: "chat", label: "OpenAI Chat Completions" },
+];
+
+function anthropicProtocolLabel(value: AnthropicProtocol): string {
+  return anthropicProtocols.find((item) => item.value === value)?.label ?? value;
+}
 
 export type EditorState =
   | { mode: "create"; draft: NodeDraft; revision: null }
@@ -177,6 +188,17 @@ export function NodeEditor({
               <TextInput label="Node ID" description="Unique identifier for this upstream node." required disabled={state.mode === "edit"} value={draft.id} error={errors.id} onChange={(event) => update((current) => ({ ...current, id: event.target.value }))} />
               <TextInput label="Base URL" description="Include http(s) and port when needed." required value={draft.base_url} error={errors.base_url} onChange={(event) => update((current) => ({ ...current, base_url: event.target.value }))} />
               <Select label="Provider" required data={[{ value: "vllm", label: "vLLM 0.25+" }, { value: "openai", label: "OpenAI compatible" }]} value={draft.provider.type} onChange={(value) => setProvider(value as ProviderKind | null)} />
+              <Select
+                label="Anthropic upstream protocol"
+                description="Adapter used for public /v1/messages requests."
+                required
+                data={anthropicProtocols}
+                value={draft.provider.anthropic_protocol}
+                onChange={(value) => value && update((current) => ({
+                  ...current,
+                  provider: { ...current.provider, anthropic_protocol: value as AnthropicProtocol },
+                }))}
+              />
               <NumberInput label="Max concurrency" required min={1} value={draft.max_concurrency} error={errors.max_concurrency} onChange={(value) => update((current) => ({ ...current, max_concurrency: numeric(value) }))} />
               <NumberInput label="Scheduling weight" description="Higher weight receives proportionally more traffic." required min={0.01} step={0.05} value={draft.weight} error={errors.weight} onChange={(value) => update((current) => ({ ...current, weight: numeric(value) }))} />
             </div>
@@ -250,6 +272,7 @@ export function NodeEditor({
             <ReviewRow label="Node ID" value={draft.id} />
             <ReviewRow label="Base URL" value={draft.base_url} />
             <ReviewRow label="Provider" value={draft.provider.type === "vllm" ? "vLLM 0.25+" : "OpenAI compatible"} />
+            <ReviewRow label="Anthropic protocol" value={anthropicProtocolLabel(draft.provider.anthropic_protocol)} />
             <ReviewRow label="Max concurrency" value={draft.max_concurrency} />
             <ReviewRow label="Scheduling weight" value={draft.weight} />
             <ReviewRow label="Model mappings" value={draft.models.filter((row) => row.key && row.value).length} />
