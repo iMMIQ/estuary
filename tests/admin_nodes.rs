@@ -202,7 +202,13 @@ async fn serves_the_embedded_admin_application_with_security_headers() {
     let admin = TestServer::spawn(gateway.admin_router()).await;
     let response = client().get(admin.url("/admin/")).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.headers().get("content-security-policy").is_some());
+    let content_security_policy = response
+        .headers()
+        .get("content-security-policy")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    assert!(content_security_policy.contains("style-src 'self' 'unsafe-inline'"));
+    assert!(!content_security_policy.contains("script-src 'unsafe-inline'"));
     assert_eq!(
         response
             .headers()

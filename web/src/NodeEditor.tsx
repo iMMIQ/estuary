@@ -1,14 +1,24 @@
 import {
+  Alert,
+  Button,
+  NumberInput,
+  Select,
+  Stepper,
+  Switch,
+  TextInput,
+} from "@mantine/core";
+import {
+  ArrowLeft,
   Check,
-  ChevronDown,
   FlaskConical,
+  Info,
   LoaderCircle,
   Plus,
+  Trash2,
   X,
 } from "lucide-react";
-import { type ReactNode, useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import * as api from "./api";
-import { Drawer } from "./dialog";
 import { draftToConfig, validateDraft } from "./node-config";
 import type { DraftErrors } from "./node-config";
 import type { KvEventsConfig, NodeDraft, Pair, PreflightResponse, ProviderKind } from "./types";
@@ -17,115 +27,41 @@ export type EditorState =
   | { mode: "create"; draft: NodeDraft; revision: null }
   | { mode: "edit"; draft: NodeDraft; revision: number };
 
-function Field({
-  label,
-  name,
-  error,
-  wide = false,
-  children,
-}: {
-  label: string;
-  name: string;
-  error?: string;
-  wide?: boolean;
-  children: ReactNode;
-}) {
-  return (
-    <label className={`field ${wide ? "wide" : ""}`} data-field={name}>
-      <span>{label}</span>
-      {children}
-      {error && <small id={`${name}-error`} className="field-error" role="alert">{error}</small>}
-    </label>
-  );
-}
-
-function NumberField({
-  label,
-  name,
-  value,
-  min,
-  step,
-  error,
-  onChange,
-}: {
-  label: string;
-  name: string;
-  value: number;
-  min: number;
-  step?: number;
-  error?: string;
-  onChange: (value: number) => void;
-}) {
-  return (
-    <Field label={label} name={name} error={error}>
-      <input
-        type="number"
-        value={value}
-        min={min}
-        step={step ?? 1}
-        aria-invalid={Boolean(error)}
-        aria-describedby={error ? `${name}-error` : undefined}
-        onChange={(event) => onChange(Number(event.target.value))}
-      />
-    </Field>
-  );
+function numeric(value: string | number): number {
+  return typeof value === "number" ? value : Number(value);
 }
 
 function PairEditor({
   rows,
   error,
   onChange,
-  keyPlaceholder,
-  valuePlaceholder,
+  keyLabel,
+  valueLabel,
 }: {
   rows: Pair[];
   error?: string;
   onChange: (rows: Pair[]) => void;
-  keyPlaceholder: string;
-  valuePlaceholder: string;
+  keyLabel: string;
+  valueLabel: string;
 }) {
-  const update = (index: number, field: keyof Pair, value: string) => {
-    onChange(rows.map((row, rowIndex) => (rowIndex === index ? { ...row, [field]: value } : row)));
+  const update = (index: number, key: keyof Pair, value: string) => {
+    onChange(rows.map((row, rowIndex) => rowIndex === index ? { ...row, [key]: value } : row));
   };
-  return (
-    <div className="pair-list">
-      {rows.map((row, index) => (
-        <div className="pair-row" key={index}>
-          <input
-            aria-label={`${keyPlaceholder} ${index + 1}`}
-            placeholder={keyPlaceholder}
-            value={row.key}
-            aria-invalid={Boolean(error)}
-            onChange={(event) => update(index, "key", event.target.value)}
-          />
-          <input
-            aria-label={`${valuePlaceholder} ${index + 1}`}
-            placeholder={valuePlaceholder}
-            value={row.value}
-            aria-invalid={Boolean(error)}
-            onChange={(event) => update(index, "value", event.target.value)}
-          />
-          <button
-            className="icon-button quiet"
-            type="button"
-            title="Remove row"
-            aria-label={`Remove row ${index + 1}`}
-            onClick={() => onChange(rows.length === 1 ? [{ key: "", value: "" }] : rows.filter((_, rowIndex) => rowIndex !== index))}
-          >
-            <X size={16} />
-          </button>
-        </div>
-      ))}
-      {error && <small className="field-error" role="alert">{error}</small>}
-      <button className="text-button" type="button" onClick={() => onChange([...rows, { key: "", value: "" }])}>
-        <Plus size={15} /> Add row
-      </button>
-    </div>
-  );
+
+  return <div className="mapping-editor">
+    <div className="mapping-head"><span>{keyLabel}</span><span>{valueLabel}</span><span /></div>
+    {rows.map((row, index) => <div className="mapping-row" key={index}>
+      <TextInput aria-label={`${keyLabel} ${index + 1}`} value={row.key} error={Boolean(error)} onChange={(event) => update(index, "key", event.target.value)} />
+      <TextInput aria-label={`${valueLabel} ${index + 1}`} value={row.value} error={Boolean(error)} onChange={(event) => update(index, "value", event.target.value)} />
+      <Button variant="subtle" color="gray" px={6} aria-label={`Remove mapping ${index + 1}`} onClick={() => onChange(rows.length === 1 ? [{ key: "", value: "" }] : rows.filter((_, rowIndex) => rowIndex !== index))}><Trash2 size={14} /></Button>
+    </div>)}
+    {error && <span className="form-error" role="alert">{error}</span>}
+    <Button variant="subtle" size="compact-sm" leftSection={<Plus size={14} />} onClick={() => onChange([...rows, { key: "", value: "" }])}>Add mapping</Button>
+  </div>;
 }
 
-function firstError(errors: DraftErrors): string | null {
-  return Object.keys(errors)[0] ?? null;
+function ReviewRow({ label, value }: { label: string; value: string | number }) {
+  return <div className="review-row"><span>{label}</span><strong>{value}</strong></div>;
 }
 
 export function NodeEditor({
@@ -140,8 +76,8 @@ export function NodeEditor({
   onSave: (state: EditorState) => Promise<void>;
 }) {
   const [draft, setDraft] = useState(state.draft);
+  const [step, setStep] = useState(0);
   const [errors, setErrors] = useState<DraftErrors>({});
-  const [advanced, setAdvanced] = useState(state.mode === "edit");
   const [checking, setChecking] = useState(false);
   const [preflight, setPreflight] = useState<PreflightResponse | null>(null);
   const [preflightError, setPreflightError] = useState<string | null>(null);
@@ -154,26 +90,25 @@ export function NodeEditor({
     setPreflightError(null);
   }, []);
 
-  const requestClose = useCallback(() => {
+  const requestClose = () => {
     if (!dirty || window.confirm("Discard unsaved changes?")) onClose();
-  }, [dirty, onClose]);
-
-  const focusError = (validation: DraftErrors) => {
-    const field = firstError(validation);
-    if (!field) return;
-    window.requestAnimationFrame(() => {
-      document.querySelector<HTMLElement>(`[data-field="${field}"] input`)?.focus();
-    });
   };
 
   const validate = () => {
     const validation = validateDraft(draft);
     setErrors(validation);
-    if (Object.keys(validation).length > 0) {
-      focusError(validation);
-      return false;
-    }
-    return true;
+    if (Object.keys(validation).length === 0) return true;
+    const basicFields = ["id", "base_url", "max_concurrency", "weight", "models"];
+    if (Object.keys(validation).some((field) => basicFields.includes(field))) setStep(0);
+    else setStep(1);
+    window.requestAnimationFrame(() => document.querySelector<HTMLElement>("[data-invalid='true'] input, input[data-invalid='true']")?.focus());
+    return false;
+  };
+
+  const next = () => {
+    if (step === 0 && !validate()) return;
+    if (step === 1 && !validate()) return;
+    setStep((current) => Math.min(2, current + 1));
   };
 
   const testConnection = async () => {
@@ -190,183 +125,134 @@ export function NodeEditor({
     }
   };
 
-  const setProvider = (kind: ProviderKind) => update((current) => ({
-    ...current,
-    provider: {
-      ...current.provider,
-      type: kind,
-      kv_events: kind === "openai" ? null : current.provider.kv_events,
-    },
-  }));
+  const setProvider = (kind: ProviderKind | null) => {
+    if (!kind) return;
+    update((current) => ({
+      ...current,
+      provider: { ...current.provider, type: kind, kv_events: kind === "openai" ? null : current.provider.kv_events },
+    }));
+  };
 
   const toggleKv = () => update((current) => ({
     ...current,
     provider: {
       ...current.provider,
-      kv_events: current.provider.kv_events
-        ? null
-        : {
-            endpoint: "tcp://127.0.0.1:5557",
-            replay_endpoint: "tcp://127.0.0.1:5558",
-            topic: "kv-events",
-            reconnect_ms: 1000,
-            max_blocks: 1_000_000,
-            max_event_bytes: 16_777_216,
-          },
+      kv_events: current.provider.kv_events ? null : {
+        endpoint: "tcp://127.0.0.1:5557",
+        replay_endpoint: "tcp://127.0.0.1:5558",
+        topic: "kv-events",
+        reconnect_ms: 1000,
+        max_blocks: 1_000_000,
+        max_event_bytes: 16_777_216,
+      },
     },
   }));
 
   const updateKv = <K extends keyof KvEventsConfig>(key: K, value: KvEventsConfig[K]) => update((current) => ({
     ...current,
-    provider: {
-      ...current.provider,
-      kv_events: current.provider.kv_events ? { ...current.provider.kv_events, [key]: value } : null,
-    },
+    provider: { ...current.provider, kv_events: current.provider.kv_events ? { ...current.provider.kv_events, [key]: value } : null },
   }));
 
-  return (
-    <Drawer
-      title={state.mode === "create" ? "Add upstream" : draft.id}
-      eyebrow="Node configuration"
-      ariaLabel={state.mode === "create" ? "Add node" : `Edit ${draft.id}`}
-      busy={busy || checking}
-      onClose={requestClose}
-    >
-      <form
-        className="editor-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (validate()) void onSave({ ...state, draft } as EditorState);
-        }}
-      >
-        <div className="drawer-body">
-        <section className="form-section">
-          <div className="form-section-heading">
-            <div><h3>Connection</h3><p>Identity and OpenAI-compatible endpoint.</p></div>
-            <span className="required-note">Required</span>
-          </div>
-          <div className="field-grid">
-            <Field label="Node ID" name="id" error={errors.id}>
-              <input
-                data-autofocus
-                value={draft.id}
-                disabled={state.mode === "edit"}
-                required
-                aria-invalid={Boolean(errors.id)}
-                aria-describedby={errors.id ? "id-error" : undefined}
-                onChange={(event) => update((current) => ({ ...current, id: event.target.value }))}
-              />
-            </Field>
-            <Field label="Base URL" name="base_url" error={errors.base_url} wide>
-              <input
-                value={draft.base_url}
-                required
-                spellCheck={false}
-                aria-invalid={Boolean(errors.base_url)}
-                aria-describedby={errors.base_url ? "base_url-error" : undefined}
-                onChange={(event) => update((current) => ({ ...current, base_url: event.target.value }))}
-              />
-            </Field>
-          </div>
-          <div className="subsection-label">Provider</div>
-          <div className="segmented" role="group" aria-label="Provider type">
-            <button type="button" aria-pressed={draft.provider.type === "vllm"} className={draft.provider.type === "vllm" ? "selected" : ""} onClick={() => setProvider("vllm")}>vLLM 0.25+</button>
-            <button type="button" aria-pressed={draft.provider.type === "openai"} className={draft.provider.type === "openai" ? "selected" : ""} onClick={() => setProvider("openai")}>OpenAI compatible</button>
-          </div>
-        </section>
+  return <div className="editor-page page-frame">
+    <button className="breadcrumb-button" type="button" onClick={requestClose}><ArrowLeft size={15} /> Back to upstreams</button>
+    <header className="editor-header"><h1>{state.mode === "create" ? "Add Upstream Node" : `Edit ${draft.id}`}</h1></header>
 
-        <section className="form-section">
-          <div className="form-section-heading"><div><h3>Routing</h3><p>Capacity and public model exposure.</p></div></div>
-          <div className="field-grid">
-            <NumberField label="Max concurrency" name="max_concurrency" value={draft.max_concurrency} min={1} error={errors.max_concurrency} onChange={(value) => update((current) => ({ ...current, max_concurrency: value }))} />
-            <NumberField label="Weight" name="weight" value={draft.weight} min={0.01} step={0.05} error={errors.weight} onChange={(value) => update((current) => ({ ...current, weight: value }))} />
-          </div>
-          <div className="subsection-label" data-field="models">Model mappings</div>
-          <PairEditor rows={draft.models} error={errors.models} keyPlaceholder="Public model" valuePlaceholder="Upstream model" onChange={(models) => update((current) => ({ ...current, models }))} />
-        </section>
+    <Stepper active={step} onStepClick={(nextStep) => nextStep < step && setStep(nextStep)} className="node-stepper" size="sm">
+      <Stepper.Step label="Basic" description="Connection and routing" />
+      <Stepper.Step label="Advanced" description="Health and telemetry" />
+      <Stepper.Step label="Review" description="Verify configuration" />
+    </Stepper>
 
-        <section className="advanced-section">
-          <button className="advanced-toggle" type="button" aria-expanded={advanced} onClick={() => setAdvanced((value) => !value)}>
-            <span><strong>Advanced settings</strong><small>Health, telemetry, credentials and KV events</small></span>
-            <ChevronDown className={advanced ? "rotated" : ""} size={18} />
-          </button>
-          {advanced && (
-            <div className="advanced-content">
-              <section className="form-section nested">
-                <h3>Health and telemetry</h3>
-                <div className="field-grid">
-                  <Field label="Health path" name="health_path" error={errors.health_path} wide>
-                    <input value={draft.health_path} aria-invalid={Boolean(errors.health_path)} onChange={(event) => update((current) => ({ ...current, health_path: event.target.value }))} />
-                  </Field>
-                  {draft.provider.type === "vllm" && <>
-                    <Field label="Version path" name="version_path" error={errors.version_path}><input value={draft.provider.version_path} onChange={(event) => update((current) => ({ ...current, provider: { ...current.provider, version_path: event.target.value } }))} /></Field>
-                    <Field label="Metrics path" name="metrics_path" error={errors.metrics_path}><input value={draft.provider.metrics_path} onChange={(event) => update((current) => ({ ...current, provider: { ...current.provider, metrics_path: event.target.value } }))} /></Field>
-                    <Field label="Tokenize path" name="tokenize_path" error={errors.tokenize_path}><input value={draft.provider.tokenize_path} onChange={(event) => update((current) => ({ ...current, provider: { ...current.provider, tokenize_path: event.target.value } }))} /></Field>
-                    <NumberField label="Monitor interval (ms)" name="monitor_interval_ms" value={draft.provider.monitor_interval_ms} min={1} error={errors.monitor_interval_ms} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, monitor_interval_ms: value } }))} />
-                    <NumberField label="Request timeout (ms)" name="request_timeout_ms" value={draft.provider.request_timeout_ms} min={1} error={errors.request_timeout_ms} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, request_timeout_ms: value } }))} />
-                    <NumberField label="Telemetry stale (ms)" name="telemetry_stale_ms" value={draft.provider.telemetry_stale_ms} min={1} error={errors.telemetry_stale_ms} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, telemetry_stale_ms: value } }))} />
-                    <NumberField label="Waiting watermark" name="waiting_threshold" value={draft.provider.waiting_threshold} min={1} error={errors.waiting_threshold} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, waiting_threshold: value } }))} />
-                    <NumberField label="Tokenize cache entries" name="tokenize_cache_entries" value={draft.provider.tokenize_cache_entries} min={1} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, tokenize_cache_entries: value } }))} />
-                  </>}
-                </div>
-              </section>
-
-              <section className="form-section nested">
-                <h3>Credentials</h3>
-                <Field label="Bearer key environment variable" name="api_key_env" wide>
-                  <input value={draft.api_key_env ?? ""} autoComplete="off" onChange={(event) => update((current) => ({ ...current, api_key_env: event.target.value || null }))} />
-                </Field>
-                <div className="subsection-label" data-field="headers_from_env">Environment-backed headers</div>
-                <PairEditor rows={draft.headers_from_env} error={errors.headers_from_env} keyPlaceholder="Header name" valuePlaceholder="Environment variable" onChange={(headers_from_env) => update((current) => ({ ...current, headers_from_env }))} />
-              </section>
-
-              {draft.provider.type === "vllm" && (
-                <section className="form-section nested">
-                  <div className="section-heading-row">
-                    <div><h3>KV events</h3><span className="field-meta">Exact prefix-cache synchronization</span></div>
-                    <label className="switch"><input aria-label="Enable KV events" type="checkbox" checked={draft.provider.kv_events !== null} onChange={toggleKv} /><span /></label>
-                  </div>
-                  {draft.provider.kv_events && <div className="field-grid">
-                    <Field label="Publisher endpoint" name="kv_endpoint" wide><input value={draft.provider.kv_events.endpoint} onChange={(event) => updateKv("endpoint", event.target.value)} /></Field>
-                    <Field label="Replay endpoint" name="kv_replay" wide><input value={draft.provider.kv_events.replay_endpoint ?? ""} onChange={(event) => updateKv("replay_endpoint", event.target.value || null)} /></Field>
-                    <Field label="Topic" name="kv_topic"><input value={draft.provider.kv_events.topic} onChange={(event) => updateKv("topic", event.target.value)} /></Field>
-                    <NumberField label="Reconnect (ms)" name="kv_reconnect" value={draft.provider.kv_events.reconnect_ms} min={1} onChange={(value) => updateKv("reconnect_ms", value)} />
-                    <NumberField label="Max blocks" name="kv_blocks" value={draft.provider.kv_events.max_blocks} min={1} onChange={(value) => updateKv("max_blocks", value)} />
-                    <NumberField label="Max event bytes" name="kv_event_bytes" value={draft.provider.kv_events.max_event_bytes} min={1} onChange={(value) => updateKv("max_event_bytes", value)} />
-                  </div>}
-                </section>
-              )}
-
-              <section className="form-section nested compact">
-                <div className="section-heading-row">
-                  <div><h3>Start draining</h3><span className="field-meta">Persist the node without assigning new requests.</span></div>
-                  <label className="switch"><input aria-label="Start node draining" type="checkbox" checked={draft.draining} onChange={(event) => update((current) => ({ ...current, draining: event.target.checked }))} /><span /></label>
-                </div>
-              </section>
+    <form className="wizard-form" onSubmit={(event) => {
+      event.preventDefault();
+      if (step < 2) next();
+      else if (validate()) void onSave({ ...state, draft } as EditorState);
+    }}>
+      <div className="wizard-content">
+        {step === 0 && <>
+          <section className="wizard-section">
+            <div className="section-title"><h2>Basic Information</h2><span>Connection identity and provider settings.</span></div>
+            <div className="wizard-grid">
+              <TextInput label="Node ID" description="Unique identifier for this upstream node." required disabled={state.mode === "edit"} value={draft.id} error={errors.id} onChange={(event) => update((current) => ({ ...current, id: event.target.value }))} />
+              <TextInput label="Base URL" description="Include http(s) and port when needed." required value={draft.base_url} error={errors.base_url} onChange={(event) => update((current) => ({ ...current, base_url: event.target.value }))} />
+              <Select label="Provider" required data={[{ value: "vllm", label: "vLLM 0.25+" }, { value: "openai", label: "OpenAI compatible" }]} value={draft.provider.type} onChange={(value) => setProvider(value as ProviderKind | null)} />
+              <NumberInput label="Max concurrency" required min={1} value={draft.max_concurrency} error={errors.max_concurrency} onChange={(value) => update((current) => ({ ...current, max_concurrency: numeric(value) }))} />
+              <NumberInput label="Scheduling weight" description="Higher weight receives proportionally more traffic." required min={0.01} step={0.05} value={draft.weight} error={errors.weight} onChange={(value) => update((current) => ({ ...current, weight: numeric(value) }))} />
             </div>
-          )}
-        </section>
+          </section>
+          <section className="wizard-section">
+            <div className="section-title"><h2>Model Mappings</h2><span>{draft.models.filter((row) => row.key && row.value).length} configured</span></div>
+            <PairEditor rows={draft.models} error={errors.models} keyLabel="Public model" valueLabel="Upstream model" onChange={(models) => update((current) => ({ ...current, models }))} />
+          </section>
+        </>}
 
-        {(preflight || preflightError) && (
-          <div className={`preflight-result ${preflight ? "success" : "error"}`} role={preflight ? "status" : "alert"}>
-            {preflight ? <Check size={17} /> : <X size={17} />}
-            <div><strong>{preflight ? "Connection verified" : "Connection failed"}</strong><span>{preflight ? `${preflight.runtime.provider === "vllm" ? "vLLM" : "OpenAI-compatible"} ${preflight.runtime.provider_version ?? "provider"} passed configuration, provider and health checks.` : preflightError}</span></div>
+        {step === 1 && <>
+          <section className="wizard-section">
+            <div className="section-title"><h2>Health and Telemetry</h2><span>Runtime probing and admission signals.</span></div>
+            <div className="wizard-grid two-columns">
+              <TextInput label="Health path" value={draft.health_path} error={errors.health_path} onChange={(event) => update((current) => ({ ...current, health_path: event.target.value }))} />
+              {draft.provider.type === "vllm" && <>
+                <TextInput label="Version path" value={draft.provider.version_path} error={errors.version_path} onChange={(event) => update((current) => ({ ...current, provider: { ...current.provider, version_path: event.target.value } }))} />
+                <TextInput label="Metrics path" value={draft.provider.metrics_path} error={errors.metrics_path} onChange={(event) => update((current) => ({ ...current, provider: { ...current.provider, metrics_path: event.target.value } }))} />
+                <TextInput label="Tokenize path" value={draft.provider.tokenize_path} error={errors.tokenize_path} onChange={(event) => update((current) => ({ ...current, provider: { ...current.provider, tokenize_path: event.target.value } }))} />
+                <NumberInput label="Monitor interval (ms)" min={1} value={draft.provider.monitor_interval_ms} error={errors.monitor_interval_ms} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, monitor_interval_ms: numeric(value) } }))} />
+                <NumberInput label="Request timeout (ms)" min={1} value={draft.provider.request_timeout_ms} error={errors.request_timeout_ms} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, request_timeout_ms: numeric(value) } }))} />
+                <NumberInput label="Telemetry stale (ms)" min={1} value={draft.provider.telemetry_stale_ms} error={errors.telemetry_stale_ms} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, telemetry_stale_ms: numeric(value) } }))} />
+                <NumberInput label="Waiting watermark" min={1} value={draft.provider.waiting_threshold} error={errors.waiting_threshold} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, waiting_threshold: numeric(value) } }))} />
+                <NumberInput label="Tokenize cache entries" min={1} value={draft.provider.tokenize_cache_entries} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, tokenize_cache_entries: numeric(value) } }))} />
+              </>}
+            </div>
+          </section>
+
+          <section className="wizard-section">
+            <div className="section-title"><h2>Credentials</h2><span>Secrets remain environment-backed.</span></div>
+            <TextInput label="Bearer key environment variable" value={draft.api_key_env ?? ""} onChange={(event) => update((current) => ({ ...current, api_key_env: event.target.value || null }))} />
+            <PairEditor rows={draft.headers_from_env} error={errors.headers_from_env} keyLabel="Header name" valueLabel="Environment variable" onChange={(headers_from_env) => update((current) => ({ ...current, headers_from_env }))} />
+          </section>
+
+          {draft.provider.type === "vllm" && <section className="wizard-section">
+            <div className="switch-heading"><div><h2>KV Events</h2><span>Exact prefix-cache synchronization.</span></div><Switch aria-label="Enable KV events" checked={draft.provider.kv_events !== null} onChange={toggleKv} /></div>
+            {draft.provider.kv_events && <div className="wizard-grid two-columns">
+              <TextInput label="Publisher endpoint" value={draft.provider.kv_events.endpoint} onChange={(event) => updateKv("endpoint", event.target.value)} />
+              <TextInput label="Replay endpoint" value={draft.provider.kv_events.replay_endpoint ?? ""} onChange={(event) => updateKv("replay_endpoint", event.target.value || null)} />
+              <TextInput label="Topic" value={draft.provider.kv_events.topic} onChange={(event) => updateKv("topic", event.target.value)} />
+              <NumberInput label="Reconnect (ms)" min={1} value={draft.provider.kv_events.reconnect_ms} onChange={(value) => updateKv("reconnect_ms", numeric(value))} />
+              <NumberInput label="Max blocks" min={1} value={draft.provider.kv_events.max_blocks} onChange={(value) => updateKv("max_blocks", numeric(value))} />
+              <NumberInput label="Max event bytes" min={1} value={draft.provider.kv_events.max_event_bytes} onChange={(value) => updateKv("max_event_bytes", numeric(value))} />
+            </div>}
+          </section>}
+
+          <section className="wizard-section compact-section">
+            <div className="switch-heading"><div><h2>Start Draining</h2><span>Persist without assigning new requests.</span></div><Switch aria-label="Start node draining" checked={draft.draining} onChange={(event) => update((current) => ({ ...current, draining: event.currentTarget.checked }))} /></div>
+          </section>
+        </>}
+
+        {step === 2 && <section className="wizard-section review-section">
+          <div className="section-title"><h2>Review Configuration</h2><span>Confirm the node before applying it to the runtime registry.</span></div>
+          <div className="review-grid">
+            <ReviewRow label="Node ID" value={draft.id} />
+            <ReviewRow label="Base URL" value={draft.base_url} />
+            <ReviewRow label="Provider" value={draft.provider.type === "vllm" ? "vLLM 0.25+" : "OpenAI compatible"} />
+            <ReviewRow label="Max concurrency" value={draft.max_concurrency} />
+            <ReviewRow label="Scheduling weight" value={draft.weight} />
+            <ReviewRow label="Model mappings" value={draft.models.filter((row) => row.key && row.value).length} />
+            <ReviewRow label="Health path" value={draft.health_path} />
+            <ReviewRow label="Lifecycle" value={draft.draining ? "Draining" : "Serving"} />
           </div>
-        )}
-        </div>
+          <Alert icon={<Info size={16} />} color="indigo" title="Connection verification recommended">Run Test Connection before applying this configuration to verify compatibility and health.</Alert>
+        </section>}
 
-        <footer className="drawer-footer">
-          <button type="button" className="secondary-button test-button" disabled={busy || checking} onClick={() => void testConnection()}>
-            {checking ? <LoaderCircle className="spin" size={16} /> : <FlaskConical size={16} />} Test connection
-          </button>
-          <span className="footer-spacer" />
-          <button type="button" className="secondary-button" disabled={busy || checking} onClick={requestClose}>Cancel</button>
-          <button type="submit" className="primary-button" disabled={busy || checking}>
-            {busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
-            {state.mode === "create" ? "Add node" : "Save changes"}
-          </button>
-        </footer>
-      </form>
-    </Drawer>
-  );
+        {(preflight || preflightError) && <Alert className="preflight-alert" icon={preflight ? <Check size={16} /> : <X size={16} />} color={preflight ? "green" : "red"} title={preflight ? "Connection verified" : "Connection failed"}>
+          {preflight ? `${preflight.runtime.provider === "vllm" ? "vLLM" : "OpenAI-compatible"} provider passed configuration, compatibility and health checks.` : preflightError}
+        </Alert>}
+      </div>
+
+      <footer className="wizard-footer">
+        <Button variant="default" leftSection={checking ? <LoaderCircle className="spin" size={15} /> : <FlaskConical size={15} />} disabled={busy || checking} onClick={() => void testConnection()}>Test Connection</Button>
+        <span className="footer-spacer" />
+        <Button variant="default" disabled={busy || checking} onClick={step === 0 ? requestClose : () => setStep((current) => current - 1)}>{step === 0 ? "Cancel" : "Back"}</Button>
+        <Button type="submit" disabled={busy || checking} leftSection={busy ? <LoaderCircle className="spin" size={15} /> : step === 2 ? <Check size={15} /> : undefined}>{step === 2 ? state.mode === "create" ? "Add Node" : "Save Changes" : "Next"}</Button>
+      </footer>
+    </form>
+  </div>;
 }

@@ -234,7 +234,7 @@ Release images are published for `linux/amd64` and `linux/arm64` in GitHub Conta
 docker pull ghcr.io/immiq/estuary:latest
 ```
 
-Use an immutable version such as `ghcr.io/immiq/estuary:0.1.0` in production. The image also carries major/minor and major tags.
+Use an immutable version such as `ghcr.io/immiq/estuary:0.2.0` in production. The image also carries major/minor and major tags.
 
 The image runs as UID/GID `10001`, has a read-only root filesystem under Compose, does not follow upstream redirects, and uses `/health/live` for its image health check. For Kubernetes, keep the admin port behind a NetworkPolicy and set the pod termination grace period above `shutdown_grace_ms`; after that application grace period, remaining public or admin server tasks and their active streams are aborted.
 

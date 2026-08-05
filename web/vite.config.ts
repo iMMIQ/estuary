@@ -7,6 +7,16 @@ export default defineConfig(({ mode }) => {
   return {
     base: "/admin/",
     plugins: [react()],
+    build: {
+      rollupOptions: {
+        output: {
+          manualChunks: {
+            mantine: ["@mantine/core", "@mantine/hooks"],
+            icons: ["lucide-react"],
+          },
+        },
+      },
+    },
     server: {
       proxy: {
         "/admin/api": adminProxy,

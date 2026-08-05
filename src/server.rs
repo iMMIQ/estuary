@@ -392,7 +392,7 @@ fn embedded_admin_response(path: &str, immutable: bool) -> Response {
         .header("permissions-policy", "camera=(), microphone=(), geolocation=()")
         .header(
             CONTENT_SECURITY_POLICY,
-            "default-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
         )
         .body(axum::body::Body::from(asset.data.into_owned()))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
