@@ -77,9 +77,8 @@ jobs:
         with:
           name: web-dist
           path: web/dist
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install musl target
+        run: rustup target add ${{ matrix.target }}
       - uses: mlugg/setup-zig@v2
       - uses: taiki-e/install-action@v2
         with:
