@@ -99,7 +99,7 @@ pub async fn proxy(
     if method != Method::POST || !is_inference_json {
         return Err(GatewayError::RouteNotFound);
     }
-    let parsed = if body.is_empty() {
+    let mut parsed = if body.is_empty() {
         None
     } else {
         serde_json::from_slice::<Value>(&body).ok()
@@ -110,6 +110,16 @@ pub async fn proxy(
     if endpoint == "responses" {
         reject_stateful_responses(parsed.as_ref())?;
     }
+    let original_body = if parsed
+        .as_mut()
+        .is_some_and(strip_claude_code_billing_blocks)
+    {
+        serde_json::to_vec(parsed.as_ref().expect("parsed body exists"))
+            .map(Bytes::from)
+            .map_err(|_| GatewayError::Internal)?
+    } else {
+        body
+    };
 
     let public_model = parsed
         .as_ref()
@@ -147,7 +157,7 @@ pub async fn proxy(
             method,
             query: uri.query().map(str::to_owned),
             headers,
-            original_body: body,
+            original_body,
             parsed_body: parsed,
             public_model,
             prefix_input,
@@ -156,6 +166,71 @@ pub async fn proxy(
         },
     )
     .await
+}
+
+const CLAUDE_CODE_BILLING_PREFIX: &str = "x-anthropic-billing-header:";
+
+fn strip_claude_code_billing_blocks(body: &mut Value) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+
+    let remove_system = match object.get_mut("system") {
+        Some(Value::String(text)) => is_claude_code_billing_text(text),
+        Some(Value::Array(blocks)) => {
+            let before = blocks.len();
+            blocks.retain(|block| !is_claude_code_billing_block(block));
+            changed |= blocks.len() != before;
+            blocks.is_empty()
+        }
+        _ => false,
+    };
+    if remove_system {
+        object.remove("system");
+        changed = true;
+    }
+
+    if let Some(Value::Array(messages)) = object.get_mut("messages") {
+        messages.retain_mut(|message| {
+            if message.get("role").and_then(Value::as_str) != Some("system") {
+                return true;
+            }
+            let Some(content) = message.get_mut("content") else {
+                return true;
+            };
+            match content {
+                Value::String(text) if is_claude_code_billing_text(text) => {
+                    changed = true;
+                    false
+                }
+                Value::Array(blocks) => {
+                    let before = blocks.len();
+                    blocks.retain(|block| !is_claude_code_billing_block(block));
+                    changed |= blocks.len() != before;
+                    !blocks.is_empty()
+                }
+                _ => true,
+            }
+        });
+    }
+
+    changed
+}
+
+fn is_claude_code_billing_block(value: &Value) -> bool {
+    value.as_str().is_some_and(is_claude_code_billing_text)
+        || value
+            .as_object()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .and_then(|block| block.get("text"))
+            .and_then(Value::as_str)
+            .is_some_and(is_claude_code_billing_text)
+}
+
+fn is_claude_code_billing_text(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with(CLAUDE_CODE_BILLING_PREFIX) && !text.contains(['\r', '\n'])
 }
 
 fn reject_stateful_responses(body: Option<&Value>) -> Result<(), GatewayError> {
@@ -913,6 +988,92 @@ mod tests {
         assert!(
             connection_header_names(&headers).contains(&HeaderName::from_static("x-remove-me"))
         );
+    }
+
+    #[test]
+    fn strips_real_claude_code_billing_blocks_without_touching_prompt_context() {
+        let mut body = json!({
+            "model": "claude-sonnet-4-5",
+            "metadata": {
+                "user_id": "{\"device_id\":\"device-hash\",\"session_id\":\"session-id\"}"
+            },
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.220.8a5; cc_entrypoint=sdk-cli;"
+                },
+                {
+                    "type": "text",
+                    "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {
+                    "type": "text",
+                    "text": "# Environment\n - Primary working directory: /workspace\n - Is a git repository: true"
+                }
+            ],
+            "messages": [{"role": "user", "content": "Implement the change"}]
+        });
+
+        assert!(strip_claude_code_billing_blocks(&mut body));
+        assert_eq!(body["system"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["system"][0]["text"],
+            "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+        );
+        assert!(
+            body["system"][1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("# Environment")
+        );
+        assert!(
+            body["metadata"]["user_id"]
+                .as_str()
+                .unwrap()
+                .contains("device-hash")
+        );
+    }
+
+    #[test]
+    fn claude_code_versions_share_the_same_sanitized_prefix() {
+        let config = crate::config::PrefixConfig::default();
+        let request = |version: &str| {
+            json!({
+                "system": [
+                    {
+                        "type": "text",
+                        "text": format!("x-anthropic-billing-header: cc_version={version}; cc_entrypoint=sdk-cli;")
+                    },
+                    {"type": "text", "text": "Stable agent instructions"}
+                ],
+                "messages": [{"role": "user", "content": "shared task"}]
+            })
+        };
+        let mut first = request("2.1.220.8a5");
+        let mut second = request("2.1.221.9b6");
+        assert!(strip_claude_code_billing_blocks(&mut first));
+        assert!(strip_claude_code_billing_blocks(&mut second));
+
+        let first = routing_text("chat/completions", Some("model"), Some(&first), &config);
+        let second = routing_text("chat/completions", Some("model"), Some(&second), &config);
+        let directory = crate::prefix::PrefixDirectory::new(&config);
+        directory.record("node-a", &first);
+        let matched = directory.best_match(&second);
+        assert_eq!(matched.node_ids, ["node-a"]);
+        assert_eq!(matched.matched_chars, matched.input_chars);
+    }
+
+    #[test]
+    fn does_not_strip_multiline_or_non_system_user_content() {
+        let mut body = json!({
+            "system": "x-anthropic-billing-header: explain this value\nDo not delete this instruction",
+            "messages": [{
+                "role": "user",
+                "content": "x-anthropic-billing-header: cc_version=user-supplied;"
+            }]
+        });
+        assert!(!strip_claude_code_billing_blocks(&mut body));
     }
 
     #[test]

@@ -198,7 +198,14 @@ async fn maps_model_preserves_unknown_fields_and_replaces_credentials() {
     let gateway = spawn_gateway(vec![upstream_node]).await;
     let request = json!({
         "model": "public-model",
-        "messages": [{"role": "user", "content": "hello", "vendor_part": 17}],
+        "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.220.8a5; cc_entrypoint=sdk-cli;"},
+            {"type": "text", "text": "Keep this system instruction", "cache_control": {"type": "ephemeral"}}
+        ],
+        "messages": [
+            {"role": "system", "content": "x-anthropic-billing-header: cc_version=2.1.219.7f1; cc_entrypoint=cli;"},
+            {"role": "user", "content": "hello", "vendor_part": 17}
+        ],
         "vendor_extension": {"nested": [true, null, {"answer": 42}]}
     });
 
@@ -243,7 +250,13 @@ async fn maps_model_preserves_unknown_fields_and_replaces_credentials() {
 
     let upstream_body: Value = serde_json::from_slice(&captured.body).expect("upstream JSON");
     assert_eq!(upstream_body["model"], "internal-model");
+    assert_eq!(upstream_body["messages"].as_array().unwrap().len(), 1);
     assert_eq!(upstream_body["messages"][0]["vendor_part"], 17);
+    assert_eq!(upstream_body["system"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        upstream_body["system"][0]["text"],
+        "Keep this system instruction"
+    );
     assert_eq!(
         upstream_body["vendor_extension"],
         request["vendor_extension"]

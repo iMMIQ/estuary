@@ -54,6 +54,8 @@ For generic OpenAI-compatible servers, the gateway stores canonical prompt mater
 - it switches completely to load-first routing when both configured load-imbalance thresholds are exceeded;
 - it is lost on restart and can differ from the server's real tokenizer or cache eviction state.
 
+Before routing or forwarding a JSON inference request, Estuary removes Claude Code's standalone `x-anthropic-billing-header:` system text block. That block contains the CLI version/build identifier and entrypoint but no model instruction, so retaining it fragments both local affinity and upstream KV prefixes across Claude Code releases. The match is intentionally narrow: multiline content, environment details, tool instructions, ordinary system messages, and user content are preserved. Native Anthropic `/v1/messages` exposure is still a separate protocol phase.
+
 Nodes configured with `provider.type: vllm` are version-gated to vLLM 0.25.0 or newer. Estuary scrapes native running, waiting, and KV-use metrics; calls `/tokenize` for Chat Completions and string Completions; and consumes vLLM's ZMQ KV events. Exact token-block matches take precedence over the character estimate. A missing metric, tokenize failure, event disconnect, sequence gap, or unsupported request shape degrades safely to local load and approximate affinity instead of blocking inference.
 
 ### Retry semantics

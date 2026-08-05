@@ -325,6 +325,7 @@ pub fn routing_text(
     };
 
     for key in [
+        "system",
         "instructions",
         "tools",
         "tool_choice",
