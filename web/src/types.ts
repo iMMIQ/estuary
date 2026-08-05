@@ -41,12 +41,18 @@ export interface NodeConfig {
 
 export interface NodeRuntime {
   id: string;
+  base_url: string;
+  provider: ProviderKind;
   health: HealthState;
   lifecycle: LifecycleState;
   circuit: CircuitState;
+  circuit_open_until_unix_ms: number | null;
+  circuit_failures: number;
+  circuit_half_open_in_flight: number;
   active: number;
   available: number;
   max_concurrency: number;
+  weight: number;
   provider_state: "generic" | "checking" | "ready" | "incompatible";
   provider_version: string | null;
   provider_last_error: string | null;
@@ -55,6 +61,27 @@ export interface NodeRuntime {
   kv_cache_usage: number | null;
   latency_ewma_ms: number;
   error_ewma: number;
+  last_error: string | null;
+  last_change_unix_ms: number;
+  provider_generation: number;
+  provider_telemetry_updated_unix_ms: number | null;
+}
+
+export interface AdmissionSnapshot {
+  state:
+    | "accepting"
+    | "draining"
+    | "health_blocked"
+    | "provider_blocked"
+    | "circuit_open"
+    | "circuit_limited"
+    | "waiting_watermark"
+    | "at_capacity";
+  reason: string;
+  routable: boolean;
+  accepting_assignments: boolean;
+  telemetry_fresh: boolean;
+  waiting_watermark_blocked: boolean;
 }
 
 export interface NodeRecord {
@@ -63,8 +90,46 @@ export interface NodeRecord {
   created_at_unix_ms: number;
   updated_at_unix_ms: number;
   runtime: NodeRuntime;
+  admission: AdmissionSnapshot;
   exact_kv_authoritative: boolean;
   exact_kv_blocks: number;
+}
+
+export interface GatewayStatus {
+  status: "ready" | "not_ready";
+  live: boolean;
+  ready: boolean;
+  version: string;
+  generated_at_unix_ms: number;
+  fleet: {
+    total_nodes: number;
+    routable_nodes: number;
+    accepting_nodes: number;
+    models: number;
+    active_requests: number;
+    total_concurrency: number;
+    available_concurrency: number;
+  };
+  queue: {
+    requests: number;
+    bytes: number;
+    max_requests: number;
+    max_bytes: number;
+  };
+  routing: {
+    prefix_enabled: boolean;
+  };
+}
+
+export interface PreflightResponse {
+  ok: true;
+  runtime: NodeRuntime;
+  admission: AdmissionSnapshot;
+  checks: {
+    configuration: "passed";
+    provider: "passed";
+    health: "passed";
+  };
 }
 
 export interface Pair {

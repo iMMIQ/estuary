@@ -76,6 +76,16 @@ async fn creates_updates_and_deletes_a_live_node() {
             .unwrap()
             .is_empty()
     );
+    let initial_status = client
+        .get(admin.url("/admin/api/status"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(initial_status.status(), StatusCode::OK);
+    let initial_status = initial_status.json::<Value>().await.unwrap();
+    assert_eq!(initial_status["status"], "not_ready");
+    assert_eq!(initial_status["fleet"]["total_nodes"], 0);
+    assert_eq!(initial_status["queue"]["requests"], 0);
 
     let created = timeout(
         IO_TIMEOUT,
@@ -91,6 +101,20 @@ async fn creates_updates_and_deletes_a_live_node() {
     let created = created.json::<Value>().await.unwrap();
     assert_eq!(created["revision"], 1);
     assert_eq!(created["runtime"]["health"], "healthy");
+    assert_eq!(created["admission"]["state"], "accepting");
+    assert_eq!(created["admission"]["accepting_assignments"], true);
+
+    let ready_status = client
+        .get(admin.url("/admin/api/status"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(ready_status["status"], "ready");
+    assert_eq!(ready_status["fleet"]["routable_nodes"], 1);
+    assert_eq!(ready_status["fleet"]["accepting_nodes"], 1);
 
     let models = client.get(public.url("/v1/models")).send().await.unwrap();
     assert_eq!(models.status(), StatusCode::OK);
@@ -135,6 +159,41 @@ async fn creates_updates_and_deletes_a_live_node() {
             .status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
+}
+
+#[tokio::test]
+async fn preflight_checks_a_node_without_persisting_it() {
+    let upstream = TestServer::spawn(Router::new().route(
+        "/v1/models",
+        get(|| async { Json(json!({"object": "list", "data": []})) }),
+    ))
+    .await;
+    let mut settings = Settings::default();
+    settings.health.timeout_ms = 500;
+    let gateway = Gateway::build(settings).unwrap();
+    let admin = TestServer::spawn(gateway.admin_router()).await;
+
+    let response = client()
+        .post(admin.url("/admin/api/nodes/preflight"))
+        .json(&node(&upstream.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = response.json::<Value>().await.unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["runtime"]["health"], "healthy");
+    assert_eq!(response["checks"]["provider"], "passed");
+
+    let nodes = client()
+        .get(admin.url("/admin/api/nodes"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert!(nodes["nodes"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

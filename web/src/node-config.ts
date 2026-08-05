@@ -1,5 +1,7 @@
 import type { NodeConfig, NodeDraft, NodeRecord, Pair, ProviderKind } from "./types";
 
+export type DraftErrors = Record<string, string>;
+
 export function pairsToRecord(pairs: Pair[]): Record<string, string> {
   return Object.fromEntries(
     pairs
@@ -63,6 +65,60 @@ export function draftToConfig(draft: NodeDraft): NodeConfig {
         draft.provider.type === "vllm" ? draft.provider.kv_events : null,
     },
   };
+}
+
+export function validateDraft(draft: NodeDraft): DraftErrors {
+  const errors: DraftErrors = {};
+  if (!draft.id.trim()) errors.id = "Node ID is required";
+
+  try {
+    const url = new URL(draft.base_url);
+    if (!["http:", "https:"].includes(url.protocol) || !url.hostname) {
+      errors.base_url = "Use an absolute HTTP or HTTPS URL";
+    } else if (url.username || url.password || url.search || url.hash) {
+      errors.base_url = "Credentials, query strings and fragments are not allowed";
+    }
+  } catch {
+    errors.base_url = "Use an absolute HTTP or HTTPS URL";
+  }
+
+  if (!draft.health_path.trim()) errors.health_path = "Health path is required";
+  if (!Number.isFinite(draft.max_concurrency) || draft.max_concurrency < 1) {
+    errors.max_concurrency = "Max concurrency must be at least 1";
+  }
+  if (!Number.isFinite(draft.weight) || draft.weight <= 0) {
+    errors.weight = "Weight must be greater than 0";
+  }
+
+  const completeModels = draft.models.filter((row) => row.key.trim() && row.value.trim());
+  if (completeModels.length === 0) errors.models = "Add at least one complete model mapping";
+  if (draft.models.some((row) => Boolean(row.key.trim()) !== Boolean(row.value.trim()))) {
+    errors.models = "Complete or remove every model mapping row";
+  }
+  const modelKeys = completeModels.map((row) => row.key.trim());
+  if (new Set(modelKeys).size !== modelKeys.length) errors.models = "Public model names must be unique";
+
+  if (draft.headers_from_env.some((row) => Boolean(row.key.trim()) !== Boolean(row.value.trim()))) {
+    errors.headers_from_env = "Complete or remove every header row";
+  }
+
+  if (draft.provider.type === "vllm") {
+    for (const [key, value] of [
+      ["version_path", draft.provider.version_path],
+      ["metrics_path", draft.provider.metrics_path],
+      ["tokenize_path", draft.provider.tokenize_path],
+    ] as const) {
+      if (!value.startsWith("/")) errors[key] = "Path must start with /";
+    }
+    if (draft.provider.monitor_interval_ms < 1) errors.monitor_interval_ms = "Must be at least 1 ms";
+    if (draft.provider.request_timeout_ms < 1) errors.request_timeout_ms = "Must be at least 1 ms";
+    if (draft.provider.telemetry_stale_ms < draft.provider.monitor_interval_ms) {
+      errors.telemetry_stale_ms = "Must not be shorter than the monitor interval";
+    }
+    if (draft.provider.waiting_threshold < 1) errors.waiting_threshold = "Must be at least 1";
+  }
+
+  return errors;
 }
 
 export function formatCompactNumber(value: number): string {

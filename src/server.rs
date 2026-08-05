@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, path::Path as FsPath, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::Path as FsPath,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -14,7 +19,7 @@ use axum::{
 };
 use reqwest::redirect::Policy;
 use rust_embed::RustEmbed;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     net::TcpListener,
@@ -31,7 +36,7 @@ use crate::{
     error::GatewayError,
     health::{preflight_health, run_health_monitor},
     metrics::Metrics,
-    node::Node,
+    node::{CircuitState, LifecycleState, Node, NodeSnapshot},
     proxy,
     scheduler::Scheduler,
     store::{NodeStore, StoredNode},
@@ -132,6 +137,11 @@ impl Gateway {
             .route("/health/ready", get(ready))
             .route("/metrics", get(metrics))
             .route("/admin/nodes", get(nodes))
+            .route("/admin/api/status", get(admin_status))
+            .route(
+                "/admin/api/nodes/preflight",
+                axum::routing::post(preflight_node),
+            )
             .route("/admin/api/nodes", get(admin_nodes).post(create_node))
             .route(
                 "/admin/api/nodes/{node}",
@@ -337,6 +347,8 @@ fn metric_endpoint(path: &str) -> &'static str {
         "/health/ready" => "health_ready",
         "/metrics" => "metrics",
         "/admin/nodes" => "admin_nodes",
+        "/admin/api/status" => "admin_status",
+        "/admin/api/nodes/preflight" => "admin_node_preflight",
         path if path.starts_with("/admin/nodes/") && path.ends_with("/drain") => "admin_node_drain",
         _ => "other",
     }
@@ -455,6 +467,112 @@ async fn admin_nodes(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+#[derive(Debug, Serialize)]
+// These independent flags are part of the admin diagnostic contract, not one state machine.
+#[allow(clippy::struct_excessive_bools)]
+struct AdminAdmissionSnapshot {
+    state: &'static str,
+    reason: &'static str,
+    routable: bool,
+    accepting_assignments: bool,
+    telemetry_fresh: bool,
+    waiting_watermark_blocked: bool,
+}
+
+fn admin_admission_snapshot(node: &Node, snapshot: &NodeSnapshot) -> AdminAdmissionSnapshot {
+    let fresh_waiting = node.fresh_vllm_waiting();
+    let telemetry_fresh =
+        node.provider().kind != crate::config::ProviderKind::Vllm || fresh_waiting.is_some();
+    let waiting_watermark_blocked =
+        fresh_waiting.is_some_and(|waiting| waiting >= node.provider().waiting_threshold);
+    let routable = node.is_routable();
+
+    let (state, reason) = if snapshot.lifecycle == LifecycleState::Draining {
+        ("draining", "Node is draining")
+    } else if !node.is_health_state_routable(snapshot.health) {
+        ("health_blocked", "Health state does not permit routing")
+    } else if !node.provider_is_ready() {
+        (
+            "provider_blocked",
+            "Provider compatibility check does not permit routing",
+        )
+    } else if snapshot.circuit == CircuitState::Open {
+        ("circuit_open", "Circuit breaker is open")
+    } else if !routable {
+        (
+            "circuit_limited",
+            "Circuit breaker half-open capacity is exhausted",
+        )
+    } else if waiting_watermark_blocked {
+        (
+            "waiting_watermark",
+            "Fresh upstream waiting depth reached its watermark",
+        )
+    } else if snapshot.available == 0 {
+        ("at_capacity", "All local concurrency permits are in use")
+    } else {
+        ("accepting", "Eligible for a new assignment")
+    };
+
+    AdminAdmissionSnapshot {
+        state,
+        reason,
+        routable,
+        accepting_assignments: state == "accepting",
+        telemetry_fresh,
+        waiting_watermark_blocked,
+    }
+}
+
+async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let nodes = state.scheduler.nodes();
+    let mut routable_nodes = 0;
+    let mut accepting_nodes = 0;
+    let mut active_requests = 0;
+    let mut total_concurrency = 0;
+    let mut available_concurrency = 0;
+
+    for node in &nodes {
+        let snapshot = node.snapshot();
+        let admission = admin_admission_snapshot(node, &snapshot);
+        routable_nodes += usize::from(admission.routable);
+        accepting_nodes += usize::from(admission.accepting_assignments);
+        active_requests += snapshot.active;
+        total_concurrency += snapshot.max_concurrency;
+        if admission.accepting_assignments {
+            available_concurrency += snapshot.available;
+        }
+    }
+    let (queued_requests, queued_bytes) = state.scheduler.queue_snapshot();
+    let ready = routable_nodes > 0;
+
+    Json(json!({
+        "status": if ready { "ready" } else { "not_ready" },
+        "live": true,
+        "ready": ready,
+        "version": env!("CARGO_PKG_VERSION"),
+        "generated_at_unix_ms": unix_millis(),
+        "fleet": {
+            "total_nodes": nodes.len(),
+            "routable_nodes": routable_nodes,
+            "accepting_nodes": accepting_nodes,
+            "models": state.scheduler.models().len(),
+            "active_requests": active_requests,
+            "total_concurrency": total_concurrency,
+            "available_concurrency": available_concurrency,
+        },
+        "queue": {
+            "requests": queued_requests,
+            "bytes": queued_bytes,
+            "max_requests": state.settings.routing.queue_max_requests,
+            "max_bytes": state.settings.routing.queue_max_bytes,
+        },
+        "routing": {
+            "prefix_enabled": state.settings.routing.prefix.enabled,
+        }
+    }))
+}
+
 async fn admin_node(State(state): State<Arc<AppState>>, Path(node_id): Path<String>) -> Response {
     let stored = match state.store.get(&node_id) {
         Ok(Some(stored)) => stored,
@@ -469,15 +587,41 @@ async fn admin_node(State(state): State<Arc<AppState>>, Path(node_id): Path<Stri
 
 fn admin_node_payload(state: &AppState, stored: &StoredNode, node: &Node) -> serde_json::Value {
     let cache = state.scheduler.exact_cache_directory().snapshot(node.id());
+    let snapshot = node.snapshot();
+    let admission = admin_admission_snapshot(node, &snapshot);
     json!({
         "config": stored.config,
         "revision": stored.revision,
         "created_at_unix_ms": stored.created_at_unix_ms,
         "updated_at_unix_ms": stored.updated_at_unix_ms,
-        "runtime": node.snapshot(),
+        "runtime": snapshot,
+        "admission": admission,
         "exact_kv_authoritative": cache.authoritative,
         "exact_kv_blocks": cache.blocks,
     })
+}
+
+async fn preflight_node(
+    State(state): State<Arc<AppState>>,
+    Json(config): Json<NodeConfig>,
+) -> Response {
+    let node = match prepare_node(&state, &config).await {
+        Ok(node) => node,
+        Err(error) => return admin_validation_error(&error),
+    };
+    let snapshot = node.snapshot();
+    let admission = admin_admission_snapshot(&node, &snapshot);
+    Json(json!({
+        "ok": true,
+        "runtime": snapshot,
+        "admission": admission,
+        "checks": {
+            "configuration": "passed",
+            "provider": "passed",
+            "health": "passed",
+        }
+    }))
+    .into_response()
 }
 
 async fn create_node(
@@ -833,6 +977,15 @@ async fn shutdown_signal() {
         () = ctrl_c => {},
         () = terminate => {},
     }
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

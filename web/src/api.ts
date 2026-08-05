@@ -1,11 +1,22 @@
-import type { NodeConfig, NodeRecord } from "./types";
+import type { GatewayStatus, NodeConfig, NodeRecord, PreflightResponse } from "./types";
 
 interface NodeListResponse {
   nodes: NodeRecord[];
 }
 
 interface ErrorEnvelope {
-  error?: { message?: string };
+  error?: { message?: string; code?: string };
+}
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly code: string | null,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -17,13 +28,28 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     const body = (await response.json().catch(() => ({}))) as ErrorEnvelope;
-    throw new Error(body.error?.message || `Request failed with HTTP ${response.status}`);
+    throw new ApiError(
+      body.error?.message || `Request failed with HTTP ${response.status}`,
+      response.status,
+      body.error?.code ?? null,
+    );
   }
   return (await response.json()) as T;
 }
 
 export async function listNodes(): Promise<NodeRecord[]> {
   return (await request<NodeListResponse>("/admin/api/nodes")).nodes;
+}
+
+export function getStatus(): Promise<GatewayStatus> {
+  return request("/admin/api/status");
+}
+
+export function preflightNode(config: NodeConfig): Promise<PreflightResponse> {
+  return request("/admin/api/nodes/preflight", {
+    method: "POST",
+    body: JSON.stringify(config),
+  });
 }
 
 export function createNode(config: NodeConfig): Promise<NodeRecord> {
