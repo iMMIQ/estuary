@@ -77,8 +77,19 @@ jobs:
         with:
           name: web-dist
           path: web/dist
-      - name: Install musl target
-        run: rustup target add ${{ matrix.target }}
+      - name: Resolve Rust toolchain
+        id: rust
+        shell: bash
+        run: |
+          echo "release=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+          echo "sysroot=$(rustc --print sysroot)" >> "$GITHUB_OUTPUT"
+      - name: Cache musl standard library
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.rust.outputs.sysroot }}/lib/rustlib/${{ matrix.target }}
+          key: rust-std-${{ runner.os }}-${{ steps.rust.outputs.release }}-${{ matrix.target }}
+      - name: Install musl target from USTC
+        run: .github/scripts/install-rust-target.sh ${{ matrix.target }}
       - uses: mlugg/setup-zig@v2
       - uses: taiki-e/install-action@v2
         with:
