@@ -4,12 +4,12 @@ This document describes the current gateway foundation, SQLite-backed control pl
 
 ## Invariants and scope
 
-- Public inference routes are an allowlist: Chat Completions, foreground Responses create, legacy Completions, and Embeddings. Model list/get are generated locally.
+- Public inference routes are an allowlist: Chat Completions, foreground Responses create, legacy Completions, Embeddings, Anthropic Messages, and Anthropic token counting. Model list/get are generated locally.
 - A node's `max_concurrency` permit covers the upstream request and complete upstream response body. Streaming consumers are isolated by a one-chunk bounded pump and a stall timeout; non-streaming successes use a separately bounded complete buffer.
 - Scheduling, permits, queued-body accounting, health, and prefix knowledge are process-local. The supported multi-process topology divides each node budget among fixed gateway slots and replaces one slot at a time.
 - Generic-node prefix knowledge is an approximation derived from requests assigned by this gateway. vLLM 0.25+ nodes can additionally supply exact local GPU block events.
-- The gateway preserves unknown request fields. When a model alias must be rewritten, it changes only the top-level `model` field and serializes the JSON again.
-- Upstream SSE/body bytes pass through a one-chunk bounded channel with backpressure. The gateway does not parse and reconstruct OpenAI or Responses events.
+- OpenAI fast paths preserve unknown request fields. vLLM 0.25+ Anthropic requests do the same and use its native Messages and count-tokens routes. When a model alias must be rewritten, these paths change only the top-level `model` field and serialize the JSON again. Generic OpenAI nodes receive a rebuilt Chat Completions payload.
+- OpenAI and Responses upstream SSE/body bytes pass through a one-chunk bounded channel unchanged. Native Anthropic SSE is incrementally framed only to rewrite the public model in `message_start`; the generic adapter emits correctly ordered named Messages events from Chat Completions SSE through the same bounded backpressure path.
 
 ## Control plane and persistence
 
@@ -150,7 +150,7 @@ Retries require another routable node and are capped to one through three total 
 - Node configuration and lifecycle are persisted and reconciled across same-host process slots; process-wide routing and timeout policy changes still require a restart.
 - Exact vLLM routing is process-local and deliberately excludes remote/offloaded, LoRA, salted, and multimodal cache keys.
 - No Responses background mode, `previous_response_id`, conversation state, or `/responses/{id}` operations. Callers should set `store: false`; an object stored by an upstream is not retrievable through this gateway.
-- No Anthropic Messages/Claude Code protocol endpoint.
+- Native vLLM Anthropic capability follows the installed vLLM 0.25+ version. The generic OpenAI fallback cannot represent server tools, document/citation blocks, or Files; such requests require a native-capable node.
 - No exactly-once guarantee for retried generation requests.
 
 ## Planned extension seams
@@ -161,9 +161,9 @@ Authentication middleware will resolve a presented key to an internal principal 
 
 Future API-key priority can add principal-aware fairness without classifying requests by prompt length. Node selection remains late-bound, preserving prefix and observed-load decisions. Metrics must label bounded policy classes, never raw API keys.
 
-### Claude and additional protocols
+### Additional protocols
 
-An inbound `ProtocolAdapter` should parse protocol-specific metadata and produce a protocol-neutral routing request plus an opaque or translated upstream payload. OpenAI-to-OpenAI remains the zero-copy fast path. A Claude adapter owns Messages request conversion, Anthropic error mapping, and named SSE event translation; the scheduler, node lease, health, queue, and metrics remain protocol-independent.
+The Anthropic adapter builds a routing representation before scheduling. A vLLM 0.25+ selection receives the sanitized native request and native route; a generic selection receives a Chat Completions translation. The adapter owns Anthropic error mapping, model-name rewriting, and named SSE conversion while the scheduler, node lease, health, queue, and metrics remain protocol-independent.
 
 Durable Responses support similarly belongs in a state-affinity adapter backed by a response-ID-to-node store and node generation checks. Additional provider adapters can reuse the current tokenizer, telemetry, and precise-cache extension points without changing the public admission contract.
 

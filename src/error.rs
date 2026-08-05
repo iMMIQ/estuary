@@ -37,7 +37,7 @@ pub enum GatewayError {
 }
 
 impl GatewayError {
-    fn status(&self) -> StatusCode {
+    pub(crate) fn status(&self) -> StatusCode {
         match self {
             Self::InvalidJson
             | Self::MissingModel

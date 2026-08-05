@@ -23,6 +23,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::{
+    anthropic,
+    config::ProviderKind,
     error::GatewayError,
     metrics::Metrics,
     node::{Node, NodeLease},
@@ -85,6 +87,25 @@ pub async fn proxy(
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
+) -> Response {
+    let is_anthropic = matches!(endpoint.as_str(), "messages" | "messages/count_tokens");
+    let gateway_request_id = request_id.0.clone();
+    match proxy_inner(state, endpoint, request_id, method, uri, headers, body).await {
+        Ok(response) => response,
+        Err(error) if is_anthropic => anthropic::error_response(&error, &gateway_request_id),
+        Err(error) => error.into_response(),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn proxy_inner(
+    state: Arc<AppState>,
+    mut endpoint: String,
+    request_id: RequestId,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, GatewayError> {
     if endpoint.starts_with("responses/") {
         return Err(GatewayError::UnsupportedFeature(
@@ -94,7 +115,12 @@ pub async fn proxy(
 
     let is_inference_json = matches!(
         endpoint.as_str(),
-        "chat/completions" | "responses" | "completions" | "embeddings"
+        "chat/completions"
+            | "responses"
+            | "completions"
+            | "embeddings"
+            | "messages"
+            | "messages/count_tokens"
     );
     if method != Method::POST || !is_inference_json {
         return Err(GatewayError::RouteNotFound);
@@ -110,7 +136,7 @@ pub async fn proxy(
     if endpoint == "responses" {
         reject_stateful_responses(parsed.as_ref())?;
     }
-    let original_body = if parsed
+    let mut original_body = if parsed
         .as_mut()
         .is_some_and(strip_claude_code_billing_blocks)
     {
@@ -129,18 +155,86 @@ pub async fn proxy(
     if is_inference_json && public_model.is_none() {
         return Err(GatewayError::MissingModel);
     }
+
+    let mut native_anthropic = None;
+    let mut native_requirement_error = None;
+    let (protocol, native_only, record_prefix) = if endpoint == "messages" {
+        anthropic::validate_request_shape(
+            parsed.as_ref().expect("inference JSON was validated above"),
+            true,
+        )?;
+        native_anthropic = Some(NativeAnthropicPayload {
+            endpoint: "messages".to_owned(),
+            body: original_body.clone(),
+            parsed: parsed
+                .as_ref()
+                .expect("inference JSON was validated above")
+                .clone(),
+            query: uri.query().map(str::to_owned),
+        });
+        let converted = anthropic::convert_request(
+            parsed.as_ref().expect("inference JSON was validated above"),
+        );
+        match converted {
+            Ok(converted) => {
+                original_body = serde_json::to_vec(&converted)
+                    .map(Bytes::from)
+                    .map_err(|_| GatewayError::Internal)?;
+                parsed = Some(converted);
+                "chat/completions".clone_into(&mut endpoint);
+                (ClientProtocol::Anthropic, false, true)
+            }
+            Err(error) => {
+                native_requirement_error = Some(error);
+                (ClientProtocol::Anthropic, true, true)
+            }
+        }
+    } else if endpoint == "messages/count_tokens" {
+        anthropic::validate_request_shape(
+            parsed.as_ref().expect("inference JSON was validated above"),
+            false,
+        )?;
+        (ClientProtocol::Anthropic, true, false)
+    } else {
+        (ClientProtocol::OpenAi, false, true)
+    };
+    if native_only
+        && !state.scheduler.nodes().iter().any(|node| {
+            node.provider().kind == ProviderKind::Vllm
+                && node.upstream_model(public_model.as_deref()).is_some()
+        })
+    {
+        return Err(
+            native_requirement_error.unwrap_or(GatewayError::UnsupportedFeature(
+                "Anthropic token counting requires a vLLM 0.25 or newer node",
+            )),
+        );
+    }
+    let routing_parsed = (endpoint == "messages/count_tokens")
+        .then(|| {
+            anthropic::convert_count_request(
+                parsed.as_ref().expect("inference JSON was validated above"),
+            )
+            .ok()
+        })
+        .flatten();
     let streaming = parsed
         .as_ref()
         .and_then(|value| value.get("stream"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let mut prefix_input = routing_text(
-        &endpoint,
+        if protocol == ClientProtocol::Anthropic {
+            "chat/completions"
+        } else {
+            &endpoint
+        },
         public_model.as_deref(),
-        parsed.as_ref(),
+        routing_parsed.as_ref().or(parsed.as_ref()),
         &state.settings.routing.prefix,
     );
-    if let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_ref()) {
+    if !native_only && let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_ref())
+    {
         if let Some(tokens) = state
             .vllm
             .tokenize_for_routing(&state.client, &endpoint, model, parsed)
@@ -150,12 +244,18 @@ pub async fn proxy(
         }
     }
 
+    let upstream_query =
+        if protocol == ClientProtocol::OpenAi || endpoint == "messages/count_tokens" {
+            uri.query().map(str::to_owned)
+        } else {
+            None
+        };
     proxy_with_retries(
         state,
         ProxyRequest {
             endpoint,
             method,
-            query: uri.query().map(str::to_owned),
+            query: upstream_query,
             headers,
             original_body,
             parsed_body: parsed,
@@ -163,6 +263,10 @@ pub async fn proxy(
             prefix_input,
             streaming,
             request_id,
+            client_protocol: protocol,
+            native_anthropic,
+            native_only,
+            record_prefix,
         },
     )
     .await
@@ -272,6 +376,51 @@ struct ProxyRequest {
     prefix_input: PrefixInput,
     streaming: bool,
     request_id: RequestId,
+    client_protocol: ClientProtocol,
+    native_anthropic: Option<NativeAnthropicPayload>,
+    native_only: bool,
+    record_prefix: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientProtocol {
+    OpenAi,
+    Anthropic,
+}
+
+struct NativeAnthropicPayload {
+    endpoint: String,
+    body: Bytes,
+    parsed: Value,
+    query: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpstreamResponseMode {
+    Passthrough,
+    ConvertToAnthropic,
+    NativeAnthropic,
+}
+
+enum ResponseStreamAdapter {
+    Converted(anthropic::StreamConverter),
+    Native(anthropic::NativeStreamRewriter),
+}
+
+impl ResponseStreamAdapter {
+    fn push(&mut self, bytes: &[u8]) -> Result<Bytes, GatewayError> {
+        match self {
+            Self::Converted(converter) => converter.push(bytes),
+            Self::Native(rewriter) => rewriter.push(bytes),
+        }
+    }
+
+    fn finish(&mut self) -> Result<Bytes, GatewayError> {
+        match self {
+            Self::Converted(converter) => converter.finish(),
+            Self::Native(rewriter) => rewriter.finish(),
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -279,7 +428,17 @@ async fn proxy_with_retries(
     state: Arc<AppState>,
     request: ProxyRequest,
 ) -> Result<Response, GatewayError> {
-    let mut excluded = HashSet::new();
+    let mut excluded = if request.native_only {
+        state
+            .scheduler
+            .nodes()
+            .into_iter()
+            .filter(|node| node.provider().kind != ProviderKind::Vllm)
+            .map(|node| node.id().to_owned())
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let mut attempt = 0usize;
     loop {
         attempt += 1;
@@ -305,15 +464,44 @@ async fn proxy_with_retries(
             .observe_prefix_match_tokens(selection.prefix_match_tokens);
 
         let node = Arc::clone(&selection.node);
+        let use_native_anthropic = request.native_only
+            || (request.native_anthropic.is_some() && node.provider().kind == ProviderKind::Vllm);
+        let (upstream_endpoint, upstream_original, upstream_parsed, upstream_query) =
+            if use_native_anthropic && !request.native_only {
+                let payload = request
+                    .native_anthropic
+                    .as_ref()
+                    .expect("native Anthropic payload was checked above");
+                (
+                    payload.endpoint.as_str(),
+                    &payload.body,
+                    Some(&payload.parsed),
+                    payload.query.as_deref(),
+                )
+            } else {
+                (
+                    request.endpoint.as_str(),
+                    &request.original_body,
+                    request.parsed_body.as_ref(),
+                    request.query.as_deref(),
+                )
+            };
+        let response_mode = match request.client_protocol {
+            ClientProtocol::OpenAi => UpstreamResponseMode::Passthrough,
+            ClientProtocol::Anthropic if use_native_anthropic => {
+                UpstreamResponseMode::NativeAnthropic
+            }
+            ClientProtocol::Anthropic => UpstreamResponseMode::ConvertToAnthropic,
+        };
         let upstream_url = node
-            .upstream_url(&request.endpoint, request.query.as_deref())
+            .upstream_url(upstream_endpoint, upstream_query)
             .map_err(|error| {
                 warn!(node = node.id(), error = %error, "failed to build upstream URL");
                 GatewayError::Internal
             })?;
         let upstream_body = mapped_body(
-            &request.original_body,
-            request.parsed_body.as_ref(),
+            upstream_original,
+            upstream_parsed,
             selection.upstream_model.as_deref(),
             request.public_model.as_deref(),
         )?;
@@ -426,6 +614,8 @@ async fn proxy_with_retries(
                 selection.lease,
                 stream_idle_timeout,
                 upstream_body_timeout,
+                request.client_protocol,
+                &request.request_id.0,
             )
             .await;
         }
@@ -442,6 +632,9 @@ async fn proxy_with_retries(
                 upstream_body_timeout,
                 state.settings.server.max_non_streaming_response_bytes,
                 state.settings.server.expose_node_header,
+                response_mode,
+                request.public_model.as_deref().unwrap_or_default(),
+                request.record_prefix,
             )
             .await;
             match buffered {
@@ -477,6 +670,9 @@ async fn proxy_with_retries(
             upstream_body_timeout,
             Duration::from_millis(state.settings.server.downstream_stall_timeout_ms),
             state.settings.server.expose_node_header,
+            response_mode,
+            request.public_model.clone().unwrap_or_default(),
+            request.record_prefix,
         ));
     }
 }
@@ -527,6 +723,9 @@ async fn buffered_success_response(
     upstream_body_timeout: Duration,
     max_body_bytes: usize,
     expose_node_header: bool,
+    response_mode: UpstreamResponseMode,
+    public_model: &str,
+    record_prefix: bool,
 ) -> Result<Response, GatewayError> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
@@ -548,12 +747,36 @@ async fn buffered_success_response(
             return Err(error);
         }
     };
+    let body = match response_mode {
+        UpstreamResponseMode::Passthrough => Ok(body),
+        UpstreamResponseMode::ConvertToAnthropic => {
+            anthropic::convert_response(&body, public_model)
+        }
+        UpstreamResponseMode::NativeAnthropic => {
+            anthropic::rewrite_native_response(&body, public_model)
+        }
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => {
+            lease.record_failure(
+                "Anthropic adapter received an invalid upstream response",
+                health_config,
+            );
+            return Err(error);
+        }
+    };
     lease.record_success(header_latency);
-    prefix_directory.record(node.id(), prefix_input);
-
+    if record_prefix {
+        prefix_directory.record(node.id(), prefix_input);
+    }
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     copy_response_headers(&headers, response.headers_mut());
+    if response_mode != UpstreamResponseMode::Passthrough {
+        response.headers_mut().remove(CONTENT_LENGTH);
+        anthropic::set_anthropic_content_type(&mut response, false);
+    }
     if let Some(value) = upstream_request_id {
         response
             .headers_mut()
@@ -583,6 +806,9 @@ fn streaming_response(
     upstream_body_timeout: Duration,
     downstream_stall_timeout: Duration,
     expose_node_header: bool,
+    response_mode: UpstreamResponseMode,
+    public_model: String,
+    record_prefix: bool,
 ) -> Response {
     let status = upstream.status();
     let headers = upstream.headers().clone();
@@ -605,12 +831,15 @@ fn streaming_response(
         let mut indexed = false;
         let mut received_body_bytes = 0_u64;
         let body_deadline = tokio::time::Instant::now() + upstream_body_timeout;
-
-        if expected_body_bytes == Some(0) {
-            prefix_directory.record(&stream_node_id, &prefix_input);
-            guard.completed();
-            return;
-        }
+        let mut anthropic_converter = match response_mode {
+            UpstreamResponseMode::Passthrough => None,
+            UpstreamResponseMode::ConvertToAnthropic => Some(ResponseStreamAdapter::Converted(
+                anthropic::StreamConverter::new(public_model),
+            )),
+            UpstreamResponseMode::NativeAnthropic => Some(ResponseStreamAdapter::Native(
+                anthropic::NativeStreamRewriter::new(public_model),
+            )),
+        };
 
         loop {
             let permit = tokio::select! {
@@ -669,14 +898,57 @@ fn streaming_response(
 
             match item {
                 Some(Ok(bytes)) => {
-                    if !indexed && !bytes.is_empty() {
+                    if record_prefix && !indexed && !bytes.is_empty() {
                         prefix_directory.record(&stream_node_id, &prefix_input);
                         indexed = true;
                     }
                     received_body_bytes = received_body_bytes
                         .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-                    permit.send(bytes);
-                    if expected_body_bytes.is_some_and(|expected| received_body_bytes >= expected) {
+                    let reached_expected =
+                        expected_body_bytes.is_some_and(|expected| received_body_bytes >= expected);
+                    let mut bytes = if let Some(converter) = anthropic_converter.as_mut() {
+                        match converter.push(&bytes) {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                fail_response_stream(
+                                    &pump_failure,
+                                    &health_config,
+                                    &mut guard,
+                                    StreamFailure::upstream(error.to_string()),
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        bytes
+                    };
+                    if reached_expected {
+                        if let Some(converter) = anthropic_converter.as_mut() {
+                            match converter.finish() {
+                                Ok(tail) if !tail.is_empty() => {
+                                    let mut joined =
+                                        BytesMut::with_capacity(bytes.len() + tail.len());
+                                    joined.extend_from_slice(&bytes);
+                                    joined.extend_from_slice(&tail);
+                                    bytes = joined.freeze();
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    fail_response_stream(
+                                        &pump_failure,
+                                        &health_config,
+                                        &mut guard,
+                                        StreamFailure::upstream(error.to_string()),
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    if !bytes.is_empty() {
+                        permit.send(bytes);
+                    }
+                    if reached_expected {
                         guard.completed();
                         return;
                     }
@@ -691,7 +963,22 @@ fn streaming_response(
                     return;
                 }
                 None => {
-                    if !indexed {
+                    if let Some(converter) = anthropic_converter.as_mut() {
+                        match converter.finish() {
+                            Ok(bytes) if !bytes.is_empty() => permit.send(bytes),
+                            Ok(_) => {}
+                            Err(error) => {
+                                fail_response_stream(
+                                    &pump_failure,
+                                    &health_config,
+                                    &mut guard,
+                                    StreamFailure::upstream(error.to_string()),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    if record_prefix && !indexed {
                         prefix_directory.record(&stream_node_id, &prefix_input);
                     }
                     guard.completed();
@@ -701,18 +988,27 @@ fn streaming_response(
         }
     });
 
+    let is_anthropic = response_mode != UpstreamResponseMode::Passthrough;
     let stream = async_stream::stream! {
         while let Some(bytes) = receiver.recv().await {
             yield Ok::<Bytes, io::Error>(bytes);
         }
         let failure = terminal_failure.lock().take();
         if let Some(failure) = failure {
-            yield Err(failure.into_io_error());
+            if is_anthropic {
+                yield Ok(anthropic::stream_error_event(&failure.message));
+            } else {
+                yield Err(failure.into_io_error());
+            }
         }
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     copy_response_headers(&headers, response.headers_mut());
+    if is_anthropic {
+        response.headers_mut().remove(CONTENT_LENGTH);
+        anthropic::set_anthropic_content_type(&mut response, true);
+    }
     if let Some(value) = upstream_request_id {
         response
             .headers_mut()
@@ -827,6 +1123,8 @@ async fn proxy_error_response(
     _lease: NodeLease,
     stream_idle_timeout: Duration,
     upstream_body_timeout: Duration,
+    client_protocol: ClientProtocol,
+    request_id: &str,
 ) -> Result<Response, GatewayError> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
@@ -840,6 +1138,13 @@ async fn proxy_error_response(
         upstream_body_timeout,
     )
     .await?;
+    if client_protocol == ClientProtocol::Anthropic {
+        let mut response = anthropic::convert_error_response(status, &body, request_id);
+        if let Some(value) = headers.get("retry-after") {
+            response.headers_mut().insert("retry-after", value.clone());
+        }
+        return Ok(response);
+    }
     let valid_openai_error = serde_json::from_slice::<Value>(&body)
         .ok()
         .and_then(|value| value.get("error").cloned())

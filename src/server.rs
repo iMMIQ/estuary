@@ -38,7 +38,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    Settings,
+    Settings, anthropic,
     config::{NodeConfig, validate_node_config},
     error::GatewayError,
     health::{preflight_health, run_health_monitor},
@@ -134,6 +134,7 @@ impl Gateway {
     pub fn public_router(&self) -> Router {
         let max_body = self.state.settings.server.max_request_body_bytes;
         Router::new()
+            .route("/api/hello", get(api_hello))
             .route("/v1/models", get(proxy::list_models))
             .route("/v1/models/{model}", get(proxy::get_model))
             .route("/v1/{*path}", any(proxy::proxy))
@@ -484,6 +485,7 @@ fn flatten_server_result(
 }
 
 async fn assign_request_id(mut request: Request, next: Next) -> Response {
+    let anthropic = request.uri().path().starts_with("/v1/messages");
     let id = request
         .headers()
         .get("x-request-id")
@@ -493,7 +495,10 @@ async fn assign_request_id(mut request: Request, next: Next) -> Response {
     request.extensions_mut().insert(RequestId(id.clone()));
     let mut response = next.run(request).await;
     if let Ok(value) = HeaderValue::from_str(&id) {
-        response.headers_mut().insert("x-request-id", value);
+        response.headers_mut().insert("x-request-id", value.clone());
+        if anthropic {
+            response.headers_mut().insert("request-id", value);
+        }
     }
     response
 }
@@ -538,7 +543,11 @@ async fn observe_request(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("application/json"))
     {
-        response = GatewayError::PayloadTooLarge.into_response();
+        response = if path.starts_with("/v1/messages") {
+            anthropic::error_response(&GatewayError::PayloadTooLarge, &request_id)
+        } else {
+            GatewayError::PayloadTooLarge.into_response()
+        };
     }
     let elapsed = started.elapsed();
     state.metrics.request(endpoint, response.status().as_u16());
@@ -559,6 +568,8 @@ async fn observe_request(
 fn metric_endpoint(path: &str) -> &'static str {
     match path {
         "/v1/chat/completions" => "chat_completions",
+        "/v1/messages" => "anthropic_messages",
+        "/v1/messages/count_tokens" => "anthropic_count_tokens",
         "/v1/responses" => "responses",
         "/v1/completions" => "completions",
         "/v1/embeddings" => "embeddings",
@@ -572,6 +583,10 @@ fn metric_endpoint(path: &str) -> &'static str {
         path if path.starts_with("/admin/nodes/") && path.ends_with("/drain") => "admin_node_drain",
         _ => "other",
     }
+}
+
+async fn api_hello() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 async fn admin_redirect() -> Redirect {
@@ -1292,6 +1307,7 @@ mod tests {
     #[test]
     fn metric_paths_have_bounded_cardinality() {
         assert_eq!(metric_endpoint("/v1/chat/completions"), "chat_completions");
+        assert_eq!(metric_endpoint("/v1/messages"), "anthropic_messages");
         assert_eq!(metric_endpoint("/v1/unknown/user-value"), "other");
     }
 }

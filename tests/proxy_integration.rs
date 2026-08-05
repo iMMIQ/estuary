@@ -2,6 +2,7 @@ use std::{
     convert::Infallible,
     future::pending,
     io,
+    net::SocketAddr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -20,7 +21,7 @@ use axum::{
 use bytes::Bytes;
 use estuary::{
     Gateway, Settings,
-    config::{NodeConfig, RetryConfig},
+    config::{NodeConfig, ProviderKind, RetryConfig},
 };
 use futures_util::stream;
 use serde_json::{Value, json};
@@ -94,6 +95,31 @@ async fn spawn_gateway(nodes: Vec<NodeConfig>) -> TestServer {
     let settings = gateway_settings(nodes);
     let gateway = Gateway::build(settings).expect("build gateway");
     TestServer::spawn(gateway.public_router()).await
+}
+
+async fn unused_address() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind unused address");
+    listener.local_addr().expect("unused address")
+}
+
+async fn wait_for_success(client: &reqwest::Client, url: &str) {
+    timeout(IO_TIMEOUT, async {
+        loop {
+            if client
+                .get(url)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("gateway did not become ready");
 }
 
 fn gateway_settings(nodes: Vec<NodeConfig>) -> Settings {
@@ -261,6 +287,389 @@ async fn maps_model_preserves_unknown_fields_and_replaces_credentials() {
         upstream_body["vendor_extension"],
         request["vendor_extension"]
     );
+}
+
+async fn anthropic_non_stream_response(
+    State(sender): State<mpsc::UnboundedSender<CapturedRequest>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    sender
+        .send(CapturedRequest { headers, body })
+        .expect("capture Anthropic request");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"id":"chatcmpl_anthropic","model":"internal-model","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":21,"completion_tokens":2}}"#,
+        ))
+        .expect("upstream Anthropic response")
+}
+
+#[tokio::test]
+async fn anthropic_messages_maps_request_response_and_claude_code_system() {
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/chat/completions", post(anthropic_non_stream_response))
+            .with_state(sender),
+    )
+    .await;
+    let mut upstream_node = node("anthropic-node", &upstream, [("claude", "internal-model")]);
+    upstream_node.api_key = Some("upstream-secret".to_owned());
+    let gateway = spawn_gateway(vec![upstream_node]).await;
+
+    let response = test_client()
+        .post(gateway.url("/v1/messages?beta=true"))
+        .header("x-api-key", "client-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude",
+            "max_tokens": 128,
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.220.8a5; cc_entrypoint=sdk-cli;"},
+                {"type": "text", "text": "Use tools carefully", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"name": "Read", "input_schema": {"type": "object", "properties": {}}}]
+        }))
+        .send()
+        .await
+        .expect("Anthropic gateway response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body: Value = response.json().await.expect("Anthropic response JSON");
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["id"], "msg_chatcmpl_anthropic");
+    assert_eq!(body["model"], "claude");
+    assert_eq!(body["content"][0], json!({"type": "text", "text": "hello"}));
+    assert_eq!(body["stop_reason"], "end_turn");
+    assert_eq!(body["usage"]["input_tokens"], 21);
+
+    let captured = timeout(IO_TIMEOUT, receiver.recv())
+        .await
+        .expect("upstream Anthropic request timeout")
+        .expect("upstream Anthropic request missing");
+    assert_eq!(
+        captured
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer upstream-secret")
+    );
+    assert!(!captured.headers.contains_key("x-api-key"));
+    let upstream_body: Value = serde_json::from_slice(&captured.body).expect("upstream JSON");
+    assert_eq!(upstream_body["model"], "internal-model");
+    assert_eq!(
+        upstream_body["messages"][0],
+        json!({"role": "system", "content": "Use tools carefully"})
+    );
+    assert_eq!(upstream_body["messages"][1]["role"], "user");
+    assert_eq!(upstream_body["tools"][0]["function"]["name"], "Read");
+    assert_eq!(upstream_body["stream"], false);
+}
+
+static ANTHROPIC_UPSTREAM_SSE: &[u8] = concat!(
+    "data: {\"id\":\"chatcmpl_stream\",\"model\":\"internal-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"chatcmpl_stream\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":5}}\n\n",
+    "data: [DONE]\n\n"
+)
+.as_bytes();
+
+async fn anthropic_upstream_sse() -> Response {
+    let split = ANTHROPIC_UPSTREAM_SSE.len() / 4;
+    let chunks = vec![
+        Bytes::copy_from_slice(&ANTHROPIC_UPSTREAM_SSE[..split]),
+        Bytes::copy_from_slice(&ANTHROPIC_UPSTREAM_SSE[split..split * 2]),
+        Bytes::copy_from_slice(&ANTHROPIC_UPSTREAM_SSE[split * 2..split * 3]),
+        Bytes::copy_from_slice(&ANTHROPIC_UPSTREAM_SSE[split * 3..]),
+    ];
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(stream::iter(
+            chunks.into_iter().map(Ok::<_, Infallible>),
+        )))
+        .expect("upstream Anthropic SSE")
+}
+
+#[tokio::test]
+async fn anthropic_stream_converts_text_tools_and_event_order() {
+    let upstream = TestServer::spawn(
+        Router::new().route("/v1/chat/completions", post(anthropic_upstream_sse)),
+    )
+    .await;
+    let gateway = spawn_gateway(vec![node(
+        "anthropic-stream-node",
+        &upstream,
+        [("claude", "internal-model")],
+    )])
+    .await;
+    let response = test_client()
+        .post(gateway.url("/v1/messages"))
+        .json(&json!({
+            "model": "claude", "max_tokens": 128, "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("Anthropic SSE response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream; charset=utf-8")
+    );
+    let stream = response.text().await.expect("Anthropic SSE body");
+    let starts = stream.find("event: message_start").unwrap();
+    let text = stream.find(r#""text":"hi""#).unwrap();
+    let tool = stream.find(r#""type":"tool_use""#).unwrap();
+    let stop = stream.find("event: message_stop").unwrap();
+    assert!(starts < text && text < tool && tool < stop);
+    assert!(stream.contains(r#""partial_json":"{\"path\":"#));
+    assert!(stream.contains(r#""stop_reason":"tool_use""#));
+    assert!(stream.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+}
+
+#[tokio::test]
+async fn anthropic_validation_errors_use_anthropic_envelope() {
+    let upstream = TestServer::spawn(Router::new()).await;
+    let gateway = spawn_gateway(vec![node(
+        "unused-anthropic-node",
+        &upstream,
+        [("claude", "claude")],
+    )])
+    .await;
+    let response = test_client()
+        .post(gateway.url("/v1/messages"))
+        .json(&json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("Anthropic validation response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.headers().contains_key("request-id"));
+    assert_eq!(
+        response.headers().get("request-id"),
+        response.headers().get("x-request-id")
+    );
+    let body: Value = response.json().await.expect("Anthropic error JSON");
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("max_tokens")
+    );
+}
+
+#[tokio::test]
+async fn oversized_anthropic_request_uses_anthropic_envelope() {
+    let upstream = TestServer::spawn(Router::new()).await;
+    let mut settings = gateway_settings(vec![node(
+        "unused-anthropic-node",
+        &upstream,
+        [("claude", "claude")],
+    )]);
+    settings.server.max_request_body_bytes = 128;
+    let gateway = Gateway::build(settings).expect("build limited Anthropic gateway");
+    let gateway = TestServer::spawn(gateway.public_router()).await;
+    let response = test_client()
+        .post(gateway.url("/v1/messages"))
+        .json(&json!({
+            "model": "claude", "max_tokens": 16,
+            "messages": [{"role": "user", "content": "x".repeat(512)}]
+        }))
+        .send()
+        .await
+        .expect("oversized Anthropic response");
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body: Value = response.json().await.expect("Anthropic 413 JSON");
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[derive(Clone)]
+struct NativeAnthropicCapture {
+    messages: mpsc::UnboundedSender<Value>,
+    counts: mpsc::UnboundedSender<Value>,
+}
+
+async fn vllm_version() -> Json<Value> {
+    Json(json!({"version": "0.25.0"}))
+}
+
+async fn vllm_metrics() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/plain; version=0.0.4")
+        .body(Body::from(concat!(
+            "# TYPE vllm:num_requests_running gauge\n",
+            "vllm:num_requests_running 0\n",
+            "# TYPE vllm:num_requests_waiting gauge\n",
+            "vllm:num_requests_waiting 0\n",
+            "# TYPE vllm:kv_cache_usage_perc gauge\n",
+            "vllm:kv_cache_usage_perc 0\n"
+        )))
+        .expect("vLLM metrics response")
+}
+
+async fn native_anthropic_messages(
+    State(state): State<NativeAnthropicCapture>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    state.messages.send(body).expect("capture native Messages");
+    Json(json!({
+        "id": "msg_native",
+        "type": "message",
+        "role": "assistant",
+        "model": "internal-model",
+        "content": [
+            {"type": "thinking", "thinking": "reason", "signature": "native-signature"},
+            {"type": "text", "text": "native response"}
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {"input_tokens": 9, "output_tokens": 4},
+        "future_native_field": true
+    }))
+}
+
+async fn native_anthropic_count(
+    State(state): State<NativeAnthropicCapture>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    state.counts.send(body).expect("capture native count");
+    Json(json!({"input_tokens": 73, "context_management": {"original_input_tokens": 81}}))
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn vllm_native_anthropic_supports_hello_messages_and_count_tokens() {
+    let (message_sender, mut message_receiver) = mpsc::unbounded_channel();
+    let (count_sender, mut count_receiver) = mpsc::unbounded_channel();
+    let capture = NativeAnthropicCapture {
+        messages: message_sender,
+        counts: count_sender,
+    };
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/version", axum::routing::get(vllm_version))
+            .route("/metrics", axum::routing::get(vllm_metrics))
+            .route(
+                "/v1/models",
+                axum::routing::get(|| async { Json(json!({"object": "list", "data": []})) }),
+            )
+            .route("/v1/messages", post(native_anthropic_messages))
+            .route("/v1/messages/count_tokens", post(native_anthropic_count))
+            .with_state(capture),
+    )
+    .await;
+    let public = unused_address().await;
+    let admin = unused_address().await;
+    let mut vllm_node = node(
+        "native-vllm",
+        &upstream,
+        [("claude-public", "internal-model")],
+    );
+    vllm_node.provider.kind = ProviderKind::Vllm;
+    vllm_node.provider.monitor_interval_ms = 50;
+    vllm_node.provider.request_timeout_ms = 500;
+    vllm_node.provider.telemetry_stale_ms = 500;
+    let mut settings = gateway_settings(vec![vllm_node]);
+    settings.server.listen = public.to_string();
+    settings.server.admin_listen = admin.to_string();
+    settings.server.withdrawal_delay_ms = 1;
+    let gateway = tokio::spawn(async move { Gateway::build(settings).unwrap().run().await });
+    let client = test_client();
+    wait_for_success(&client, &format!("http://{admin}/health/ready")).await;
+
+    let hello = client
+        .head(format!("http://{public}/api/hello"))
+        .send()
+        .await
+        .expect("Claude Code hello response");
+    assert_eq!(hello.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .post(format!("http://{public}/v1/messages?beta=true"))
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "future-claude-code-beta")
+        .json(&json!({
+            "model": "claude-public", "max_tokens": 4096, "stream": false,
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.220.8a5; cc_entrypoint=sdk-cli;"},
+                {"type": "text", "text": "system"}
+            ],
+            "messages": [
+                {"role": "system", "content": "inline native system"},
+                {"role": "user", "content": "hello"}
+            ],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "future_claude_code_field": {"preserved": true}
+        }))
+        .send()
+        .await
+        .expect("native Messages response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: Value = response.json().await.expect("native Messages JSON");
+    assert_eq!(response["model"], "claude-public");
+    assert_eq!(response["content"][0]["signature"], "native-signature");
+    assert_eq!(response["future_native_field"], true);
+    let captured = timeout(IO_TIMEOUT, message_receiver.recv())
+        .await
+        .expect("native Messages capture timeout")
+        .expect("native Messages missing");
+    assert_eq!(captured["model"], "internal-model");
+    assert_eq!(captured["thinking"]["type"], "adaptive");
+    assert_eq!(captured["future_claude_code_field"]["preserved"], true);
+    assert_eq!(captured["system"].as_array().unwrap().len(), 1);
+    assert_eq!(captured["messages"][0]["role"], "system");
+
+    let count = client
+        .post(format!(
+            "http://{public}/v1/messages/count_tokens?beta=true"
+        ))
+        .json(&json!({
+            "model": "claude-public",
+            "system": "system",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_reference", "tool_name": "deferred_tool"},
+                {"type": "text", "text": "count"}
+            ]}]
+        }))
+        .send()
+        .await
+        .expect("native token count response");
+    assert_eq!(count.status(), StatusCode::OK);
+    let count: Value = count.json().await.expect("native count JSON");
+    assert_eq!(count["input_tokens"], 73);
+    assert_eq!(count["context_management"]["original_input_tokens"], 81);
+    let captured = timeout(IO_TIMEOUT, count_receiver.recv())
+        .await
+        .expect("native count capture timeout")
+        .expect("native count missing");
+    assert_eq!(captured["model"], "internal-model");
+    assert_eq!(
+        captured["messages"][0]["content"][0]["type"],
+        "tool_reference"
+    );
+
+    gateway.abort();
 }
 
 static CHAT_SSE: &[u8] = b": upstream comment\r\n\r\ndata: { \"id\": \"chatcmpl_1\", \"object\": \"chat.completion.chunk\", \"vendor\": [1,2], \"choices\": [{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}] }\r\n\r\ndata: [DONE]\r\n\r\n";

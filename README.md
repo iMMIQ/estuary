@@ -3,9 +3,9 @@
 [![CI](https://github.com/iMMIQ/estuary/actions/workflows/ci.yml/badge.svg)](https://github.com/iMMIQ/estuary/actions/workflows/ci.yml)
 [![Release](https://github.com/iMMIQ/estuary/actions/workflows/release.yml/badge.svg)](https://github.com/iMMIQ/estuary/actions/workflows/release.yml)
 
-`estuary` is a Rust gateway for a pool of OpenAI-compatible LLM servers. It exposes a stable OpenAI-style endpoint, rewrites public model names to node-specific names, enforces per-node concurrency, and selects a healthy node using current load, recent latency/error signals, and approximate prompt-prefix locality.
+`estuary` is a Rust gateway for a pool of OpenAI-compatible LLM servers. It exposes OpenAI and Anthropic client protocols on one public listener, rewrites public model names to node-specific names, enforces per-node concurrency, and selects a healthy node using current load, recent latency/error signals, and prompt-prefix locality.
 
-This repository contains the phase-one gateway foundation plus a native vLLM provider for vLLM 0.25 and newer. It deliberately does not yet implement client API-key management, tenant quotas or priorities, durable Responses state, or the Anthropic/Claude protocol.
+This repository contains the phase-one gateway foundation plus a native vLLM provider for vLLM 0.25 and newer. It deliberately does not yet implement client API-key management, tenant quotas or priorities, or durable Responses state.
 
 ## Supported API surface
 
@@ -17,8 +17,13 @@ This repository contains the phase-one gateway foundation plus a native vLLM pro
 | `POST /v1/responses` | Foreground create, non-streaming and SSE streaming pass-through. Durable follow-up operations are not supported. |
 | `POST /v1/completions` | Compatibility pass-through with model routing and prefix affinity. |
 | `POST /v1/embeddings` | Compatibility pass-through with model routing. |
+| `POST /v1/messages` | Anthropic Messages, including streaming, thinking, tools, model aliases, and Claude Code request cleanup. Uses native vLLM handling when available and an OpenAI conversion fallback otherwise. |
+| `POST /v1/messages/count_tokens` | Exact Anthropic token counting through a vLLM 0.25+ node. |
+| `HEAD /api/hello` | Claude Code gateway capability probe. |
 
-The four POST routes above are an explicit allowlist. Other methods and `/v1/*` paths return an OpenAI-shaped `404` instead of being blindly proxied.
+The six POST routes above are an explicit allowlist. Other methods and `/v1/*` paths return a shaped `404` instead of being blindly proxied. OpenAI routes use OpenAI error envelopes; both Messages routes use Anthropic error envelopes and expose `request-id` plus `x-request-id`.
+
+vLLM 0.25's generate router natively exposes `/v1/messages` and `/v1/messages/count_tokens`. Estuary forwards Anthropic requests to those native routes without rebuilding the body, apart from removing Claude Code's billing marker and rewriting the model alias; native responses and SSE retain thinking signatures and future fields while their model name is mapped back to the public alias. This is the preferred Claude Code path. If a request lands on a generic OpenAI-compatible node, Estuary translates system/message text, base64/URL images, tools, tool-use loops, structured output, and extended-thinking controls to Chat Completions and translates buffered or fragmented SSE responses back to Anthropic. Features the fallback cannot represent are restricted to native vLLM nodes instead of being silently discarded.
 
 Responses state is explicitly rejected with an OpenAI-shaped `400` response:
 
@@ -54,7 +59,7 @@ For generic OpenAI-compatible servers, the gateway stores canonical prompt mater
 - it switches completely to load-first routing when both configured load-imbalance thresholds are exceeded;
 - it is lost on restart and can differ from the server's real tokenizer or cache eviction state.
 
-Before routing or forwarding a JSON inference request, Estuary removes Claude Code's standalone `x-anthropic-billing-header:` system text block. That block contains the CLI version/build identifier and entrypoint but no model instruction, so retaining it fragments both local affinity and upstream KV prefixes across Claude Code releases. The match is intentionally narrow: multiline content, environment details, tool instructions, ordinary system messages, and user content are preserved. Native Anthropic `/v1/messages` exposure is still a separate protocol phase.
+Before routing or forwarding a JSON inference request, Estuary removes Claude Code's standalone `x-anthropic-billing-header:` system text block. That block contains the CLI version/build identifier and entrypoint but no model instruction, so retaining it fragments both local affinity and upstream KV prefixes across Claude Code releases. The match is intentionally narrow: multiline content, environment details, tool instructions, ordinary system messages, and user content are preserved. This cleanup applies before Messages-to-Chat conversion and vLLM tokenization.
 
 Nodes configured with `provider.type: vllm` are version-gated to vLLM 0.25.0 or newer. Estuary scrapes native running, waiting, and KV-use metrics; calls `/tokenize` for Chat Completions and string Completions; and consumes vLLM's ZMQ KV events. Exact token-block matches take precedence over the character estimate. A missing metric, tokenize failure, event disconnect, sequence gap, or unsupported request shape degrades safely to local load and approximate affinity instead of blocking inference.
 
@@ -77,7 +82,7 @@ For each request the gateway:
 5. tries candidates in score order and atomically acquires a node permit;
 6. if every eligible node is full or above the vLLM waiting watermark, keeps the request pending until capacity becomes available or the client disconnects.
 
-Queued requests use one scheduling class and register in each eligible node semaphore's FIFO wait list. A newly arriving fast-path request cannot take a permit already assigned to an older waiter, while requests for independent model pools do not share a global head-of-line lock. The count and byte limits bound how many requests simultaneously register with node semaphores; excess requests wait for queue admission instead of receiving a gateway-generated `429`. No healthy node returns `503`. Upstream transport/protocol failures return `502`, and the upstream response-header timeout returns `504`. Errors generated by the gateway use the OpenAI `{"error": {...}}` envelope.
+Queued requests use one scheduling class and register in each eligible node semaphore's FIFO wait list. A newly arriving fast-path request cannot take a permit already assigned to an older waiter, while requests for independent model pools do not share a global head-of-line lock. The count and byte limits bound how many requests simultaneously register with node semaphores; excess requests wait for queue admission instead of receiving a gateway-generated `429`. No healthy node returns `503`. Upstream transport/protocol failures return `502`, and the upstream response-header timeout returns `504`. Gateway errors follow the protocol of the selected public endpoint.
 
 Each node also has an independent circuit breaker. Consecutive transport, 5xx, or upstream-body failures open it and remove the node from routing. After `open_ms`, a bounded number of real inference requests enter half-open state; the configured success streak closes the circuit, while any half-open failure reopens it. Upstream `429` is treated as load pressure rather than a circuit failure.
 
@@ -142,6 +147,28 @@ curl -sS http://127.0.0.1:8080/v1/responses \
 ```
 
 For a streaming Response, add `"stream": true` and use `curl -N`. The gateway forwards upstream SSE bytes and unknown events without rebuilding them.
+
+Use the Anthropic endpoint through the same public port:
+
+```bash
+curl -N http://127.0.0.1:8080/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{
+    "model": "gateway-chat",
+    "max_tokens": 256,
+    "stream": true,
+    "messages": [{"role": "user", "content": "Inspect this request path."}]
+  }'
+```
+
+Claude Code can use the same listener. Any non-empty placeholder key is accepted until inbound API-key management is implemented:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:8080 \
+ANTHROPIC_API_KEY=estuary \
+claude
+```
 
 ## Configuration and persistence
 
@@ -257,7 +284,7 @@ The existing separation between request metadata, scheduling, node runtime, and 
 
 - gateway API-key lifecycle, tenant identity, quota, and priority/fair queues;
 - durable Responses state-to-node affinity and background operations;
-- Anthropic Messages/Claude Code protocol adapters;
+- additional non-vLLM Anthropic fallback mappings such as server tools and citations;
 - additional provider adapters and local tokenizer implementations;
 - shared prefix/admission state or distributed node leases for active-active gateways;
 - persisted global policy management and fleet-coordinated node lifecycle state.
