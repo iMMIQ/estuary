@@ -43,6 +43,7 @@ jobs:
       packages: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
+      image_name: ${{ steps.image.outputs.name }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v4
@@ -98,7 +99,7 @@ jobs:
             Container image:
 
             ```console
-            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            docker pull ghcr.io/${{ needs.image.outputs.image_name }}:${{ github.ref_name }}
             ```
 
             Multi-platform manifest: `linux/amd64`, `linux/arm64`
