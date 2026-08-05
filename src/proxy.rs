@@ -233,14 +233,15 @@ async fn proxy_inner(
         routing_parsed.as_ref().or(parsed.as_ref()),
         &state.settings.routing.prefix,
     );
-    if !native_only && let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_ref())
-    {
-        if let Some(tokens) = state
-            .vllm
-            .tokenize_for_routing(&state.client, &endpoint, model, parsed)
-            .await
-        {
-            prefix_input.set_token_ids(tokens);
+    if !native_only {
+        if let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_ref()) {
+            if let Some(tokens) = state
+                .vllm
+                .tokenize_for_routing(&state.client, &endpoint, model, parsed)
+                .await
+            {
+                prefix_input.set_token_ids(tokens);
+            }
         }
     }
 
