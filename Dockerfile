@@ -2,16 +2,14 @@
 
 ARG RUST_VERSION=1.97.1
 ARG IMAGE_REGISTRY=docker.m.daocloud.io
-ARG GCR_REGISTRY=m.daocloud.io/gcr.io
 
 # Release builds target this stage with Zig-cross-compiled static binaries in
 # docker-bin/. It has no RUN instructions, so arm64 assembly needs no QEMU.
-FROM ${IMAGE_REGISTRY}/library/busybox:1.37.0-musl AS runtime-tools
+FROM ${IMAGE_REGISTRY}/library/alpine:3.22 AS runtime-files
 
-FROM ${GCR_REGISTRY}/distroless/static-debian12:latest AS runtime-base
+FROM ${IMAGE_REGISTRY}/library/alpine:3.22 AS runtime-base
 
-COPY --from=runtime-tools /bin/busybox /usr/bin/busybox
-COPY --from=runtime-tools --chown=10001:10001 /tmp /var/lib/estuary
+COPY --from=runtime-files --chown=10001:10001 /tmp /var/lib/estuary
 
 USER 10001:10001
 EXPOSE 8080 9090
@@ -24,7 +22,7 @@ ENV ESTUARY_DATABASE=/var/lib/estuary/estuary.db \
     RUST_LOG=estuary=info
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
-    CMD ["/usr/bin/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/health/live"]
+    CMD ["/bin/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/health/live"]
 
 ENTRYPOINT ["/usr/local/bin/estuary"]
 
