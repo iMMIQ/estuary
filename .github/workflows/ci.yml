@@ -44,6 +44,8 @@ jobs:
       - run: bun run test
       - run: bun run typecheck
       - run: bun run build
+      - run: bunx --bun playwright install --with-deps chromium
+      - run: bun run test:e2e
 
   release:
     name: Rust (stable musl ${{ matrix.arch }})

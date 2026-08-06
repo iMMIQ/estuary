@@ -126,7 +126,7 @@ export function validateDraft(draft: NodeDraft): DraftErrors {
     ] as const) {
       if (!value.startsWith("/")) errors[key] = "Path must start with /";
     }
-    if (draft.provider.monitor_interval_ms < 1) errors.monitor_interval_ms = "Must be at least 1 ms";
+    if (draft.provider.monitor_interval_ms < 100) errors.monitor_interval_ms = "Must be at least 100 ms";
     if (draft.provider.request_timeout_ms < 1) errors.request_timeout_ms = "Must be at least 1 ms";
     if (draft.provider.telemetry_stale_ms < draft.provider.monitor_interval_ms) {
       errors.telemetry_stale_ms = "Must not be shorter than the monitor interval";

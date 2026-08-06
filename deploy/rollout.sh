@@ -42,9 +42,29 @@ fi
 haproxy_socket=${ESTUARY_HAPROXY_SOCKET:-/run/estuary/haproxy.sock}
 start_timeout=${ESTUARY_START_TIMEOUT_SECONDS:-180}
 drain_timeout=${ESTUARY_DRAIN_TIMEOUT_SECONDS:-3700}
+admin_token=${ESTUARY_ADMIN_TOKEN:-}
+if [[ -z ${admin_token} && -r /etc/estuary/common.env ]]; then
+    while IFS='=' read -r name value; do
+        if [[ ${name} == ESTUARY_ADMIN_TOKEN ]]; then
+            admin_token=${value#\"}
+            admin_token=${admin_token%\"}
+            admin_token=${admin_token#\'}
+            admin_token=${admin_token%\'}
+        fi
+    done </etc/estuary/common.env
+fi
 
 haproxy_command() {
     printf '%s\n' "$1" | socat - "UNIX-CONNECT:${haproxy_socket}" >/dev/null
+}
+
+admin_request() {
+    local url=$1
+    local arguments=(--fail --silent --show-error --request PUT)
+    if [[ -n ${admin_token} ]]; then
+        arguments+=(--header "Authorization: Bearer ${admin_token}")
+    fi
+    curl "${arguments[@]}" "${url}" >/dev/null
 }
 
 wait_ready() {
@@ -105,8 +125,7 @@ roll_slot() {
     previous=$(readlink -f -- "/opt/estuary/slots/${slot}/current" 2>/dev/null || true)
 
     echo "draining slot ${slot}"
-    curl --fail --silent --show-error --request PUT \
-        "http://127.0.0.1:${port}/admin/api/process/drain" >/dev/null
+    admin_request "http://127.0.0.1:${port}/admin/api/process/drain"
     haproxy_command "set server estuary_public/slot-${slot} state drain"
     haproxy_command "set server estuary_admin/slot-${slot} state drain"
     if ! wait_stopped "${unit}"; then

@@ -515,6 +515,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum",
+ "base64",
  "blake3",
  "bytes",
  "clap",

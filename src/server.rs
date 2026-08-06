@@ -15,13 +15,17 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{
-        HeaderValue, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE},
+        HeaderValue, Method, StatusCode,
+        header::{
+            AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
+            WWW_AUTHENTICATE,
+        },
     },
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::{any, get, put},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::StreamExt;
 use parking_lot::RwLock;
 use reqwest::redirect::Policy;
@@ -142,6 +146,10 @@ impl Gateway {
             .layer(DefaultBodyLimit::max(max_body))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&self.state),
+                admit_public_request,
+            ))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&self.state),
                 observe_request,
             ))
             .layer(middleware::from_fn(assign_request_id))
@@ -153,12 +161,10 @@ impl Gateway {
     }
 
     pub fn admin_router(&self) -> Router {
-        Router::new()
+        let protected = Router::new()
             .route("/", get(admin_redirect))
             .route("/admin", get(admin_redirect))
             .route("/admin/", get(admin_index))
-            .route("/health/live", get(live))
-            .route("/health/ready", get(ready))
             .route("/metrics", get(metrics))
             .route("/admin/nodes", get(nodes))
             .route("/admin/api/status", get(admin_status))
@@ -182,6 +188,14 @@ impl Gateway {
                 put(drain_node).delete(resume_node),
             )
             .route("/admin/{*asset}", get(admin_asset))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&self.state),
+                authorize_admin,
+            ));
+        Router::new()
+            .route("/health/live", get(live))
+            .route("/health/ready", get(ready))
+            .merge(protected)
             .fallback(proxy::not_found)
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&self.state),
@@ -345,6 +359,86 @@ impl Gateway {
     }
 }
 
+async fn admit_public_request(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.method() != Method::POST || !request.uri().path().starts_with("/v1/") {
+        return next.run(request).await;
+    }
+
+    let max_body = state.settings.server.max_request_body_bytes;
+    let reserved_bytes = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(max_body);
+    if reserved_bytes > max_body {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+
+    let _admission = state.scheduler.admit_ingress(reserved_bytes).await;
+    next.run(request).await
+}
+
+async fn authorize_admin(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = state.settings.server.admin_token.as_deref() else {
+        return next.run(request).await;
+    };
+    let candidate = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(admin_authorization_token);
+    if candidate
+        .is_some_and(|candidate| constant_time_eq(candidate.as_bytes(), expected.as_bytes()))
+    {
+        return next.run(request).await;
+    }
+
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(
+            WWW_AUTHENTICATE,
+            "Basic realm=\"Estuary Admin\", charset=\"UTF-8\"",
+        )
+        .body(Body::from("authentication required"))
+        .unwrap_or_else(|_| StatusCode::UNAUTHORIZED.into_response())
+}
+
+fn admin_authorization_token(value: &str) -> Option<String> {
+    let (scheme, credentials) = value.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("bearer") {
+        return Some(credentials.to_owned());
+    }
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let decoded = BASE64_STANDARD.decode(credentials).ok()?;
+    let decoded = std::str::from_utf8(&decoded).ok()?;
+    decoded
+        .split_once(':')
+        .map(|(_, password)| password.to_owned())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (*left ^ *right)
+        })
+        == 0
+}
+
 async fn run_control_reconciler(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_millis(
         state.settings.server.control_sync_interval_ms,
@@ -367,15 +461,15 @@ async fn run_control_reconciler(state: Arc<AppState>, mut shutdown: watch::Recei
 }
 
 async fn reconcile_control_plane(state: &Arc<AppState>) -> Result<()> {
-    let observed = state.store.revision()?;
+    let observed = state.store.revision_async().await?;
     if observed == state.control_revision.load(AtomicOrdering::Acquire) {
         return Ok(());
     }
 
     let _mutation = state.admin_mutation.lock().await;
-    let before = state.store.revision()?;
-    let stored_nodes = state.store.list()?;
-    let after = state.store.revision()?;
+    let before = state.store.revision_async().await?;
+    let stored_nodes = state.store.list_async().await?;
+    let after = state.store.revision_async().await?;
     if before != after {
         return Ok(());
     }
@@ -709,7 +803,7 @@ async fn nodes(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
 }
 
 async fn admin_nodes(State(state): State<Arc<AppState>>) -> Response {
-    match state.store.list() {
+    match state.store.list_async().await {
         Ok(nodes) => Json(json!({
             "nodes": nodes
                 .into_iter()
@@ -832,7 +926,7 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
 }
 
 async fn admin_node(State(state): State<Arc<AppState>>, Path(node_id): Path<String>) -> Response {
-    let stored = match state.store.get(&node_id) {
+    let stored = match state.store.get_async(&node_id).await {
         Ok(Some(stored)) => stored,
         Ok(None) => return admin_node_not_found(&node_id),
         Err(error) => return admin_internal_error("could not load node configuration", &error),
@@ -849,6 +943,9 @@ fn admin_node_payload(state: &AppState, stored: &StoredNode, node: &Node) -> ser
     let admission = admin_admission_snapshot(node, &snapshot);
     let mut public_config = stored.config.clone();
     public_config.api_key = None;
+    public_config.headers.clear();
+    let mut header_names = stored.config.headers.keys().cloned().collect::<Vec<_>>();
+    header_names.sort();
     let api_key_source = if stored.config.api_key.is_some() {
         "database"
     } else if stored.config.api_key_env.is_some() {
@@ -861,6 +958,7 @@ fn admin_node_payload(state: &AppState, stored: &StoredNode, node: &Node) -> ser
         "credentials": {
             "api_key_configured": api_key_source != "none",
             "api_key_source": api_key_source,
+            "header_names": header_names,
         },
         "revision": stored.revision,
         "created_at_unix_ms": stored.created_at_unix_ms,
@@ -876,6 +974,7 @@ fn admin_node_payload(state: &AppState, stored: &StoredNode, node: &Node) -> ser
 #[serde(default, deny_unknown_fields)]
 struct CredentialMutationQuery {
     clear_api_key: bool,
+    clear_headers: bool,
 }
 
 async fn preflight_node(
@@ -884,11 +983,20 @@ async fn preflight_node(
     Json(mut config): Json<NodeConfig>,
 ) -> Response {
     if config.api_key.is_none() && !query.clear_api_key {
-        match state.store.get(&config.id) {
+        match state.store.get_async(&config.id).await {
             Ok(Some(stored)) => config.api_key = stored.config.api_key,
             Ok(None) => {}
             Err(error) => {
                 return admin_internal_error("could not load stored credentials", &error);
+            }
+        }
+    }
+    if config.headers.is_empty() && !query.clear_headers {
+        match state.store.get_async(&config.id).await {
+            Ok(Some(stored)) => config.headers = stored.config.headers,
+            Ok(None) => {}
+            Err(error) => {
+                return admin_internal_error("could not load stored headers", &error);
             }
         }
     }
@@ -923,15 +1031,18 @@ async fn create_node(
         Ok(node) => node,
         Err(error) => return admin_validation_error(&error),
     };
-    if matches!(state.store.get(&config.id), Ok(Some(_))) {
+    if matches!(state.store.get_async(&config.id).await, Ok(Some(_))) {
         return admin_conflict("node_already_exists", "a node with this id already exists");
     }
-    let stored = match state.store.insert(&config) {
+    let stored = match state.store.insert_async(&config).await {
         Ok(stored) => stored,
         Err(error) => return admin_internal_error("could not persist node", &error),
     };
     if let Err(error) = state.scheduler.add_node(Arc::clone(&node)) {
-        let _ = state.store.delete(&config.id, Some(stored.revision));
+        let _ = state
+            .store
+            .delete_async(&config.id, Some(stored.revision))
+            .await;
         return admin_internal_error("could not add node to runtime registry", &error);
     }
     state
@@ -952,6 +1063,8 @@ struct UpdateNodeRequest {
     config: NodeConfig,
     #[serde(default)]
     clear_api_key: bool,
+    #[serde(default)]
+    clear_headers: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -975,7 +1088,7 @@ async fn update_node(
             "the request path and config node id must match",
         );
     }
-    let stored = match state.store.get(&node_id) {
+    let stored = match state.store.get_async(&node_id).await {
         Ok(Some(stored)) => stored,
         Ok(None) => return admin_node_not_found(&node_id),
         Err(error) => return admin_internal_error("could not load node configuration", &error),
@@ -993,6 +1106,9 @@ async fn update_node(
     if requested_config.api_key.is_none() && !request.clear_api_key {
         requested_config.api_key.clone_from(&stored.config.api_key);
     }
+    if requested_config.headers.is_empty() && !request.clear_headers {
+        requested_config.headers.clone_from(&stored.config.headers);
+    }
     let replacement = match prepare_node(&state, &requested_config).await {
         Ok(node) => node,
         Err(error) => return admin_validation_error(&error),
@@ -1009,7 +1125,8 @@ async fn update_node(
     }
     let updated = match state
         .store
-        .update(&node_id, request.revision, &requested_config)
+        .update_async(&node_id, request.revision, &requested_config)
+        .await
     {
         Ok(Some(updated)) => updated,
         Ok(None) => {
@@ -1040,7 +1157,7 @@ async fn delete_node(
     Query(query): Query<MutationQuery>,
 ) -> Response {
     let _mutation = state.admin_mutation.lock().await;
-    let stored = match state.store.get(&node_id) {
+    let stored = match state.store.get_async(&node_id).await {
         Ok(Some(stored)) => stored,
         Ok(None) => return admin_node_not_found(&node_id),
         Err(error) => return admin_internal_error("could not load node configuration", &error),
@@ -1070,7 +1187,11 @@ async fn delete_node(
             "the node is draining but still has active requests; retry deletion later",
         );
     }
-    match state.store.delete(&node_id, Some(stored.revision)) {
+    match state
+        .store
+        .delete_async(&node_id, Some(stored.revision))
+        .await
+    {
         Ok(true) => {}
         Ok(false) => {
             node.set_draining(was_draining);
@@ -1122,7 +1243,7 @@ async fn drain_node(
     Query(query): Query<DrainQuery>,
 ) -> Response {
     let _mutation = state.admin_mutation.lock().await;
-    let mut stored = match state.store.get(&node_id) {
+    let mut stored = match state.store.get_async(&node_id).await {
         Ok(Some(stored)) => stored,
         Ok(None) => return admin_node_not_found(&node_id),
         Err(error) => return admin_internal_error("could not load node configuration", &error),
@@ -1130,7 +1251,8 @@ async fn drain_node(
     stored.config.draining = true;
     let stored = match state
         .store
-        .update(&node_id, stored.revision, &stored.config)
+        .update_async(&node_id, stored.revision, &stored.config)
+        .await
     {
         Ok(Some(stored)) => stored,
         Ok(None) => {
@@ -1180,7 +1302,7 @@ async fn drain_node(
 
 async fn resume_node(State(state): State<Arc<AppState>>, Path(node_id): Path<String>) -> Response {
     let _mutation = state.admin_mutation.lock().await;
-    let mut stored = match state.store.get(&node_id) {
+    let mut stored = match state.store.get_async(&node_id).await {
         Ok(Some(stored)) => stored,
         Ok(None) => return admin_node_not_found(&node_id),
         Err(error) => return admin_internal_error("could not load node configuration", &error),
@@ -1188,7 +1310,8 @@ async fn resume_node(State(state): State<Arc<AppState>>, Path(node_id): Path<Str
     stored.config.draining = false;
     let stored = match state
         .store
-        .update(&node_id, stored.revision, &stored.config)
+        .update_async(&node_id, stored.revision, &stored.config)
+        .await
     {
         Ok(Some(stored)) => stored,
         Ok(None) => {

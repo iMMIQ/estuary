@@ -105,7 +105,7 @@ async fn queue_waits_until_capacity_is_released() {
 }
 
 #[tokio::test]
-async fn queue_admission_pressure_waits_instead_of_rejecting() {
+async fn multiple_node_waiters_remain_ordered_instead_of_rejecting() {
     let node = healthy_node("only", 1);
     let scheduler = Scheduler::new(vec![node], routing(1));
     let excluded = HashSet::new();
@@ -146,6 +146,41 @@ async fn queue_admission_pressure_waits_instead_of_rejecting() {
         .expect("admission waiter should eventually enter the node queue")
         .expect("second queued selection");
     assert_eq!(second.node.id(), "only");
+}
+
+#[tokio::test]
+async fn ingress_request_admission_waits_before_entering_the_gateway() {
+    let scheduler = Scheduler::new(Vec::new(), routing(1));
+    let first = scheduler.admit_ingress(128).await;
+    let second = scheduler.admit_ingress(128);
+    tokio::pin!(second);
+    assert!(matches!(poll!(second.as_mut()), Poll::Pending));
+
+    drop(first);
+    tokio::time::timeout(Duration::from_millis(250), second.as_mut())
+        .await
+        .expect("request admission should wake after the budget is released");
+}
+
+#[tokio::test]
+async fn ingress_byte_admission_is_bounded_independently_of_request_count() {
+    let scheduler = Scheduler::new(
+        Vec::new(),
+        RoutingConfig {
+            queue_max_requests: 2,
+            queue_max_bytes: 1024,
+            ..RoutingConfig::default()
+        },
+    );
+    let first = scheduler.admit_ingress(1024).await;
+    let second = scheduler.admit_ingress(1024);
+    tokio::pin!(second);
+    assert!(matches!(poll!(second.as_mut()), Poll::Pending));
+
+    drop(first);
+    tokio::time::timeout(Duration::from_millis(250), second.as_mut())
+        .await
+        .expect("byte admission should wake after the budget is released");
 }
 
 #[tokio::test]

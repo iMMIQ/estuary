@@ -71,6 +71,8 @@ The gateway does not authenticate callers in phase one. Run the public listener 
 
 Upstream Bearer credentials are configured independently per node in the management UI and stored as plaintext inside the SQLite node document. The management API reports whether a key is configured but never returns its value. Existing `api_key_env` and `headers_from_env` references remain supported for compatibility. Multi-key lifecycle management, tenant quotas, and priority scheduling are planned follow-up work.
 
+This limitation applies to the public inference listener. The management listener has an independent `ESTUARY_ADMIN_TOKEN`: when configured, browsers use HTTP Basic Auth (any username, token as password) and automation may send `Authorization: Bearer <token>`. A non-loopback management bind is rejected unless this token is configured. `/health/live` and `/health/ready` remain unauthenticated for load-balancer probes.
+
 ### Concurrency limits are process-local
 
 `max_concurrency` is a hard limit for each node within one gateway process. Streaming responses use an independent one-chunk bounded pump; non-streaming successes are buffered up to `max_non_streaming_response_bytes` before downstream commit. The permit is released on upstream EOF, error, configured timeout, or client cancellation. A client that stops draining a stream cannot hold a node slot beyond `downstream_stall_timeout_ms`. With `N` active-active gateway replicas, a node can receive up to `N * max_concurrency` requests.
@@ -201,9 +203,11 @@ claude
 
 SQLite is the only node-configuration source. The schema is initialized automatically, uses WAL mode and optimistic revisions, and supports an empty first boot. Additive triggers maintain a database-wide control revision; processes sharing the same local database poll that revision and reconcile node create, update, delete, drain, and resume operations into their own schedulers. Node candidates are validated and probed before entering any scheduler. Updating or deleting a node first drains it and waits for active leases; a timeout leaves the node safely draining for a later retry.
 
-The management UI at `/admin/` edits node URLs, model aliases, concurrency, weights, provider settings, the Anthropic upstream protocol, a direct Bearer API key, and vLLM KV event endpoints. Direct keys are persisted unencrypted in the node's SQLite `config_json`; list and detail responses replace the value with `null` and expose only credential status. An empty key while editing preserves the stored value, while **Remove key** explicitly clears it. Treat the database, WAL files, filesystem snapshots, and backups as secrets. Legacy `api_key_env` and `headers_from_env` references remain valid and are used when no direct key is configured.
+The management UI at `/admin/` edits node URLs, model aliases, concurrency, weights, provider settings, the Anthropic upstream protocol, a direct Bearer API key, and vLLM KV event endpoints. Direct keys are persisted unencrypted in the node's SQLite `config_json`; list and detail responses replace the value with `null` and expose only credential status. Direct custom header values are also omitted; only their names are returned, and an empty header map preserves the stored values unless `clear_headers: true` is explicitly sent. An empty Bearer key while editing preserves the stored value, while **Remove key** explicitly clears it. Treat the database, WAL files, filesystem snapshots, and backups as secrets. Legacy `api_key_env` and `headers_from_env` references remain valid and are used when no direct key is configured.
 
-The public and admin listeners are process bootstrap settings because they are needed before SQLite and the UI can be reached. Keep the admin listener on a private network. Routing, health, retry, circuit, and response-limit values currently use the validated defaults in `src/config.rs`.
+The public and admin listeners are process bootstrap settings because they are needed before SQLite and the UI can be reached. Keep the admin listener on a private network even when authentication is enabled. Global routing, prefix, health, retry, circuit, timeout, request-body, response-body, and shutdown policies can be overridden through CLI flags or their `ESTUARY_*` environment variables; `estuary --help` is the authoritative list. Node-specific configuration remains exclusively in SQLite and the management UI.
+
+`ESTUARY_QUEUE_MAX_REQUESTS` and `ESTUARY_QUEUE_MAX_BYTES` are pre-body ingress budgets for inference requests. When either budget is exhausted, new requests remain pending before their body is read, applying transport backpressure without returning `429`. Requests without `Content-Length` conservatively reserve one maximum-sized body. The queue counters in the UI count the admitted requests currently waiting for a node.
 
 Model mappings associate a public model name with a node-specific upstream name. The special upstream value `"*"` preserves the requested public name; a wildcard public key routes unlisted models. Only explicit public names appear in `/v1/models`.
 
@@ -301,6 +305,7 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 cd web && bun install --frozen-lockfile && bun run test && bun run build
+bunx --bun playwright install chromium && bun run test:e2e
 ```
 
 Contract tests should additionally exercise slow/cancelled SSE clients, split SSE frames, retry boundaries, queue byte exhaustion, and the concurrency limit with real TCP mock upstreams.

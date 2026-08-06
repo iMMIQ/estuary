@@ -55,9 +55,12 @@ async fn spawn_upstream(state: Arc<UpstreamState>) -> TestServer {
     TestServer { address, task }
 }
 
-async fn unused_address() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap()
+async fn unused_addresses() -> (SocketAddr, SocketAddr) {
+    let public = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addresses = (public.local_addr().unwrap(), admin.local_addr().unwrap());
+    drop((public, admin));
+    addresses
 }
 
 async fn wait_for_url(client: &reqwest::Client, url: &str) {
@@ -80,8 +83,7 @@ async fn process_drain_finishes_an_existing_queue_before_exit() {
         release_first: Notify::new(),
     });
     let upstream = spawn_upstream(Arc::clone(&upstream_state)).await;
-    let public = unused_address().await;
-    let admin = unused_address().await;
+    let (public, admin) = unused_addresses().await;
 
     let mut settings = Settings::default();
     settings.server.listen = public.to_string();

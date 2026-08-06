@@ -212,6 +212,57 @@ impl NodeStore {
         }
         Ok(())
     }
+
+    pub async fn list_async(self: &Arc<Self>) -> Result<Vec<StoredNode>> {
+        self.run_blocking(Self::list).await
+    }
+
+    pub async fn revision_async(self: &Arc<Self>) -> Result<u64> {
+        self.run_blocking(Self::revision).await
+    }
+
+    pub async fn get_async(self: &Arc<Self>, id: &str) -> Result<Option<StoredNode>> {
+        let id = id.to_owned();
+        self.run_blocking(move |store| store.get(&id)).await
+    }
+
+    pub async fn insert_async(self: &Arc<Self>, config: &NodeConfig) -> Result<StoredNode> {
+        let config = config.clone();
+        self.run_blocking(move |store| store.insert(&config)).await
+    }
+
+    pub async fn update_async(
+        self: &Arc<Self>,
+        id: &str,
+        expected_revision: u64,
+        config: &NodeConfig,
+    ) -> Result<Option<StoredNode>> {
+        let id = id.to_owned();
+        let config = config.clone();
+        self.run_blocking(move |store| store.update(&id, expected_revision, &config))
+            .await
+    }
+
+    pub async fn delete_async(
+        self: &Arc<Self>,
+        id: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<bool> {
+        let id = id.to_owned();
+        self.run_blocking(move |store| store.delete(&id, expected_revision))
+            .await
+    }
+
+    async fn run_blocking<T, F>(self: &Arc<Self>, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Self) -> Result<T> + Send + 'static,
+    {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || operation(&store))
+            .await
+            .context("SQLite worker task failed")?
+    }
 }
 
 fn decode_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNode> {

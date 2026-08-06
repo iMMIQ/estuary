@@ -92,6 +92,7 @@ export interface NodeRecord {
   credentials: {
     api_key_configured: boolean;
     api_key_source: "database" | "environment" | "none";
+    header_names: string[];
   };
   revision: number;
   created_at_unix_ms: number;

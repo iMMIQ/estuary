@@ -2,6 +2,8 @@
 /target/
 /web/node_modules/
 /web/.cache/
+/web/playwright-report/
+/web/test-results/
 /web/*.tsbuildinfo
 /web/vite.config.js
 /web/vite.config.d.ts

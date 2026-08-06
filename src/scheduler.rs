@@ -63,6 +63,12 @@ pub struct Scheduler {
 }
 
 #[derive(Debug)]
+pub struct IngressAdmission {
+    _request: OwnedSemaphorePermit,
+    _bytes: OwnedSemaphorePermit,
+}
+
+#[derive(Debug)]
 struct QueueAccounting {
     requests: Arc<AtomicUsize>,
     bytes: Arc<AtomicUsize>,
@@ -135,23 +141,12 @@ impl Scheduler {
             return Ok(selection);
         }
 
-        let body_kib = u32::try_from(body_bytes.div_ceil(1024).max(1).min(u32::MAX as usize))
-            .unwrap_or(u32::MAX);
-        let rounded_bytes = body_kib as usize * 1024;
+        let rounded_bytes = body_bytes.div_ceil(1024).max(1) * 1024;
         let _accounting = QueueAccounting::new(
             Arc::clone(&self.queued_requests),
             Arc::clone(&self.queued_bytes),
             rounded_bytes,
         );
-        let _queue_request = Arc::clone(&self.queue_slots)
-            .acquire_owned()
-            .await
-            .expect("queue admission semaphore is never closed");
-        let _queue_bytes: OwnedSemaphorePermit = Arc::clone(&self.queue_kib)
-            .acquire_many_owned(body_kib)
-            .await
-            .expect("queue byte semaphore is never closed");
-
         let mut registered = HashSet::new();
         let mut acquisitions = FuturesUnordered::<PendingAcquisition>::new();
         loop {
@@ -209,6 +204,23 @@ impl Scheduler {
                 }
                 () = state_changed => {}
             }
+        }
+    }
+
+    pub async fn admit_ingress(&self, body_bytes: usize) -> IngressAdmission {
+        let body_kib = u32::try_from(body_bytes.div_ceil(1024).max(1).min(u32::MAX as usize))
+            .unwrap_or(u32::MAX);
+        let request = Arc::clone(&self.queue_slots)
+            .acquire_owned()
+            .await
+            .expect("ingress request semaphore is never closed");
+        let bytes = Arc::clone(&self.queue_kib)
+            .acquire_many_owned(body_kib)
+            .await
+            .expect("ingress byte semaphore is never closed");
+        IngressAdmission {
+            _request: request,
+            _bytes: bytes,
         }
     }
 

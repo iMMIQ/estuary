@@ -37,6 +37,10 @@ interpreted. Inference remains available. Database changes shipped in a rolling
 release must be additive and readable by both the current and previous binary;
 destructive schema or JSON-field removal requires a later contract release.
 
+If `ESTUARY_ADMIN_TOKEN` is enabled, `rollout.sh` reads it from the current
+environment or `/etc/estuary/common.env` and sends it as a Bearer token to each
+slot's drain API. The HAProxy health checks remain unauthenticated.
+
 Node concurrency is process-local. With two serving slots, configure each
 node's `max_concurrency` to half of the desired fleet-wide limit. A rollout does
 not overlap old and new binaries in one slot, so it cannot increase that budget;

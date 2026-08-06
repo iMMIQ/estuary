@@ -221,6 +221,110 @@ async fn redacts_preserves_and_clears_a_database_api_key() {
 }
 
 #[tokio::test]
+async fn redacts_preserves_and_explicitly_clears_sensitive_headers() {
+    let upstream = TestServer::spawn(Router::new().route(
+        "/v1/models",
+        get(|| async { Json(json!({"object": "list", "data": []})) }),
+    ))
+    .await;
+    let admin =
+        TestServer::spawn(Gateway::build(Settings::default()).unwrap().admin_router()).await;
+    let client = client();
+
+    let mut config = node(&upstream.base_url);
+    config
+        .headers
+        .insert("x-api-key".to_owned(), "header-secret".to_owned());
+    let created = client
+        .post(admin.url("/admin/api/nodes"))
+        .json(&config)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(created["config"]["headers"], json!({}));
+    assert_eq!(created["credentials"]["header_names"], json!(["x-api-key"]));
+
+    config.headers.clear();
+    config.weight = 1.5;
+    let preserved = client
+        .put(admin.url("/admin/api/nodes/dynamic-a"))
+        .json(&json!({"revision": 1, "config": config}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        preserved["credentials"]["header_names"],
+        json!(["x-api-key"])
+    );
+
+    let cleared = client
+        .put(admin.url("/admin/api/nodes/dynamic-a"))
+        .json(&json!({
+            "revision": 2,
+            "config": config,
+            "clear_headers": true,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(cleared["credentials"]["header_names"], json!([]));
+}
+
+#[tokio::test]
+async fn admin_token_protects_management_routes_but_not_health_checks() {
+    let mut settings = Settings::default();
+    settings.server.admin_token = Some("admin-secret".to_owned());
+    let admin = TestServer::spawn(Gateway::build(settings).unwrap().admin_router()).await;
+    let client = client();
+
+    assert_eq!(
+        client
+            .get(admin.url("/health/live"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let unauthorized = client
+        .get(admin.url("/admin/api/status"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert!(unauthorized.headers().contains_key("www-authenticate"));
+    assert_eq!(
+        client
+            .get(admin.url("/admin/api/status"))
+            .bearer_auth("admin-secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .get(admin.url("/admin/"))
+            .basic_auth("estuary", Some("admin-secret"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
 async fn preflight_checks_a_node_without_persisting_it() {
     let upstream = TestServer::spawn(Router::new().route(
         "/v1/models",

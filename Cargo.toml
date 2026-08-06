@@ -13,6 +13,7 @@ categories = ["network-programming", "web-programming::http-server"]
 [dependencies]
 anyhow = "1.0"
 async-stream = "0.3"
+base64 = "0.22"
 axum = { version = "0.8.9", features = ["http2", "json", "macros"] }
 blake3 = "1.8"
 bytes = "1.10"

@@ -116,11 +116,10 @@ impl Drop for RunningGateway {
 
 async fn spawn_vllm_gateway(mut config: NodeConfig) -> RunningGateway {
     config.provider.kind = ProviderKind::Vllm;
-    config.provider.monitor_interval_ms = 25;
+    config.provider.monitor_interval_ms = 100;
     config.provider.request_timeout_ms = 500;
     config.provider.telemetry_stale_ms = 500;
-    let public = unused_address().await;
-    let admin = unused_address().await;
+    let (public, admin) = unused_addresses().await;
     let mut settings = gateway_settings(vec![config]);
     settings.server.listen = public.to_string();
     settings.server.admin_listen = admin.to_string();
@@ -133,11 +132,19 @@ async fn spawn_vllm_gateway(mut config: NodeConfig) -> RunningGateway {
     }
 }
 
-async fn unused_address() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0")
+async fn unused_addresses() -> (SocketAddr, SocketAddr) {
+    let public = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind unused address");
-    listener.local_addr().expect("unused address")
+    let admin = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind unused address");
+    let addresses = (
+        public.local_addr().expect("unused public address"),
+        admin.local_addr().expect("unused admin address"),
+    );
+    drop((public, admin));
+    addresses
 }
 
 async fn wait_for_success(client: &reqwest::Client, url: &str) {
@@ -741,15 +748,14 @@ async fn vllm_native_anthropic_supports_hello_messages_and_count_tokens() {
             .with_state(capture),
     )
     .await;
-    let public = unused_address().await;
-    let admin = unused_address().await;
+    let (public, admin) = unused_addresses().await;
     let mut vllm_node = node(
         "native-vllm",
         &upstream,
         [("claude-public", "internal-model")],
     );
     vllm_node.provider.kind = ProviderKind::Vllm;
-    vllm_node.provider.monitor_interval_ms = 50;
+    vllm_node.provider.monitor_interval_ms = 100;
     vllm_node.provider.request_timeout_ms = 500;
     vllm_node.provider.telemetry_stale_ms = 500;
     let mut settings = gateway_settings(vec![vllm_node]);

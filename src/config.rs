@@ -37,6 +37,17 @@ impl Settings {
         if public_address.port() == admin_address.port() {
             bail!("server.listen and server.admin_listen must use different ports");
         }
+        if !admin_address.ip().is_loopback() && self.server.admin_token.is_none() {
+            bail!("a non-loopback server.admin_listen requires server.admin_token");
+        }
+        if self
+            .server
+            .admin_token
+            .as_deref()
+            .is_some_and(|token| token.trim().is_empty())
+        {
+            bail!("server.admin_token must not be empty");
+        }
         if self.server.connect_timeout_ms == 0
             || self.server.upstream_header_timeout_ms == 0
             || self.server.stream_idle_timeout_ms == 0
@@ -231,10 +242,13 @@ fn validate_provider(node: &NodeConfig, base_url: &Url) -> Result<()> {
         return Ok(());
     }
 
-    if provider.monitor_interval_ms == 0
-        || provider.request_timeout_ms == 0
-        || provider.telemetry_stale_ms == 0
-    {
+    if provider.monitor_interval_ms < 100 {
+        bail!(
+            "node {} provider.monitor_interval_ms must be at least 100 ms",
+            node.id
+        );
+    }
+    if provider.request_timeout_ms == 0 || provider.telemetry_stale_ms == 0 {
         bail!(
             "node {} vLLM provider timeouts must be greater than zero",
             node.id
@@ -312,6 +326,7 @@ fn validate_zmq_endpoint(node_id: &str, field: &str, endpoint: &str) -> Result<(
 pub struct ServerConfig {
     pub listen: String,
     pub admin_listen: String,
+    pub admin_token: Option<String>,
     pub connect_timeout_ms: u64,
     pub upstream_header_timeout_ms: u64,
     pub stream_idle_timeout_ms: u64,
@@ -332,6 +347,7 @@ impl Default for ServerConfig {
         Self {
             listen: "0.0.0.0:8080".to_owned(),
             admin_listen: "127.0.0.1:9090".to_owned(),
+            admin_token: None,
             connect_timeout_ms: 5_000,
             upstream_header_timeout_ms: 120_000,
             stream_idle_timeout_ms: 300_000,
@@ -636,6 +652,33 @@ mod tests {
             ..Settings::default()
         };
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn remote_admin_listener_requires_an_authentication_token() {
+        let mut settings = Settings::default();
+        settings.server.admin_listen = "0.0.0.0:9090".to_owned();
+        assert!(settings.validate().is_err());
+        settings.server.admin_token = Some("secret".to_owned());
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_vllm_monitor_intervals_below_the_safe_floor() {
+        let mut node = NodeConfig {
+            id: "node".to_owned(),
+            base_url: "http://localhost:8000/v1".to_owned(),
+            models: HashMap::from([("model".to_owned(), "model".to_owned())]),
+            provider: ProviderConfig {
+                kind: ProviderKind::Vllm,
+                monitor_interval_ms: 99,
+                ..ProviderConfig::default()
+            },
+            ..NodeConfig::default()
+        };
+        assert!(validate_node_config(&node).is_err());
+        node.provider.monitor_interval_ms = 100;
+        assert!(validate_node_config(&node).is_ok());
     }
 
     #[test]
