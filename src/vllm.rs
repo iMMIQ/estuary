@@ -699,7 +699,7 @@ fn tokenization_key(
         hasher.update(&[0]);
     }
     hasher.update(&generation.to_le_bytes());
-    if let Ok(encoded) = serde_json::to_vec(payload) {
+    if let Ok(encoded) = sonic_rs::to_vec(payload) {
         hasher.update(&encoded);
     }
     *hasher.finalize().as_bytes()
