@@ -556,6 +556,34 @@ async fn draining_stops_new_work_without_cancelling_active_lease() {
 }
 
 #[tokio::test]
+async fn capacity_release_does_not_broadcast_a_scheduler_state_change() {
+    let node = healthy_node("only", 1);
+    let scheduler = Scheduler::new(vec![node], routing(1));
+    let selected = scheduler
+        .acquire(
+            Some("model"),
+            prefix::PrefixInput::default(),
+            &HashSet::new(),
+            128,
+        )
+        .await
+        .expect("initial selection");
+    let state_notify = scheduler.state_notifier();
+    let state_changed = state_notify.notified();
+    tokio::pin!(state_changed);
+    state_changed.as_mut().enable();
+
+    drop(selected);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), state_changed)
+            .await
+            .is_err(),
+        "node semaphore release must not wake every scheduler waiter"
+    );
+}
+
+#[tokio::test]
 async fn prefix_affinity_escapes_overloaded_node() {
     let cached = healthy_node("cached", 4);
     let idle = healthy_node("idle", 4);

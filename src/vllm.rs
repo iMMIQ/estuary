@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, Cursor},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -41,6 +41,31 @@ pub struct VllmManager {
     prefix: Arc<PrefixDirectory>,
     state_notify: Arc<Notify>,
     token_cache: Mutex<TokenizationCache>,
+}
+
+#[derive(Debug)]
+pub struct RoutingTokenization {
+    pub tokens: Option<Vec<u64>>,
+    pub outcome: &'static str,
+    pub elapsed: Duration,
+}
+
+impl RoutingTokenization {
+    fn new(tokens: Option<Vec<u64>>, outcome: &'static str, started: Instant) -> Self {
+        Self {
+            tokens,
+            outcome,
+            elapsed: started.elapsed(),
+        }
+    }
+
+    pub(crate) fn skipped(outcome: &'static str) -> Self {
+        Self {
+            tokens: None,
+            outcome,
+            elapsed: Duration::ZERO,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -91,6 +116,19 @@ impl VllmManager {
         for (_, task) in tasks {
             stop_managed_tasks(task).await;
         }
+    }
+
+    pub fn has_exact_cache_for_model(&self, public_model: &str) -> bool {
+        self.scheduler.nodes().into_iter().any(|node| {
+            node.provider().kind == ProviderKind::Vllm
+                && node.provider_state() == ProviderState::Ready
+                && node.is_routable()
+                && node.upstream_model(Some(public_model)).is_some()
+                && {
+                    let snapshot = self.exact_cache.snapshot(node.id());
+                    snapshot.authoritative && snapshot.blocks > 0
+                }
+        })
     }
 
     async fn reconcile_tasks(
@@ -161,16 +199,26 @@ impl VllmManager {
         endpoint: &str,
         public_model: &str,
         body: &JsonValue,
-    ) -> Option<Vec<u64>> {
+        allow_remote: bool,
+    ) -> RoutingTokenization {
+        let started = Instant::now();
         if body.get("cache_salt").is_some_and(|value| !value.is_null()) {
-            return None;
+            return RoutingTokenization::new(None, "cache_salt", started);
         }
         if endpoint == "completions" {
             if let Some(tokens) = pretokenized_completion(body) {
-                return Some(tokens);
+                return RoutingTokenization::new(Some(tokens), "pretokenized", started);
             }
         }
-        let base_payload = tokenize_payload(endpoint, body)?;
+        if !matches!(endpoint, "chat/completions" | "completions") {
+            return RoutingTokenization::new(None, "unsupported", started);
+        }
+        if !allow_remote {
+            return RoutingTokenization::new(None, "prefix_gate", started);
+        }
+        let Some(base_payload) = tokenize_payload(endpoint, body) else {
+            return RoutingTokenization::new(None, "unsupported", started);
+        };
 
         let mut candidates = self
             .scheduler
@@ -188,38 +236,47 @@ impl VllmManager {
             snapshot.authoritative && snapshot.blocks > 0
         });
         if !has_exact_blocks {
-            return None;
+            return RoutingTokenization::new(None, "directory_unavailable", started);
         }
         candidates.sort_by_key(|node| (node.scheduling_load(), node.id().to_owned()));
 
-        for node in candidates {
-            let Some(Some(upstream_model)) = node.upstream_model(Some(public_model)) else {
-                continue;
-            };
-            let mut payload = base_payload.clone();
-            payload.insert("model".to_owned(), JsonValue::String(upstream_model));
-            let key = tokenization_key(
-                endpoint,
-                public_model,
-                node.id(),
-                node.provider_generation(),
-                &payload,
-            );
-            if let Some(tokens) = self.token_cache.lock().get(&key) {
-                return Some(tokens);
+        let Some(node) = candidates.into_iter().next() else {
+            return RoutingTokenization::new(None, "unavailable", started);
+        };
+        let Some(Some(upstream_model)) = node.upstream_model(Some(public_model)) else {
+            return RoutingTokenization::new(None, "unavailable", started);
+        };
+        let mut payload = base_payload;
+        payload.insert("model".to_owned(), JsonValue::String(upstream_model));
+        let key = tokenization_key(
+            endpoint,
+            public_model,
+            node.id(),
+            node.provider_generation(),
+            &payload,
+        );
+        if let Some(tokens) = self.token_cache.lock().get(&key) {
+            return RoutingTokenization::new(Some(tokens), "cache_hit", started);
+        }
+        let timeout = Duration::from_millis(node.provider().request_timeout_ms);
+        match tokio::time::timeout(timeout, request_tokenization(client, &node, payload)).await {
+            Ok(Ok(tokens)) if !node.is_retired() => {
+                self.token_cache.lock().insert(key, tokens.clone());
+                RoutingTokenization::new(Some(tokens), "upstream_success", started)
             }
-            match request_tokenization(client, &node, payload).await {
-                Ok(tokens) if !node.is_retired() => {
-                    self.token_cache.lock().insert(key, tokens.clone());
-                    return Some(tokens);
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    debug!(node = node.id(), error = %error, "vLLM tokenization failed");
-                }
+            Ok(Ok(_)) => RoutingTokenization::new(None, "node_retired", started),
+            Ok(Err(error)) => {
+                debug!(node = node.id(), error = %error, "vLLM tokenization failed");
+                RoutingTokenization::new(None, "upstream_error", started)
+            }
+            Err(_) => {
+                debug!(
+                    node = node.id(),
+                    "vLLM tokenization exceeded its total deadline"
+                );
+                RoutingTokenization::new(None, "deadline", started)
             }
         }
-        None
     }
 }
 
@@ -255,6 +312,10 @@ async fn run_node_monitor(
                 if node.is_retired() {
                     break;
                 }
+                let provider_was_ready = node.provider_is_ready();
+                let waiting_was_blocked = node
+                    .fresh_vllm_waiting()
+                    .is_some_and(|waiting| waiting >= node.provider().waiting_threshold);
                 let generation = node.provider_generation();
                 poll_node(&client, &node, tick % VERSION_RECHECK_TICKS == 0).await;
                 if node.is_retired() {
@@ -264,7 +325,13 @@ async fn run_node_monitor(
                     exact_cache.invalidate_node_owned(node.id(), node.instance_id());
                     prefix.clear_node(node.id());
                 }
-                notify.notify_waiters();
+                let provider_became_ready = !provider_was_ready && node.provider_is_ready();
+                let waiting_is_blocked = node
+                    .fresh_vllm_waiting()
+                    .is_some_and(|waiting| waiting >= node.provider().waiting_threshold);
+                if provider_became_ready || (waiting_was_blocked && !waiting_is_blocked) {
+                    notify.notify_waiters();
+                }
                 tick = tick.wrapping_add(1);
             }
         }
@@ -501,10 +568,7 @@ async fn request_tokenization(
     payload: Map<String, JsonValue>,
 ) -> Result<Vec<u64>> {
     let url = node.provider_url(&node.provider().tokenize_path)?;
-    let mut request = client
-        .post(url)
-        .timeout(Duration::from_millis(node.provider().request_timeout_ms))
-        .json(&payload);
+    let mut request = client.post(url).json(&payload);
     for (name, value) in node.headers() {
         request = request.header(name, value);
     }
@@ -1089,10 +1153,16 @@ fn field<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a Value> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use axum::{
-        Router,
+        Json, Router,
+        extract::State,
+        http::StatusCode,
+        response::{IntoResponse, Response},
         routing::{get, post},
     };
     use rmpv::encode::write_value;
@@ -1132,13 +1202,48 @@ mod tests {
         (format!("http://{address}"), handle)
     }
 
+    async fn counted_tokenize(
+        State((calls, success, delay)): State<(Arc<AtomicUsize>, bool, Duration)>,
+    ) -> Response {
+        calls.fetch_add(1, Ordering::Relaxed);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if success {
+            Json(json!({"tokens": [1, 2, 3]})).into_response()
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+
+    async fn tokenize_server(
+        success: bool,
+        delay: Duration,
+    ) -> (String, Arc<AtomicUsize>, JoinHandle<()>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route("/tokenize", post(counted_tokenize))
+            .with_state((Arc::clone(&calls), success, delay));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (format!("http://{address}"), calls, handle)
+    }
+
     fn vllm_node(base_url: &str) -> Arc<Node> {
+        vllm_node_with_id("vllm", base_url, 2_000)
+    }
+
+    fn vllm_node_with_id(id: &str, base_url: &str, request_timeout_ms: u64) -> Arc<Node> {
         Node::from_config(&NodeConfig {
-            id: "vllm".to_owned(),
+            id: id.to_owned(),
             base_url: format!("{base_url}/v1"),
             models: HashMap::from([("public".to_owned(), "upstream".to_owned())]),
             provider: ProviderConfig {
                 kind: ProviderKind::Vllm,
+                request_timeout_ms,
                 kv_events: Some(VllmKvEventsConfig::default()),
                 ..ProviderConfig::default()
             },
@@ -1401,9 +1506,150 @@ vllm:kv_cache_usage_perc{model_name="a"} 0.75
                 "chat/completions",
                 "public",
                 &json!({"messages": [{"role": "user", "content": "hello"}]}),
+                true,
             )
             .await;
-        assert_eq!(tokens, Some(vec![1, 2, 3]));
+        assert_eq!(tokens.tokens, Some(vec![1, 2, 3]));
+        assert_eq!(tokens.outcome, "upstream_success");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tokenization_failure_does_not_fan_out_to_other_nodes() {
+        let (first_url, first_calls, first_server) = tokenize_server(false, Duration::ZERO).await;
+        let (second_url, second_calls, second_server) = tokenize_server(true, Duration::ZERO).await;
+        let first = vllm_node_with_id("a", &first_url, 500);
+        let second = vllm_node_with_id("b", &second_url, 500);
+        first.record_vllm_ready("0.25.0".to_owned());
+        second.record_vllm_ready("0.25.0".to_owned());
+        let scheduler = Arc::new(Scheduler::new(
+            vec![Arc::clone(&first), Arc::clone(&second)],
+            crate::config::RoutingConfig::default(),
+        ));
+        for node in [&first, &second] {
+            scheduler.exact_cache_directory().configure_node_owned(
+                node.id(),
+                10,
+                node.instance_id(),
+            );
+            scheduler
+                .exact_cache_directory()
+                .apply_owned(
+                    node.id(),
+                    node.instance_id(),
+                    vec![CacheMutation::Store {
+                        hashes: vec![BlockHash::Integer(1)],
+                        parent: None,
+                        token_ids: vec![1, 2],
+                        block_size: 2,
+                        group: 0,
+                    }],
+                )
+                .unwrap();
+        }
+        let manager = VllmManager::new(scheduler);
+
+        let result = manager
+            .tokenize_for_routing(
+                &Client::new(),
+                "chat/completions",
+                "public",
+                &json!({"messages": [{"role": "user", "content": "hello"}]}),
+                true,
+            )
+            .await;
+
+        assert_eq!(result.outcome, "upstream_error");
+        assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(second_calls.load(Ordering::Relaxed), 0);
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn tokenization_uses_one_total_deadline() {
+        let (base_url, calls, server) = tokenize_server(true, Duration::from_millis(200)).await;
+        let node = vllm_node_with_id("slow", &base_url, 25);
+        node.record_vllm_ready("0.25.0".to_owned());
+        let scheduler = Arc::new(Scheduler::new(
+            vec![Arc::clone(&node)],
+            crate::config::RoutingConfig::default(),
+        ));
+        scheduler
+            .exact_cache_directory()
+            .configure_node_owned(node.id(), 10, node.instance_id());
+        scheduler
+            .exact_cache_directory()
+            .apply_owned(
+                node.id(),
+                node.instance_id(),
+                vec![CacheMutation::Store {
+                    hashes: vec![BlockHash::Integer(1)],
+                    parent: None,
+                    token_ids: vec![1, 2],
+                    block_size: 2,
+                    group: 0,
+                }],
+            )
+            .unwrap();
+        let manager = VllmManager::new(scheduler);
+
+        let result = manager
+            .tokenize_for_routing(
+                &Client::new(),
+                "chat/completions",
+                "public",
+                &json!({"messages": [{"role": "user", "content": "hello"}]}),
+                true,
+            )
+            .await;
+
+        assert_eq!(result.outcome, "deadline");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(result.elapsed < Duration::from_millis(150));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tokenization_prefix_gate_avoids_the_upstream_request() {
+        let (base_url, calls, server) = tokenize_server(true, Duration::ZERO).await;
+        let node = vllm_node_with_id("gated", &base_url, 500);
+        node.record_vllm_ready("0.25.0".to_owned());
+        let scheduler = Arc::new(Scheduler::new(
+            vec![Arc::clone(&node)],
+            crate::config::RoutingConfig::default(),
+        ));
+        scheduler
+            .exact_cache_directory()
+            .configure_node_owned(node.id(), 10, node.instance_id());
+        scheduler
+            .exact_cache_directory()
+            .apply_owned(
+                node.id(),
+                node.instance_id(),
+                vec![CacheMutation::Store {
+                    hashes: vec![BlockHash::Integer(1)],
+                    parent: None,
+                    token_ids: vec![1, 2],
+                    block_size: 2,
+                    group: 0,
+                }],
+            )
+            .unwrap();
+        let manager = VllmManager::new(scheduler);
+
+        let result = manager
+            .tokenize_for_routing(
+                &Client::new(),
+                "chat/completions",
+                "public",
+                &json!({"messages": [{"role": "user", "content": "first request"}]}),
+                false,
+            )
+            .await;
+
+        assert_eq!(result.outcome, "prefix_gate");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
         server.abort();
     }
 }

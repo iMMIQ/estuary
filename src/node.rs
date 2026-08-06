@@ -703,14 +703,14 @@ impl Node {
         }
     }
 
-    pub fn try_acquire(self: &Arc<Self>, notify: Arc<Notify>) -> Option<NodeLease> {
+    pub fn try_acquire(self: &Arc<Self>, idle_notify: Arc<Notify>) -> Option<NodeLease> {
         let permit = Arc::clone(&self.semaphore).try_acquire_owned().ok()?;
         let circuit_ticket = self.begin_circuit_request()?;
         Some(NodeLease {
             node: Arc::clone(self),
             permit: Some(permit),
             circuit_ticket: Some(circuit_ticket),
-            notify,
+            idle_notify,
         })
     }
 
@@ -865,14 +865,14 @@ pub(crate) struct NodeReservation {
 }
 
 impl NodeReservation {
-    pub(crate) fn try_commit(self, notify: Arc<Notify>) -> Option<NodeLease> {
+    pub(crate) fn try_commit(self, idle_notify: Arc<Notify>) -> Option<NodeLease> {
         let Self { node, permit } = self;
         let circuit_ticket = node.begin_circuit_request()?;
         Some(NodeLease {
             node,
             permit: Some(permit),
             circuit_ticket: Some(circuit_ticket),
-            notify,
+            idle_notify,
         })
     }
 }
@@ -882,7 +882,7 @@ pub struct NodeLease {
     node: Arc<Node>,
     permit: Option<OwnedSemaphorePermit>,
     circuit_ticket: Option<CircuitTicket>,
-    notify: Arc<Notify>,
+    idle_notify: Arc<Notify>,
 }
 
 impl NodeLease {
@@ -912,7 +912,7 @@ impl Drop for NodeLease {
             self.node.release_circuit_ticket(ticket);
         }
         drop(self.permit.take());
-        self.notify.notify_waiters();
+        self.idle_notify.notify_waiters();
     }
 }
 

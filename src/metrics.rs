@@ -34,12 +34,18 @@ struct NodeLabels {
     node: String,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
+struct TokenizationLabels {
+    outcome: String,
+}
+
 #[derive(Debug)]
 pub struct Metrics {
     registry: Registry,
     requests: Family<RequestLabels, Counter>,
     attempts: Family<AttemptLabels, Counter>,
     retries: Family<AttemptLabels, Counter>,
+    tokenizations: Family<TokenizationLabels, Counter>,
     stream_cancellations: Family<NodeLabels, Counter>,
     stream_errors: Family<NodeLabels, Counter>,
     node_active: Family<NodeLabels, Gauge>,
@@ -57,6 +63,7 @@ pub struct Metrics {
     queue_bytes: Gauge,
     request_duration: Histogram,
     queue_duration: Histogram,
+    tokenization_duration: Histogram,
     prefix_match_chars: Histogram,
     prefix_match_tokens: Histogram,
 }
@@ -67,6 +74,7 @@ impl Metrics {
         let requests = Family::default();
         let attempts = Family::default();
         let retries = Family::default();
+        let tokenizations = Family::default();
         let stream_cancellations = Family::default();
         let stream_errors = Family::default();
         let node_active = Family::default();
@@ -84,6 +92,7 @@ impl Metrics {
         let queue_bytes = Gauge::default();
         let request_duration = Histogram::new(exponential_buckets(0.005, 2.0, 18));
         let queue_duration = Histogram::new(exponential_buckets(0.001, 2.0, 16));
+        let tokenization_duration = Histogram::new(exponential_buckets(0.000_5, 2.0, 18));
         let prefix_match_chars = Histogram::new(exponential_buckets(128.0, 2.0, 14));
         let prefix_match_tokens = Histogram::new(exponential_buckets(16.0, 2.0, 16));
 
@@ -102,6 +111,11 @@ impl Metrics {
             "retries",
             "Internal retry attempts by node and reason.",
             retries.clone(),
+        );
+        registry.register(
+            "tokenization_outcomes",
+            "Routing tokenization decisions and results by bounded outcome.",
+            tokenizations.clone(),
         );
         registry.register(
             "stream_cancellations",
@@ -189,6 +203,11 @@ impl Metrics {
             queue_duration.clone(),
         );
         registry.register(
+            "tokenization_duration_seconds",
+            "Time spent deciding, caching, or requesting exact routing tokenization.",
+            tokenization_duration.clone(),
+        );
+        registry.register(
             "prefix_match_chars",
             "Longest approximate cached prompt prefix selected, in canonical characters.",
             prefix_match_chars.clone(),
@@ -204,6 +223,7 @@ impl Metrics {
             requests,
             attempts,
             retries,
+            tokenizations,
             stream_cancellations,
             stream_errors,
             node_active,
@@ -221,6 +241,7 @@ impl Metrics {
             queue_bytes,
             request_duration,
             queue_duration,
+            tokenization_duration,
             prefix_match_chars,
             prefix_match_tokens,
         })
@@ -251,6 +272,15 @@ impl Metrics {
                 outcome: reason.to_owned(),
             })
             .inc();
+    }
+
+    pub fn tokenization(&self, outcome: &str, elapsed: std::time::Duration) {
+        self.tokenizations
+            .get_or_create(&TokenizationLabels {
+                outcome: outcome.to_owned(),
+            })
+            .inc();
+        self.tokenization_duration.observe(elapsed.as_secs_f64());
     }
 
     pub fn stream_cancelled(&self, node: &str) {
@@ -381,9 +411,13 @@ mod tests {
         })
         .unwrap();
         let scheduler = Scheduler::new(vec![node], RoutingConfig::default());
-        let output = Metrics::new().encode(&scheduler).unwrap();
+        let metrics = Metrics::new();
+        metrics.tokenization("prefix_gate", std::time::Duration::from_millis(2));
+        let output = metrics.encode(&scheduler).unwrap();
         assert!(output.contains("estuary_node_provider_ready"));
         assert!(output.contains("estuary_node_exact_kv_blocks"));
         assert!(output.contains("estuary_node_kv_cache_usage_ratio"));
+        assert!(output.contains("estuary_tokenization_outcomes_total{outcome=\"prefix_gate\"} 1"));
+        assert!(output.contains("estuary_tokenization_duration_seconds_count 1"));
     }
 }

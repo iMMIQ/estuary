@@ -90,7 +90,7 @@ For generic OpenAI-compatible servers, the gateway stores canonical prompt mater
 
 Before routing or forwarding a JSON inference request, Estuary removes Claude Code's standalone `x-anthropic-billing-header:` system text block. That block contains the CLI version/build identifier and entrypoint but no model instruction, so retaining it fragments both local affinity and upstream KV prefixes across Claude Code releases. The match is intentionally narrow: multiline content, environment details, tool instructions, ordinary system messages, and user content are preserved. This cleanup applies before Messages-to-Chat conversion and vLLM tokenization.
 
-Nodes configured with `provider.type: vllm` are version-gated to vLLM 0.25.0 or newer. Estuary scrapes native running, waiting, and KV-use metrics; calls `/tokenize` for Chat Completions and string Completions; and consumes vLLM's ZMQ KV events. Exact token-block matches take precedence over the character estimate. A missing metric, tokenize failure, event disconnect, sequence gap, or unsupported request shape degrades safely to local load and approximate affinity instead of blocking inference.
+Nodes configured with `provider.type: vllm` are version-gated to vLLM 0.25.0 or newer. Estuary scrapes native running, waiting, and KV-use metrics; conditionally calls `/tokenize` for Chat Completions and string Completions; and consumes vLLM's ZMQ KV events. Remote tokenization is attempted only when the approximate prefix already exceeds `prefix.cache_threshold` and an authoritative exact directory contains blocks. One selected tokenizer gets one total `provider.request_timeout_ms` deadline; failure degrades immediately instead of fanning out across the pool. Exact token-block matches take precedence over the character estimate. A missing metric, tokenize failure, event disconnect, sequence gap, or unsupported request shape degrades safely to local load and approximate affinity instead of blocking inference.
 
 ### Retry semantics
 
@@ -111,7 +111,7 @@ For each request the gateway:
 5. tries candidates in score order and atomically acquires a node permit;
 6. if every eligible node is full or above the vLLM waiting watermark, keeps the request pending until capacity becomes available or the client disconnects.
 
-Queued requests use one scheduling class and register in each eligible node semaphore's FIFO wait list. A newly arriving fast-path request cannot take a permit already assigned to an older waiter, while requests for independent model pools do not share a global head-of-line lock. The count and byte limits bound how many requests simultaneously register with node semaphores; excess requests wait for queue admission instead of receiving a gateway-generated `429`. No healthy node returns `503`. Upstream transport/protocol failures return `502`, and the upstream response-header timeout returns `504`. Gateway errors follow the protocol of the selected public endpoint.
+Queued requests use one scheduling class and register in each eligible node semaphore's FIFO wait list. A newly arriving fast-path request cannot take a permit already assigned to an older waiter, while requests for independent model pools do not share a global head-of-line lock. Capacity release wakes the affected semaphore FIFO rather than broadcasting to every queued request; registry, health, and telemetry changes retain the global eligibility notification. The count and byte limits bound how many requests simultaneously register with node semaphores; excess requests wait for queue admission instead of receiving a gateway-generated `429`. No healthy node returns `503`. Upstream transport/protocol failures return `502`, and the upstream response-header timeout returns `504`. Gateway errors follow the protocol of the selected public endpoint.
 
 Each node also has an independent circuit breaker. Consecutive transport, 5xx, or upstream-body failures open it and remove the node from routing. After `open_ms`, a bounded number of real inference requests enter half-open state; the configured success streak closes the circuit, while any half-open failure reopens it. Upstream `429` is treated as load pressure rather than a circuit failure.
 
@@ -275,6 +275,8 @@ Important metric families include:
 - `estuary_node_exact_kv_blocks`
 - `estuary_request_duration_seconds`
 - `estuary_queue_duration_seconds`
+- `estuary_tokenization_outcomes_total`
+- `estuary_tokenization_duration_seconds`
 - `estuary_prefix_match_chars`
 - `estuary_prefix_match_tokens`
 

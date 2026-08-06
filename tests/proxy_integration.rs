@@ -490,6 +490,56 @@ async fn anthropic_messages_use_configured_responses_adapter() {
     assert_eq!(request["tools"][0]["type"], "function");
 }
 
+#[tokio::test]
+async fn anthropic_conversion_failure_lazily_falls_back_to_a_capable_protocol() {
+    let chat_calls = Arc::new(AtomicUsize::new(0));
+    let chat_counter = Arc::clone(&chat_calls);
+    let chat = TestServer::spawn(Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let chat_counter = Arc::clone(&chat_counter);
+            async move {
+                chat_counter.fetch_add(1, Ordering::SeqCst);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }),
+    ))
+    .await;
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let responses = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(responses_anthropic_response))
+            .with_state(sender),
+    )
+    .await;
+    let chat_node = node("a-chat", &chat, [("claude", "chat-model")]);
+    let mut responses_node = node("b-responses", &responses, [("claude", "responses-model")]);
+    responses_node.provider.anthropic_protocol = AnthropicProtocol::Responses;
+    let gateway = spawn_gateway(vec![chat_node, responses_node]).await;
+
+    let response = test_client()
+        .post(gateway.url("/v1/messages"))
+        .json(&json!({
+            "model": "claude",
+            "max_tokens": 512,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "reason about this"}]
+        }))
+        .send()
+        .await
+        .expect("Responses fallback request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(chat_calls.load(Ordering::SeqCst), 0);
+    let captured = timeout(IO_TIMEOUT, receiver.recv())
+        .await
+        .expect("Responses fallback capture timeout")
+        .expect("Responses fallback request missing");
+    let request: Value = serde_json::from_slice(&captured.body).expect("Responses JSON");
+    assert_eq!(request["model"], "responses-model");
+    assert_eq!(request["reasoning"]["effort"], "high");
+}
+
 static ANTHROPIC_UPSTREAM_SSE: &[u8] = concat!(
     "data: {\"id\":\"chatcmpl_stream\",\"model\":\"internal-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
     "data: {\"id\":\"chatcmpl_stream\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}\n\n",

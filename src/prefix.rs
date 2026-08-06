@@ -339,7 +339,7 @@ pub fn routing_text(
     }
 
     let input_key = match endpoint {
-        "chat/completions" => "messages",
+        "chat/completions" | "messages" => "messages",
         "completions" => "prompt",
         _ => "input",
     };
@@ -429,6 +429,33 @@ mod tests {
         assert_eq!(result.node_ids, ["node-a"]);
         assert!(result.matched_chars > 20);
         assert!(result.matched_chars < result.input_chars);
+    }
+
+    #[test]
+    fn anthropic_routing_ignores_generation_only_fields() {
+        let config = PrefixConfig::default();
+        let first = json!({
+            "model": "claude",
+            "max_tokens": 128,
+            "stream": false,
+            "system": "be precise",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let second = json!({
+            "model": "claude",
+            "max_tokens": 4096,
+            "stream": true,
+            "system": "be precise",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let first = routing_text("messages", Some("claude"), Some(&first), &config);
+        let second = routing_text("messages", Some("claude"), Some(&second), &config);
+        let directory = PrefixDirectory::new(&config);
+        directory.record("node-a", &first);
+
+        let matched = directory.best_match(&second);
+        assert_eq!(matched.node_ids, ["node-a"]);
+        assert_eq!(matched.matched_chars, matched.input_chars);
     }
 
     #[test]

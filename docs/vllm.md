@@ -71,7 +71,7 @@ Keep both ZMQ ports on a private network. The vLLM KV event transport does not d
 
 ## Routing semantics
 
-For supported requests, Estuary obtains token IDs from `/tokenize` and walks the event-derived token trie for every eligible node. A hybrid model can publish multiple KV groups; the usable prefix is the minimum match across all groups learned for that node. If the longest confirmed match exceeds `routing.prefix.cache_threshold` and the pool is not load-imbalanced, the longest matching node set is preferred.
+For supported requests, Estuary first checks whether the approximate match already exceeds `routing.prefix.cache_threshold` and whether an authoritative exact directory contains blocks. Only then does it obtain token IDs from `/tokenize`; pre-tokenized Completions bypass the remote-call gate. The least-loaded tokenizer's node-local cache is checked before one request is sent to that node. Failure or the single total `provider.request_timeout_ms` deadline degrades immediately to approximate affinity without trying every node. Estuary then walks the event-derived token trie for every eligible node. A hybrid model can publish multiple KV groups; the usable prefix is the minimum match across all groups learned for that node. If the longest confirmed match exceeds the threshold and the pool is not load-imbalanced, the longest matching node set is preferred.
 
 Exact state is intentionally conservative:
 

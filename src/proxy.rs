@@ -170,41 +170,15 @@ async fn proxy_inner(
     }
 
     let mut anthropic_payloads = None;
-    let mut routing_endpoint = endpoint.clone();
     let (protocol, record_prefix) = if endpoint == "messages" {
         anthropic::validate_request_shape(
             parsed.as_ref().expect("inference JSON was validated above"),
             true,
         )?;
-        let native = PreparedPayload {
-            endpoint: "messages".to_owned(),
-            body: original_body.clone(),
-            parsed: parsed
-                .as_ref()
-                .expect("inference JSON was validated above")
-                .clone(),
-            query: uri.query().map(str::to_owned),
-        };
-        let (chat, chat_error) = match anthropic::convert_request(&native.parsed) {
-            Ok(parsed) => (Some(prepared_payload("chat/completions", parsed)), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-        let (responses, responses_error) =
-            match anthropic_responses::convert_request(&native.parsed) {
-                Ok(parsed) => (Some(prepared_payload("responses", parsed)), None),
-                Err(error) => (None, Some(error.to_string())),
-            };
-        if chat.is_some() {
-            "chat/completions".clone_into(&mut routing_endpoint);
-        } else if responses.is_some() {
-            "responses".clone_into(&mut routing_endpoint);
-        }
         anthropic_payloads = Some(AnthropicPayloads {
-            native,
-            responses,
-            chat,
-            responses_error,
-            chat_error,
+            allow_adapters: true,
+            responses: None,
+            chat: None,
             expose_thinking: anthropic::thinking_requested(
                 parsed.as_ref().expect("inference JSON was validated above"),
             ),
@@ -215,62 +189,16 @@ async fn proxy_inner(
             parsed.as_ref().expect("inference JSON was validated above"),
             false,
         )?;
-        let native = PreparedPayload {
-            endpoint: endpoint.clone(),
-            body: original_body.clone(),
-            parsed: parsed
-                .as_ref()
-                .expect("inference JSON was validated above")
-                .clone(),
-            query: uri.query().map(str::to_owned),
-        };
         anthropic_payloads = Some(AnthropicPayloads {
-            native,
+            allow_adapters: false,
             responses: None,
             chat: None,
-            responses_error: None,
-            chat_error: None,
             expose_thinking: false,
         });
         (ClientProtocol::Anthropic, false)
     } else {
         (ClientProtocol::OpenAi, true)
     };
-    if let Some(payloads) = anthropic_payloads.as_ref() {
-        let supported = state.scheduler.nodes().iter().any(|node| {
-            node.upstream_model(public_model.as_deref()).is_some()
-                && payloads.supports(
-                    node.provider()
-                        .anthropic_protocol
-                        .resolve(node.provider().kind),
-                )
-        });
-        if !supported {
-            let details = state
-                .scheduler
-                .nodes()
-                .iter()
-                .filter(|node| node.upstream_model(public_model.as_deref()).is_some())
-                .filter_map(|node| {
-                    let protocol = node
-                        .provider()
-                        .anthropic_protocol
-                        .resolve(node.provider().kind);
-                    payloads
-                        .error(protocol)
-                        .map(|error| format!("{} ({protocol:?}): {error}", node.id()))
-                })
-                .collect::<Vec<_>>();
-            let detail = if details.is_empty() {
-                "no node is configured with a compatible native Anthropic protocol".to_owned()
-            } else {
-                details.join("; ")
-            };
-            return Err(GatewayError::InvalidRequest(format!(
-                "no configured upstream protocol can represent this Anthropic request: {detail}"
-            )));
-        }
-    }
     let routing_parsed = (endpoint == "messages/count_tokens")
         .then(|| {
             anthropic::convert_count_request(
@@ -285,49 +213,80 @@ async fn proxy_inner(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let mut prefix_input = routing_text(
-        if protocol == ClientProtocol::Anthropic {
-            &routing_endpoint
-        } else {
-            &endpoint
-        },
+        &endpoint,
         public_model.as_deref(),
-        routing_parsed
-            .as_ref()
-            .or_else(|| {
-                anthropic_payloads.as_ref().and_then(|payloads| {
-                    payloads
-                        .chat
-                        .as_ref()
-                        .or(payloads.responses.as_ref())
-                        .map(|payload| &payload.parsed)
-                })
-            })
-            .or(parsed.as_ref()),
+        routing_parsed.as_ref().or(parsed.as_ref()),
         &state.settings.routing.prefix,
     );
     if endpoint != "messages/count_tokens" {
-        let tokenize_parsed = anthropic_payloads
-            .as_ref()
-            .and_then(|payloads| payloads.chat.as_ref().or(payloads.responses.as_ref()))
-            .map(|payload| &payload.parsed)
-            .or(parsed.as_ref());
-        if let (Some(model), Some(parsed)) = (public_model.as_deref(), tokenize_parsed) {
-            if let Some(tokens) = state
-                .vllm
-                .tokenize_for_routing(&state.client, &routing_endpoint, model, parsed)
-                .await
-            {
+        if let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_ref()) {
+            let salted = parsed
+                .get("cache_salt")
+                .is_some_and(|value| !value.is_null());
+            let exact_cache_available = state.vllm.has_exact_cache_for_model(model);
+            let prefix_worth_tokenizing = exact_cache_available
+                && state
+                    .scheduler
+                    .approximate_prefix_worth_tokenizing(&prefix_input);
+            let tokenization = if protocol == ClientProtocol::Anthropic {
+                if salted {
+                    crate::vllm::RoutingTokenization::skipped("cache_salt")
+                } else if !exact_cache_available {
+                    crate::vllm::RoutingTokenization::skipped("directory_unavailable")
+                } else if !prefix_worth_tokenizing {
+                    crate::vllm::RoutingTokenization::skipped("prefix_gate")
+                } else {
+                    match anthropic_payloads
+                        .as_mut()
+                        .expect("Anthropic requests have adapter state")
+                        .prepare(AnthropicProtocol::Chat, parsed)
+                    {
+                        Ok(Some(payload)) => {
+                            state
+                                .vllm
+                                .tokenize_for_routing(
+                                    &state.client,
+                                    &payload.endpoint,
+                                    model,
+                                    &payload.parsed,
+                                    true,
+                                )
+                                .await
+                        }
+                        Ok(None) => unreachable!("Chat preparation produces a payload"),
+                        Err(_) => crate::vllm::RoutingTokenization::skipped("adapter_unsupported"),
+                    }
+                }
+            } else {
+                if salted {
+                    crate::vllm::RoutingTokenization::skipped("cache_salt")
+                } else if !matches!(endpoint.as_str(), "chat/completions" | "completions") {
+                    crate::vllm::RoutingTokenization::skipped("unsupported")
+                } else if !exact_cache_available {
+                    crate::vllm::RoutingTokenization::skipped("directory_unavailable")
+                } else {
+                    state
+                        .vllm
+                        .tokenize_for_routing(
+                            &state.client,
+                            &endpoint,
+                            model,
+                            parsed,
+                            prefix_worth_tokenizing,
+                        )
+                        .await
+                }
+            };
+            state
+                .metrics
+                .tokenization(tokenization.outcome, tokenization.elapsed);
+            if let Some(tokens) = tokenization.tokens {
                 prefix_input.set_token_ids(tokens);
             }
         }
     }
 
-    let upstream_query =
-        if protocol == ClientProtocol::OpenAi || endpoint == "messages/count_tokens" {
-            uri.query().map(str::to_owned)
-        } else {
-            None
-        };
+    let upstream_query = uri.query().map(str::to_owned);
     proxy_with_retries(
         state,
         ProxyRequest {
@@ -577,38 +536,45 @@ struct PreparedPayload {
 }
 
 struct AnthropicPayloads {
-    native: PreparedPayload,
-    responses: Option<PreparedPayload>,
-    chat: Option<PreparedPayload>,
-    responses_error: Option<String>,
-    chat_error: Option<String>,
+    allow_adapters: bool,
+    responses: Option<Result<PreparedPayload, String>>,
+    chat: Option<Result<PreparedPayload, String>>,
     expose_thinking: bool,
 }
 
 impl AnthropicPayloads {
-    fn supports(&self, protocol: AnthropicProtocol) -> bool {
+    fn prepare(
+        &mut self,
+        protocol: AnthropicProtocol,
+        source: &Value,
+    ) -> Result<Option<&PreparedPayload>, String> {
         match protocol {
-            AnthropicProtocol::Native => true,
-            AnthropicProtocol::Responses => self.responses.is_some(),
-            AnthropicProtocol::Chat => self.chat.is_some(),
-            AnthropicProtocol::Auto => unreachable!("Anthropic protocol must be resolved"),
-        }
-    }
-
-    fn payload(&self, protocol: AnthropicProtocol) -> Option<&PreparedPayload> {
-        match protocol {
-            AnthropicProtocol::Native => Some(&self.native),
-            AnthropicProtocol::Responses => self.responses.as_ref(),
-            AnthropicProtocol::Chat => self.chat.as_ref(),
-            AnthropicProtocol::Auto => None,
-        }
-    }
-
-    fn error(&self, protocol: AnthropicProtocol) -> Option<&str> {
-        match protocol {
-            AnthropicProtocol::Responses => self.responses_error.as_deref(),
-            AnthropicProtocol::Chat => self.chat_error.as_deref(),
-            AnthropicProtocol::Native | AnthropicProtocol::Auto => None,
+            AnthropicProtocol::Native => Ok(None),
+            AnthropicProtocol::Responses => {
+                if !self.allow_adapters {
+                    return Err("count_tokens requires a native Anthropic upstream".to_owned());
+                }
+                let prepared = self.responses.get_or_insert_with(|| {
+                    anthropic_responses::convert_request(source)
+                        .map(|value| prepared_payload("responses", value))
+                        .map_err(|error| error.to_string())
+                });
+                prepared.as_ref().map(Some).map_err(Clone::clone)
+            }
+            AnthropicProtocol::Chat => {
+                if !self.allow_adapters {
+                    return Err("count_tokens requires a native Anthropic upstream".to_owned());
+                }
+                let prepared = self.chat.get_or_insert_with(|| {
+                    anthropic::convert_request(source)
+                        .map(|value| prepared_payload("chat/completions", value))
+                        .map_err(|error| error.to_string())
+                });
+                prepared.as_ref().map(Some).map_err(Clone::clone)
+            }
+            AnthropicProtocol::Auto => {
+                unreachable!("Anthropic protocol must be resolved before payload preparation")
+            }
         }
     }
 }
@@ -697,29 +663,12 @@ impl ResponseStreamAdapter {
 #[allow(clippy::too_many_lines)]
 async fn proxy_with_retries(
     state: Arc<AppState>,
-    request: ProxyRequest,
+    mut request: ProxyRequest,
 ) -> Result<Response, GatewayError> {
-    let mut excluded = request
-        .anthropic_payloads
-        .as_ref()
-        .map_or_else(HashSet::new, |payloads| {
-            state
-                .scheduler
-                .nodes()
-                .into_iter()
-                .filter(|node| {
-                    !payloads.supports(
-                        node.provider()
-                            .anthropic_protocol
-                            .resolve(node.provider().kind),
-                    )
-                })
-                .map(|node| node.id().to_owned())
-                .collect()
-        });
+    let mut excluded = HashSet::new();
+    let mut adapter_errors = Vec::new();
     let mut attempt = 0usize;
     loop {
-        attempt += 1;
         let queue_started = Instant::now();
         let selection = state
             .scheduler
@@ -747,12 +696,46 @@ async fn proxy_with_retries(
                 .anthropic_protocol
                 .resolve(node.provider().kind)
         });
-        let selected_payload = selected_protocol.and_then(|protocol| {
-            request
-                .anthropic_payloads
+        let selected_payload = if let Some(protocol) = selected_protocol {
+            let source = request
+                .parsed_body
                 .as_ref()
-                .and_then(|payloads| payloads.payload(protocol))
-        });
+                .expect("Anthropic inference requests contain parsed JSON");
+            match request
+                .anthropic_payloads
+                .as_mut()
+                .expect("Anthropic requests have adapter state")
+                .prepare(protocol, source)
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    adapter_errors.push(format!("{} ({protocol:?}): {error}", node.id()));
+                    for candidate in state.scheduler.nodes() {
+                        if candidate
+                            .provider()
+                            .anthropic_protocol
+                            .resolve(candidate.provider().kind)
+                            == protocol
+                        {
+                            excluded.insert(candidate.id().to_owned());
+                        }
+                    }
+                    drop(selection.lease);
+                    if state
+                        .scheduler
+                        .has_alternative(request.public_model.as_deref(), &excluded)
+                    {
+                        continue;
+                    }
+                    return Err(GatewayError::InvalidRequest(format!(
+                        "no configured upstream protocol can represent this Anthropic request: {}",
+                        adapter_errors.join("; ")
+                    )));
+                }
+            }
+        } else {
+            None
+        };
         let (upstream_endpoint, upstream_original, upstream_parsed, upstream_query) =
             selected_payload.map_or_else(
                 || {
@@ -835,6 +818,7 @@ async fn proxy_with_retries(
             .headers(upstream_headers)
             .body(upstream_body);
 
+        attempt += 1;
         let upstream_started = Instant::now();
         let result = tokio::time::timeout(
             Duration::from_millis(state.settings.server.upstream_header_timeout_ms),
@@ -1792,6 +1776,40 @@ mod tests {
             }
         });
         assert!(normalize_context_management(&mut unsupported).is_err());
+    }
+
+    #[test]
+    fn anthropic_adapter_payloads_are_built_only_when_selected() {
+        let source = json!({
+            "model": "claude",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let mut payloads = AnthropicPayloads {
+            allow_adapters: true,
+            responses: None,
+            chat: None,
+            expose_thinking: false,
+        };
+
+        assert!(
+            payloads
+                .prepare(AnthropicProtocol::Native, &source)
+                .unwrap()
+                .is_none()
+        );
+        assert!(payloads.chat.is_none());
+        assert!(payloads.responses.is_none());
+
+        let endpoint = payloads
+            .prepare(AnthropicProtocol::Responses, &source)
+            .unwrap()
+            .unwrap()
+            .endpoint
+            .clone();
+        assert_eq!(endpoint, "responses");
+        assert!(payloads.responses.is_some());
+        assert!(payloads.chat.is_none());
     }
 
     #[test]

@@ -56,6 +56,7 @@ pub struct Scheduler {
     prefix: Arc<PrefixDirectory>,
     exact_cache: Arc<ExactCacheDirectory>,
     notify: Arc<Notify>,
+    idle_notify: Arc<Notify>,
     queue_slots: Arc<Semaphore>,
     queue_kib: Arc<Semaphore>,
     queued_requests: Arc<AtomicUsize>,
@@ -107,6 +108,7 @@ impl Scheduler {
             prefix,
             exact_cache,
             notify: Arc::new(Notify::new()),
+            idle_notify: Arc::new(Notify::new()),
             queue_slots: Arc::new(Semaphore::new(queue_max_requests)),
             queue_kib: Arc::new(Semaphore::new(queue_max_kib)),
             queued_requests: Arc::new(AtomicUsize::new(0)),
@@ -124,6 +126,16 @@ impl Scheduler {
 
     pub fn exact_cache_directory(&self) -> &Arc<ExactCacheDirectory> {
         &self.exact_cache
+    }
+
+    pub fn approximate_prefix_worth_tokenizing(&self, input: &PrefixInput) -> bool {
+        if !self.config.prefix.enabled {
+            return false;
+        }
+        let matched = self.prefix.best_match(input);
+        matched.input_chars > 0
+            && matched.matched_chars as f64 / matched.input_chars as f64
+                > self.config.prefix.cache_threshold
     }
 
     pub fn state_notifier(&self) -> Arc<Notify> {
@@ -190,7 +202,7 @@ impl Scheduler {
                         drop(reservation);
                         continue;
                     }
-                    let Some(lease) = reservation.try_commit(Arc::clone(&self.notify)) else {
+                    let Some(lease) = reservation.try_commit(Arc::clone(&self.idle_notify)) else {
                         continue;
                     };
                     return Ok(Selection {
@@ -231,7 +243,7 @@ impl Scheduler {
         excluded: &HashSet<String>,
     ) -> Result<Option<Selection>, GatewayError> {
         for candidate in self.ranked_candidates(model, prefix_input, excluded)? {
-            if let Some(lease) = candidate.node.try_acquire(Arc::clone(&self.notify)) {
+            if let Some(lease) = candidate.node.try_acquire(Arc::clone(&self.idle_notify)) {
                 return Ok(Some(Selection {
                     node: candidate.node,
                     lease,
@@ -454,7 +466,7 @@ impl Scheduler {
             if node.active() == 0 {
                 return true;
             }
-            let notified = self.notify.notified();
+            let notified = self.idle_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if node.active() == 0 {
@@ -724,5 +736,20 @@ mod tests {
         assert_eq!(selected.node.id(), "z-exact");
         assert_eq!(selected.prefix_match_tokens, 4);
         assert_eq!(selected.prefix_match_chars, 0);
+    }
+
+    #[test]
+    fn remote_tokenization_gate_requires_a_high_value_approximate_prefix() {
+        let scheduler = Scheduler::new(vec![node("node", 4)], RoutingConfig::default());
+        let request = prefix::routing_text(
+            "chat/completions",
+            Some("model"),
+            Some(&json!({"messages": [{"role": "user", "content": "shared prompt"}]})),
+            &PrefixConfig::default(),
+        );
+        assert!(!scheduler.approximate_prefix_worth_tokenizing(&request));
+
+        scheduler.prefix_directory().record("node", &request);
+        assert!(scheduler.approximate_prefix_worth_tokenizing(&request));
     }
 }
