@@ -1040,7 +1040,11 @@ fn mapped_body(
     native_vllm_messages: bool,
     vllm_codex_responses: bool,
 ) -> Result<(Bytes, bool, Option<Arc<codex::NamespaceMap>>), GatewayError> {
-    if !native_vllm_messages
+    let rewrite_native_thinking = native_vllm_messages
+        && parsed
+            .and_then(|value| value.get("thinking"))
+            .is_some_and(|value| !value.is_null());
+    if !rewrite_native_thinking
         && !vllm_codex_responses
         && (upstream_model == public_model || upstream_model.is_none())
     {
@@ -1050,7 +1054,7 @@ fn mapped_body(
     let object = value.as_object_mut().ok_or_else(|| {
         GatewayError::InvalidRequest("JSON request body must be an object".to_owned())
     })?;
-    let thinking_budget_approximated = if native_vllm_messages {
+    let thinking_budget_approximated = if rewrite_native_thinking {
         apply_vllm_native_thinking_compat(object)?
     } else {
         false
@@ -2092,6 +2096,27 @@ mod tests {
         assert_eq!(endpoint, "responses");
         assert!(payloads.responses.is_some());
         assert!(payloads.chat.is_none());
+    }
+
+    #[test]
+    fn native_vllm_request_reuses_an_unchanged_body() {
+        let original = Bytes::from_static(
+            br#"{"model":"model","max_tokens":128,"messages":[{"role":"user","content":"hello"}]}"#,
+        );
+        let parsed = serde_json::from_slice(&original).unwrap();
+        let (mapped, approximated, namespaces) = mapped_body(
+            &original,
+            Some(&parsed),
+            Some("model"),
+            Some("model"),
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(mapped.as_ptr(), original.as_ptr());
+        assert!(!approximated);
+        assert!(namespaces.is_none());
     }
 
     #[test]

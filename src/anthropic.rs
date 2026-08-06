@@ -771,6 +771,14 @@ impl NativeStreamRewriter {
         &mut self,
         mut event: sse::Event,
     ) -> Result<Vec<sse::Event>, GatewayError> {
+        let rewrite = match event.name() {
+            Some("message_start") | None => true,
+            Some("content_block_start" | "content_block_delta") => !self.expose_thinking,
+            Some(_) => false,
+        };
+        if !rewrite {
+            return Ok(vec![event]);
+        }
         let mut value: Value = serde_json::from_str(event.data())
             .map_err(|_| GatewayError::InvalidUpstreamResponse)?;
         if value.get("type").and_then(Value::as_str) == Some("message_start") {
@@ -1372,7 +1380,7 @@ mod tests {
     async fn rewrites_fragmented_native_stream_model_without_losing_events() {
         let source = concat!(
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"internal\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
-            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            "event: ping\ndata: { \"type\": \"ping\", \"future\": true }\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
         );
         let split = source.len() / 2;
@@ -1383,6 +1391,7 @@ mod tests {
         .await;
         assert!(output.contains(r#""model":"public""#));
         assert!(output.contains("event: ping"));
+        assert!(output.contains(r#"data: { "type": "ping", "future": true }"#));
         assert!(output.contains("event: message_stop"));
         assert!(!output.contains("internal"));
     }
