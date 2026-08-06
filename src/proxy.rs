@@ -447,10 +447,10 @@ fn apply_vllm_native_thinking_compat(
             GatewayError::InvalidRequest("vLLM chat_template_kwargs must be an object".to_owned())
         })?;
     template_kwargs.insert("enable_thinking".to_owned(), Value::Bool(enable_thinking));
-    if let Some(thinking) = object.get_mut("thinking").and_then(Value::as_object_mut)
-        && thinking.get("display").and_then(Value::as_str) == Some("omitted")
-    {
-        thinking.remove("display");
+    if let Some(thinking) = object.get_mut("thinking").and_then(Value::as_object_mut) {
+        if thinking.get("display").and_then(Value::as_str) == Some("omitted") {
+            thinking.remove("display");
+        }
     }
     Ok(approximated_budget)
 }
@@ -1030,10 +1030,10 @@ fn mapped_body(
     let object = value.as_object_mut().ok_or_else(|| {
         GatewayError::InvalidRequest("JSON request body must be an object".to_owned())
     })?;
-    if upstream_model != public_model
-        && let Some(upstream_model) = upstream_model
-    {
-        object.insert("model".to_owned(), Value::String(upstream_model.to_owned()));
+    if upstream_model != public_model {
+        if let Some(upstream_model) = upstream_model {
+            object.insert("model".to_owned(), Value::String(upstream_model.to_owned()));
+        }
     }
     let body = serde_json::to_vec(&value)
         .map(Bytes::from)

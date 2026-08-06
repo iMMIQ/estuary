@@ -634,11 +634,11 @@ pub(crate) fn rewrite_native_response(
         .ok_or(GatewayError::InvalidUpstreamResponse)?;
     if object.get("type").and_then(Value::as_str) == Some("message") {
         object.insert("model".to_owned(), Value::String(public_model.to_owned()));
-        if !expose_thinking
-            && let Some(content) = object.get_mut("content").and_then(Value::as_array_mut)
-        {
-            for block in content {
-                suppress_native_thinking(block);
+        if !expose_thinking {
+            if let Some(content) = object.get_mut("content").and_then(Value::as_array_mut) {
+                for block in content {
+                    suppress_native_thinking(block);
+                }
             }
         }
     } else if object.get("input_tokens").and_then(Value::as_u64).is_none() {
@@ -794,10 +794,10 @@ impl NativeStreamRewriter {
                     if let Some(block) = value.get_mut("content_block") {
                         suppress_native_thinking(block);
                     }
-                } else if value.get("type").and_then(Value::as_str) == Some("content_block_delta")
-                    && let Some(delta) = value.get_mut("delta")
-                {
-                    suppress_native_thinking(delta);
+                } else if value.get("type").and_then(Value::as_str) == Some("content_block_delta") {
+                    if let Some(delta) = value.get_mut("delta") {
+                        suppress_native_thinking(delta);
+                    }
                 }
             }
             let name = event_name(&frame)
