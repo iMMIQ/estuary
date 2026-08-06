@@ -504,19 +504,25 @@ impl Gateway {
         let _ = health_shutdown.send(true);
         let _ = provider_shutdown.send(true);
         let _ = control_shutdown.send(true);
-        if !health_done && let Err(error) = health_handle.await {
-            first_error
-                .get_or_insert_with(|| anyhow::anyhow!("health monitor task failed: {error}"));
+        if !health_done {
+            if let Err(error) = health_handle.await {
+                first_error
+                    .get_or_insert_with(|| anyhow::anyhow!("health monitor task failed: {error}"));
+            }
         }
-        if !provider_done && let Err(error) = provider_handle.await {
-            first_error.get_or_insert_with(|| {
-                anyhow::anyhow!("vLLM provider monitor task failed: {error}")
-            });
+        if !provider_done {
+            if let Err(error) = provider_handle.await {
+                first_error.get_or_insert_with(|| {
+                    anyhow::anyhow!("vLLM provider monitor task failed: {error}")
+                });
+            }
         }
-        if !control_done && let Err(error) = control_handle.await {
-            first_error.get_or_insert_with(|| {
-                anyhow::anyhow!("control-plane reconciler task failed: {error}")
-            });
+        if !control_done {
+            if let Err(error) = control_handle.await {
+                first_error.get_or_insert_with(|| {
+                    anyhow::anyhow!("control-plane reconciler task failed: {error}")
+                });
+            }
         }
         self.state.process.mark_drained();
         if let Some(error) = first_error {

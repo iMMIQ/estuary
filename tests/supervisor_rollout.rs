@@ -199,10 +199,10 @@ async fn control_request(runtime: &Path, request: Value) -> Result<Value> {
 async fn wait_for_status(runtime: &Path, predicate: impl Fn(&Value) -> bool) -> Result<Value> {
     let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
     loop {
-        if let Ok(status) = control_request(runtime, json!({"command": "status"})).await
-            && predicate(&status)
-        {
-            return Ok(status);
+        if let Ok(status) = control_request(runtime, json!({"command": "status"})).await {
+            if predicate(&status) {
+                return Ok(status);
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             bail!("supervisor status did not reach the expected state");

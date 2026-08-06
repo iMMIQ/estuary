@@ -220,11 +220,11 @@ impl VllmManager {
                 }
                 continue;
             }
-            if let Some(restart) = restarts.get(&id)
-                && restart.instance_id == node.instance_id()
-                && Instant::now() < restart.not_before
-            {
-                continue;
+            if let Some(restart) = restarts.get(&id) {
+                if restart.instance_id == node.instance_id() && Instant::now() < restart.not_before
+                {
+                    continue;
+                }
             }
             self.token_cache
                 .lock()

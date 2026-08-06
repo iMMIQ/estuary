@@ -305,25 +305,23 @@ async fn proxy_inner(
                         Err(_) => crate::vllm::RoutingTokenization::skipped("adapter_unsupported"),
                     }
                 }
+            } else if salted {
+                crate::vllm::RoutingTokenization::skipped("cache_salt")
+            } else if !matches!(endpoint.as_str(), "chat/completions" | "completions") {
+                crate::vllm::RoutingTokenization::skipped("unsupported")
+            } else if !exact_cache_available {
+                crate::vllm::RoutingTokenization::skipped("directory_unavailable")
             } else {
-                if salted {
-                    crate::vllm::RoutingTokenization::skipped("cache_salt")
-                } else if !matches!(endpoint.as_str(), "chat/completions" | "completions") {
-                    crate::vllm::RoutingTokenization::skipped("unsupported")
-                } else if !exact_cache_available {
-                    crate::vllm::RoutingTokenization::skipped("directory_unavailable")
-                } else {
-                    state
-                        .vllm
-                        .tokenize_for_routing(
-                            &state.client,
-                            &endpoint,
-                            model,
-                            parsed,
-                            prefix_worth_tokenizing,
-                        )
-                        .await
-                }
+                state
+                    .vllm
+                    .tokenize_for_routing(
+                        &state.client,
+                        &endpoint,
+                        model,
+                        parsed,
+                        prefix_worth_tokenizing,
+                    )
+                    .await
             };
             state
                 .metrics

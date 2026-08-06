@@ -202,10 +202,10 @@ pub async fn run(config: SupervisorConfig) -> Result<()> {
             supervisor.shutdown.cancel();
             drop(slot);
             supervisor.drain_all().await;
-            if let Some(journal) = recovered_rollout.as_ref()
-                && let Err(restore_error) = restore_rollout_links(&supervisor.config, journal)
-            {
-                error!(error = %restore_error, "failed to restore pre-rollout slot links");
+            if let Some(journal) = recovered_rollout.as_ref() {
+                if let Err(restore_error) = restore_rollout_links(&supervisor.config, journal) {
+                    error!(error = %restore_error, "failed to restore pre-rollout slot links");
+                }
             }
             let _ = fs::remove_file(supervisor.config.control_socket());
             return Err(error);
@@ -215,10 +215,10 @@ pub async fn run(config: SupervisorConfig) -> Result<()> {
     if let Err(error) = supervisor.finalize_recovered_rollout().await {
         supervisor.shutdown.cancel();
         supervisor.drain_all().await;
-        if let Some(journal) = recovered_rollout.as_ref()
-            && let Err(restore_error) = restore_rollout_links(&supervisor.config, journal)
-        {
-            error!(error = %restore_error, "failed to restore pre-rollout slot links");
+        if let Some(journal) = recovered_rollout.as_ref() {
+            if let Err(restore_error) = restore_rollout_links(&supervisor.config, journal) {
+                error!(error = %restore_error, "failed to restore pre-rollout slot links");
+            }
         }
         let _ = fs::remove_file(supervisor.config.control_socket());
         return Err(error);
