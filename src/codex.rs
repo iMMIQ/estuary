@@ -283,9 +283,9 @@ pub(crate) fn rewrite_response(
     namespaces: &NamespaceMap,
 ) -> Result<Bytes, GatewayError> {
     let mut value: Value =
-        serde_json::from_slice(bytes).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
+        sonic_rs::from_slice(bytes).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
     rewrite_value(&mut value, namespaces);
-    serde_json::to_vec(&value)
+    sonic_rs::to_vec(&value)
         .map(Bytes::from)
         .map_err(|_| GatewayError::Internal)
 }

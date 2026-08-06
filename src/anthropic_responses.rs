@@ -468,7 +468,7 @@ pub(crate) fn convert_response(
     expose_thinking: bool,
 ) -> Result<Bytes, GatewayError> {
     let response: Value =
-        serde_json::from_slice(body).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
+        sonic_rs::from_slice(body).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
     if !matches!(
         response.get("status").and_then(Value::as_str),
         Some("completed" | "incomplete")
@@ -546,7 +546,7 @@ pub(crate) fn convert_response(
         "model": public_model, "content": content, "stop_reason": stop, "stop_sequence": Value::Null,
         "usage": response_usage(response.get("usage"))
     });
-    serde_json::to_vec(&converted)
+    sonic_rs::to_vec(&converted)
         .map(Bytes::from)
         .map_err(|_| GatewayError::Internal)
 }

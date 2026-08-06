@@ -182,7 +182,7 @@ async fn proxy_inner(
     let mut parsed = if body.is_empty() {
         None
     } else {
-        serde_json::from_slice::<Value>(&body).ok()
+        sonic_rs::from_slice::<Value>(&body).ok()
     };
     if is_inference_json && parsed.is_none() {
         return Err(GatewayError::InvalidJson);
@@ -201,7 +201,7 @@ async fn proxy_inner(
         .as_mut()
         .is_some_and(strip_claude_code_billing_blocks);
     let original_body = if body_changed {
-        serde_json::to_vec(parsed.as_ref().expect("parsed body exists"))
+        sonic_rs::to_vec(parsed.as_ref().expect("parsed body exists"))
             .map(Bytes::from)
             .map_err(|_| GatewayError::Internal)?
     } else {
@@ -630,7 +630,7 @@ impl AnthropicPayloads {
 fn prepared_payload(endpoint: &str, parsed: Value) -> PreparedPayload {
     PreparedPayload {
         endpoint: endpoint.to_owned(),
-        body: serde_json::to_vec(&parsed)
+        body: sonic_rs::to_vec(&parsed)
             .map(Bytes::from)
             .expect("serializing a JSON value cannot fail"),
         parsed,
@@ -1072,7 +1072,7 @@ fn mapped_body(
             object.insert("model".to_owned(), Value::String(upstream_model.to_owned()));
         }
     }
-    let body = serde_json::to_vec(&value)
+    let body = sonic_rs::to_vec(&value)
         .map(Bytes::from)
         .map_err(|_| GatewayError::Internal)?;
     Ok((body, thinking_budget_approximated, codex_namespaces))

@@ -549,7 +549,7 @@ pub(crate) fn convert_response(
     expose_thinking: bool,
 ) -> Result<Bytes, GatewayError> {
     let value: Value =
-        serde_json::from_slice(body).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
+        sonic_rs::from_slice(body).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
     let choice = value
         .get("choices")
         .and_then(Value::as_array)
@@ -617,7 +617,7 @@ pub(crate) fn convert_response(
         "stop_sequence": Value::Null,
         "usage": usage
     });
-    serde_json::to_vec(&response)
+    sonic_rs::to_vec(&response)
         .map(Bytes::from)
         .map_err(|_| GatewayError::Internal)
 }
@@ -628,7 +628,7 @@ pub(crate) fn rewrite_native_response(
     expose_thinking: bool,
 ) -> Result<Bytes, GatewayError> {
     let mut value: Value =
-        serde_json::from_slice(body).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
+        sonic_rs::from_slice(body).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
     let object = value
         .as_object_mut()
         .ok_or(GatewayError::InvalidUpstreamResponse)?;
@@ -644,7 +644,7 @@ pub(crate) fn rewrite_native_response(
     } else if object.get("input_tokens").and_then(Value::as_u64).is_none() {
         return Err(GatewayError::InvalidUpstreamResponse);
     }
-    serde_json::to_vec(&value)
+    sonic_rs::to_vec(&value)
         .map(Bytes::from)
         .map_err(|_| GatewayError::Internal)
 }
