@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::{
-    anthropic, anthropic_responses,
+    anthropic, anthropic_responses, codex,
     config::AnthropicProtocol,
     error::GatewayError,
     metrics::Metrics,
@@ -142,6 +142,7 @@ async fn proxy_inner(
     if endpoint == "responses" {
         reject_stateful_responses(parsed.as_ref())?;
     }
+    let codex_request = endpoint == "responses" && codex::is_request(&headers, parsed.as_ref());
     let mut body_changed = false;
     if matches!(endpoint.as_str(), "messages" | "messages/count_tokens") {
         body_changed |= normalize_context_management(
@@ -342,6 +343,7 @@ async fn proxy_inner(
             request_id,
             client_protocol: protocol,
             anthropic_payloads,
+            codex_request,
             record_prefix,
         },
     )
@@ -557,6 +559,7 @@ struct ProxyRequest {
     request_id: RequestId,
     client_protocol: ClientProtocol,
     anthropic_payloads: Option<AnthropicPayloads>,
+    codex_request: bool,
     record_prefix: bool,
 }
 
@@ -621,9 +624,12 @@ fn prepared_payload(endpoint: &str, parsed: Value) -> PreparedPayload {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 enum UpstreamResponseMode {
     Passthrough,
+    Codex {
+        namespaces: Arc<codex::NamespaceMap>,
+    },
     ChatToAnthropic {
         expose_thinking: bool,
     },
@@ -637,11 +643,20 @@ enum UpstreamResponseMode {
 }
 
 impl UpstreamResponseMode {
-    fn is_anthropic(self) -> bool {
-        self != Self::Passthrough
+    fn is_anthropic(&self) -> bool {
+        matches!(
+            self,
+            Self::ChatToAnthropic { .. }
+                | Self::ResponsesToAnthropic { .. }
+                | Self::NativeAnthropic { .. }
+        )
     }
 
-    fn thinking_budget_approximated(self) -> bool {
+    fn rewrites_body(&self) -> bool {
+        !matches!(self, Self::Passthrough)
+    }
+
+    fn thinking_budget_approximated(&self) -> bool {
         matches!(
             self,
             Self::NativeAnthropic {
@@ -653,6 +668,7 @@ impl UpstreamResponseMode {
 }
 
 enum ResponseStreamAdapter {
+    Codex(codex::StreamRewriter),
     Chat(anthropic::StreamConverter),
     Responses(anthropic_responses::StreamConverter),
     Native(anthropic::NativeStreamRewriter),
@@ -661,6 +677,7 @@ enum ResponseStreamAdapter {
 impl ResponseStreamAdapter {
     fn push(&mut self, bytes: &[u8]) -> Result<Bytes, GatewayError> {
         match self {
+            Self::Codex(rewriter) => rewriter.push(bytes),
             Self::Chat(converter) => converter.push(bytes),
             Self::Responses(converter) => converter.push(bytes),
             Self::Native(rewriter) => rewriter.push(bytes),
@@ -669,6 +686,7 @@ impl ResponseStreamAdapter {
 
     fn finish(&mut self) -> Result<Bytes, GatewayError> {
         match self {
+            Self::Codex(rewriter) => rewriter.finish(),
             Self::Chat(converter) => converter.finish(),
             Self::Responses(converter) => converter.finish(),
             Self::Native(rewriter) => rewriter.finish(),
@@ -763,19 +781,26 @@ async fn proxy_with_retries(
         let native_vllm_messages = selected_protocol == Some(AnthropicProtocol::Native)
             && node.provider().kind == crate::config::ProviderKind::Vllm
             && upstream_endpoint == "messages";
-        let (upstream_body, thinking_budget_approximated) = mapped_body(
+        let vllm_codex_responses = request.codex_request
+            && selected_protocol.is_none()
+            && node.provider().kind == crate::config::ProviderKind::Vllm
+            && upstream_endpoint == "responses";
+        let (upstream_body, thinking_budget_approximated, codex_namespaces) = mapped_body(
             upstream_original,
             upstream_parsed,
             selection.upstream_model.as_deref(),
             request.public_model.as_deref(),
             native_vllm_messages,
+            vllm_codex_responses,
         )?;
         let expose_thinking = request
             .anthropic_payloads
             .as_ref()
             .is_some_and(|payloads| payloads.expose_thinking);
         let response_mode = match selected_protocol {
-            None => UpstreamResponseMode::Passthrough,
+            None => codex_namespaces.map_or(UpstreamResponseMode::Passthrough, |namespaces| {
+                UpstreamResponseMode::Codex { namespaces }
+            }),
             Some(AnthropicProtocol::Native) => UpstreamResponseMode::NativeAnthropic {
                 expose_thinking: native_vllm_messages || expose_thinking,
                 thinking_budget_approximated,
@@ -918,7 +943,7 @@ async fn proxy_with_retries(
                 upstream_body_timeout,
                 state.settings.server.max_non_streaming_response_bytes,
                 state.settings.server.expose_node_header,
-                response_mode,
+                &response_mode,
                 request.public_model.as_deref().unwrap_or_default(),
                 request.record_prefix,
             )
@@ -980,9 +1005,13 @@ fn mapped_body(
     upstream_model: Option<&str>,
     public_model: Option<&str>,
     native_vllm_messages: bool,
-) -> Result<(Bytes, bool), GatewayError> {
-    if !native_vllm_messages && (upstream_model == public_model || upstream_model.is_none()) {
-        return Ok((original.clone(), false));
+    vllm_codex_responses: bool,
+) -> Result<(Bytes, bool, Option<Arc<codex::NamespaceMap>>), GatewayError> {
+    if !native_vllm_messages
+        && !vllm_codex_responses
+        && (upstream_model == public_model || upstream_model.is_none())
+    {
+        return Ok((original.clone(), false, None));
     }
     let mut value = parsed.cloned().ok_or(GatewayError::InvalidJson)?;
     let object = value.as_object_mut().ok_or_else(|| {
@@ -993,6 +1022,14 @@ fn mapped_body(
     } else {
         false
     };
+    let codex_namespaces = if vllm_codex_responses {
+        codex::normalize_vllm_request(&mut value)?
+    } else {
+        None
+    };
+    let object = value.as_object_mut().ok_or_else(|| {
+        GatewayError::InvalidRequest("JSON request body must be an object".to_owned())
+    })?;
     if upstream_model != public_model
         && let Some(upstream_model) = upstream_model
     {
@@ -1001,7 +1038,7 @@ fn mapped_body(
     let body = serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|_| GatewayError::Internal)?;
-    Ok((body, thinking_budget_approximated))
+    Ok((body, thinking_budget_approximated, codex_namespaces))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1017,7 +1054,7 @@ async fn buffered_success_response(
     upstream_body_timeout: Duration,
     max_body_bytes: usize,
     expose_node_header: bool,
-    response_mode: UpstreamResponseMode,
+    response_mode: &UpstreamResponseMode,
     public_model: &str,
     record_prefix: bool,
 ) -> Result<Response, GatewayError> {
@@ -1043,21 +1080,22 @@ async fn buffered_success_response(
     };
     let body = match response_mode {
         UpstreamResponseMode::Passthrough => Ok(body),
+        UpstreamResponseMode::Codex { namespaces } => codex::rewrite_response(&body, namespaces),
         UpstreamResponseMode::ChatToAnthropic { expose_thinking } => {
-            anthropic::convert_response(&body, public_model, expose_thinking)
+            anthropic::convert_response(&body, public_model, *expose_thinking)
         }
         UpstreamResponseMode::ResponsesToAnthropic { expose_thinking } => {
-            anthropic_responses::convert_response(&body, public_model, expose_thinking)
+            anthropic_responses::convert_response(&body, public_model, *expose_thinking)
         }
         UpstreamResponseMode::NativeAnthropic {
             expose_thinking, ..
-        } => anthropic::rewrite_native_response(&body, public_model, expose_thinking),
+        } => anthropic::rewrite_native_response(&body, public_model, *expose_thinking),
     };
     let body = match body {
         Ok(body) => body,
         Err(error) => {
             lease.record_failure(
-                "Anthropic adapter received an invalid upstream response",
+                "response adapter received an invalid upstream body",
                 health_config,
             );
             return Err(error);
@@ -1070,11 +1108,16 @@ async fn buffered_success_response(
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     copy_response_headers(&headers, response.headers_mut());
-    if response_mode.is_anthropic() {
+    if response_mode.rewrites_body() {
         response.headers_mut().remove(CONTENT_LENGTH);
+    }
+    if response_mode.is_anthropic() {
         anthropic::set_anthropic_content_type(&mut response, false);
     }
-    set_thinking_budget_warning(response_mode, response.headers_mut());
+    set_thinking_budget_warning(
+        response_mode.thinking_budget_approximated(),
+        response.headers_mut(),
+    );
     if let Some(value) = upstream_request_id {
         response
             .headers_mut()
@@ -1117,6 +1160,9 @@ fn streaming_response(
     let (sender, mut receiver) = mpsc::channel::<Bytes>(1);
     let terminal_failure = Arc::new(parking_lot::Mutex::new(None));
     let pump_failure = Arc::clone(&terminal_failure);
+    let is_anthropic = response_mode.is_anthropic();
+    let rewrites_body = response_mode.rewrites_body();
+    let thinking_budget_approximated = response_mode.thinking_budget_approximated();
 
     tokio::spawn(async move {
         let mut guard = BodyGuard::new(
@@ -1126,7 +1172,7 @@ fn streaming_response(
             header_latency,
         );
         let mut body = upstream.bytes_stream();
-        let anthropic_stream = response_mode.is_anthropic();
+        let needs_keepalive = is_anthropic;
         let keepalive_period = Duration::from_secs(10);
         let mut keepalive = tokio::time::interval_at(
             tokio::time::Instant::now() + keepalive_period,
@@ -1137,8 +1183,11 @@ fn streaming_response(
         let mut received_body_bytes = 0_u64;
         let body_deadline = tokio::time::Instant::now() + upstream_body_timeout;
         let mut idle_deadline = tokio::time::Instant::now() + stream_idle_timeout;
-        let mut anthropic_converter = match response_mode {
+        let mut stream_adapter = match response_mode {
             UpstreamResponseMode::Passthrough => None,
+            UpstreamResponseMode::Codex { namespaces } => Some(ResponseStreamAdapter::Codex(
+                codex::StreamRewriter::new(namespaces),
+            )),
             UpstreamResponseMode::ChatToAnthropic { expose_thinking } => {
                 Some(ResponseStreamAdapter::Chat(
                     anthropic::StreamConverter::new(public_model, expose_thinking),
@@ -1206,7 +1255,7 @@ fn streaming_response(
                         );
                         return;
                 },
-                _ = keepalive.tick(), if anthropic_stream => {
+                _ = keepalive.tick(), if needs_keepalive => {
                     permit.send(anthropic::ping_event());
                     continue;
                 },
@@ -1224,8 +1273,8 @@ fn streaming_response(
                         .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
                     let reached_expected =
                         expected_body_bytes.is_some_and(|expected| received_body_bytes >= expected);
-                    let mut bytes = if let Some(converter) = anthropic_converter.as_mut() {
-                        match converter.push(&bytes) {
+                    let mut bytes = if let Some(adapter) = stream_adapter.as_mut() {
+                        match adapter.push(&bytes) {
                             Ok(bytes) => bytes,
                             Err(error) => {
                                 fail_response_stream(
@@ -1241,8 +1290,8 @@ fn streaming_response(
                         bytes
                     };
                     if reached_expected {
-                        if let Some(converter) = anthropic_converter.as_mut() {
-                            match converter.finish() {
+                        if let Some(adapter) = stream_adapter.as_mut() {
+                            match adapter.finish() {
                                 Ok(tail) if !tail.is_empty() => {
                                     let mut joined =
                                         BytesMut::with_capacity(bytes.len() + tail.len());
@@ -1281,8 +1330,8 @@ fn streaming_response(
                     return;
                 }
                 None => {
-                    if let Some(converter) = anthropic_converter.as_mut() {
-                        match converter.finish() {
+                    if let Some(adapter) = stream_adapter.as_mut() {
+                        match adapter.finish() {
                             Ok(bytes) if !bytes.is_empty() => permit.send(bytes),
                             Ok(_) => {}
                             Err(error) => {
@@ -1306,7 +1355,6 @@ fn streaming_response(
         }
     });
 
-    let is_anthropic = response_mode.is_anthropic();
     let stream = async_stream::stream! {
         while let Some(bytes) = receiver.recv().await {
             yield Ok::<Bytes, io::Error>(bytes);
@@ -1323,11 +1371,13 @@ fn streaming_response(
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     copy_response_headers(&headers, response.headers_mut());
-    if is_anthropic {
+    if rewrites_body {
         response.headers_mut().remove(CONTENT_LENGTH);
+    }
+    if is_anthropic {
         anthropic::set_anthropic_content_type(&mut response, true);
     }
-    set_thinking_budget_warning(response_mode, response.headers_mut());
+    set_thinking_budget_warning(thinking_budget_approximated, response.headers_mut());
     if let Some(value) = upstream_request_id {
         response
             .headers_mut()
@@ -1353,8 +1403,8 @@ fn streaming_response(
     response
 }
 
-fn set_thinking_budget_warning(response_mode: UpstreamResponseMode, headers: &mut HeaderMap) {
-    if response_mode.thinking_budget_approximated() {
+fn set_thinking_budget_warning(approximated: bool, headers: &mut HeaderMap) {
+    if approximated {
         headers.insert(
             HeaderName::from_static("x-estuary-thinking-budget"),
             HeaderValue::from_static(THINKING_BUDGET_WARNING),

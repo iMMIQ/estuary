@@ -97,6 +97,42 @@ async fn spawn_gateway(nodes: Vec<NodeConfig>) -> TestServer {
     TestServer::spawn(gateway.public_router()).await
 }
 
+struct RunningGateway {
+    base_url: String,
+    task: JoinHandle<anyhow::Result<()>>,
+}
+
+impl RunningGateway {
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
+    }
+}
+
+impl Drop for RunningGateway {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn spawn_vllm_gateway(mut config: NodeConfig) -> RunningGateway {
+    config.provider.kind = ProviderKind::Vllm;
+    config.provider.monitor_interval_ms = 25;
+    config.provider.request_timeout_ms = 500;
+    config.provider.telemetry_stale_ms = 500;
+    let public = unused_address().await;
+    let admin = unused_address().await;
+    let mut settings = gateway_settings(vec![config]);
+    settings.server.listen = public.to_string();
+    settings.server.admin_listen = admin.to_string();
+    settings.server.withdrawal_delay_ms = 1;
+    let task = tokio::spawn(async move { Gateway::build(settings)?.run().await });
+    wait_for_success(&test_client(), &format!("http://{admin}/health/ready")).await;
+    RunningGateway {
+        base_url: format!("http://{public}"),
+        task,
+    }
+}
+
 async fn unused_address() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -946,6 +982,247 @@ async fn responses_named_sse_bytes_are_forwarded_unchanged_without_done() {
             .windows(b"[DONE]".len())
             .any(|window| window == b"[DONE]")
     );
+}
+
+#[derive(Clone)]
+struct CodexCapture {
+    sender: mpsc::UnboundedSender<Value>,
+}
+
+async fn codex_namespace_response(
+    State(capture): State<CodexCapture>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    capture.sender.send(body).expect("capture Codex request");
+    Json(json!({
+        "id": "resp_codex_1",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-oss-internal",
+        "output": [{
+            "id": "fc_1",
+            "type": "function_call",
+            "status": "completed",
+            "call_id": "call_2",
+            "name": "multi_agent_v1__spawn_agent",
+            "arguments": "{}"
+        }]
+    }))
+}
+
+fn codex_namespace_request(stream: bool) -> Value {
+    json!({
+        "model": "gpt-oss-public",
+        "stream": stream,
+        "store": false,
+        "client_metadata": {
+            "x-codex-installation-id": "00000000-0000-0000-0000-000000000000"
+        },
+        "tools": [{
+            "type": "function",
+            "name": "exec_command",
+            "description": "Run a command.",
+            "parameters": {"type": "object"}
+        }, {
+            "type": "namespace",
+            "name": "multi_agent_v1",
+            "description": "Manage workers.",
+            "tools": [{
+                "type": "function",
+                "name": "spawn_agent",
+                "description": "Start a worker.",
+                "parameters": {"type": "object"}
+            }]
+        }],
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "delegate"}]
+        }, {
+            "type": "function_call",
+            "id": "fc_previous",
+            "call_id": "call_previous",
+            "namespace": "multi_agent_v1",
+            "name": "spawn_agent",
+            "arguments": "{}"
+        }, {
+            "type": "function_call_output",
+            "call_id": "call_previous",
+            "output": "done"
+        }]
+    })
+}
+
+fn codex_vllm_node(upstream: &TestServer) -> NodeConfig {
+    node(
+        "codex-vllm",
+        upstream,
+        [("gpt-oss-public", "gpt-oss-internal")],
+    )
+}
+
+#[tokio::test]
+async fn codex_namespace_tools_round_trip_through_vllm_responses() {
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/version", axum::routing::get(vllm_version))
+            .route("/metrics", axum::routing::get(vllm_metrics))
+            .route(
+                "/v1/models",
+                axum::routing::get(|| async {
+                    Json(json!({"object": "list", "data": [{"id": "gpt-oss-internal"}]}))
+                }),
+            )
+            .route("/v1/responses", post(codex_namespace_response))
+            .with_state(CodexCapture { sender }),
+    )
+    .await;
+    let gateway = spawn_vllm_gateway(codex_vllm_node(&upstream)).await;
+
+    let response = test_client()
+        .post(gateway.url("/v1/responses"))
+        .header("user-agent", "codex_exec/0.146.0")
+        .json(&codex_namespace_request(false))
+        .send()
+        .await
+        .expect("Codex response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("content-length").is_none());
+    let response: Value = response.json().await.expect("Codex response JSON");
+    assert_eq!(response["output"][0]["namespace"], "multi_agent_v1");
+    assert_eq!(response["output"][0]["name"], "spawn_agent");
+
+    let upstream_body = receiver.recv().await.expect("upstream Codex request");
+    assert_eq!(upstream_body["model"], "gpt-oss-internal");
+    assert_eq!(upstream_body["tools"][0]["name"], "exec_command");
+    assert_eq!(
+        upstream_body["tools"][1]["name"],
+        "multi_agent_v1__spawn_agent"
+    );
+    assert_eq!(
+        upstream_body["input"][1]["name"],
+        "multi_agent_v1__spawn_agent"
+    );
+    assert!(upstream_body["input"][1].get("namespace").is_none());
+}
+
+async fn codex_namespace_sse(Json(_body): Json<Value>) -> Response {
+    static SSE: &[u8] = concat!(
+        "event: response.output_item.added\r\n",
+        "data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"name\":\"multi_agent_v1__spawn_agent\",\"call_id\":\"call_1\",\"arguments\":\"\"}}\r\n\r\n",
+        "event: response.output_item.done\r\n",
+        "data: {\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"name\":\"multi_agent_v1__spawn_agent\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}}\r\n\r\n",
+        "event: response.completed\r\n",
+        "data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"id\":\"fc_1\",\"type\":\"function_call\",\"name\":\"multi_agent_v1__spawn_agent\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}]}}\r\n\r\n",
+        "data: [DONE]\r\n\r\n"
+    )
+    .as_bytes();
+    let chunks = SSE
+        .chunks(17)
+        .map(Bytes::copy_from_slice)
+        .map(Ok::<_, Infallible>);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(stream::iter(chunks)))
+        .expect("Codex SSE response")
+}
+
+#[tokio::test]
+async fn codex_namespace_sse_is_restored_across_upstream_chunks() {
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/version", axum::routing::get(vllm_version))
+            .route("/metrics", axum::routing::get(vllm_metrics))
+            .route(
+                "/v1/models",
+                axum::routing::get(|| async {
+                    Json(json!({"object": "list", "data": [{"id": "gpt-oss-internal"}]}))
+                }),
+            )
+            .route("/v1/responses", post(codex_namespace_sse)),
+    )
+    .await;
+    let gateway = spawn_vllm_gateway(codex_vllm_node(&upstream)).await;
+    let response = test_client()
+        .post(gateway.url("/v1/responses"))
+        .header("user-agent", "codex_exec/0.146.0")
+        .json(&codex_namespace_request(true))
+        .send()
+        .await
+        .expect("Codex SSE response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-accel-buffering")
+            .and_then(|value| value.to_str().ok()),
+        Some("no")
+    );
+    let body = response.text().await.expect("Codex SSE body");
+    assert!(!body.contains("multi_agent_v1__spawn_agent"));
+    assert_eq!(body.matches("\"namespace\":\"multi_agent_v1\"").count(), 3);
+    assert_eq!(body.matches("\"name\":\"spawn_agent\"").count(), 3);
+    assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn codex_vllm_incompatible_tools_return_actionable_400() {
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/version", axum::routing::get(vllm_version))
+            .route("/metrics", axum::routing::get(vllm_metrics))
+            .route(
+                "/v1/models",
+                axum::routing::get(|| async {
+                    Json(json!({"object": "list", "data": [{"id": "gpt-oss-internal"}]}))
+                }),
+            ),
+    )
+    .await;
+    let gateway = spawn_vllm_gateway(codex_vllm_node(&upstream)).await;
+    for (request, expected) in [
+        (
+            json!({
+                "model": "gpt-oss-public",
+                "stream": true,
+                "input": "search",
+                "tools": [{"type": "web_search"}]
+            }),
+            "web_search = \"disabled\"",
+        ),
+        (
+            json!({
+                "model": "gpt-oss-public",
+                "stream": true,
+                "input": [{
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": []
+                }]
+            }),
+            "use_responses_lite: false",
+        ),
+    ] {
+        let response = test_client()
+            .post(gateway.url("/v1/responses"))
+            .header("user-agent", "codex_exec/0.146.0")
+            .json(&request)
+            .send()
+            .await
+            .expect("Codex compatibility error");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = response.json().await.expect("OpenAI error JSON");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(expected)),
+            "{body}"
+        );
+    }
 }
 
 #[tokio::test]

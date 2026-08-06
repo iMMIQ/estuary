@@ -14,7 +14,7 @@ This repository contains the phase-one gateway foundation plus a native vLLM pro
 | `GET /v1/models` | Returns the configured public model names, de-duplicated and sorted. Wildcard mappings are not listed. |
 | `GET /v1/models/{model}` | Returns a configured public model or an OpenAI-shaped `404` error. |
 | `POST /v1/chat/completions` | Foreground, non-streaming and SSE streaming pass-through, including unknown OpenAI-compatible fields. |
-| `POST /v1/responses` | Foreground create, non-streaming and SSE streaming pass-through. Durable follow-up operations are not supported. |
+| `POST /v1/responses` | Foreground create, non-streaming and SSE streaming. Ordinary clients pass through; detected Codex requests selected onto vLLM receive the compatibility mapping described below. Durable follow-up operations are not supported. |
 | `POST /v1/completions` | Compatibility pass-through with model routing and prefix affinity. |
 | `POST /v1/embeddings` | Compatibility pass-through with model routing. |
 | `POST /v1/messages` | Anthropic Messages, including streaming, thinking, tools, model aliases, Claude Code request cleanup, and keep-alive pings. Each node can use native Messages, OpenAI Responses, or Chat Completions upstream. |
@@ -39,6 +39,29 @@ Responses state is explicitly rejected with an OpenAI-shaped `400` response:
 These operations require a durable response-to-node mapping. Silently routing them to another node would be incorrect.
 
 The `store` field is not changed or rejected. If it is true, or an upstream stores Responses by default, that object may be persisted upstream but cannot be retrieved through this phase-one gateway. Set `store: false` when that distinction matters.
+
+## Codex with vLLM
+
+Codex uses the Responses API and replays the complete turn history. Point Codex at Estuary with a provider in `~/.codex/config.toml`:
+
+```toml
+model_provider = "estuary"
+model = "gpt-oss-20b"
+web_search = "disabled"
+
+[model_providers.estuary]
+name = "Estuary"
+base_url = "http://127.0.0.1:8080/v1"
+wire_api = "responses"
+requires_openai_auth = false
+
+[features]
+multi_agent = true
+```
+
+Use the public model name configured in Estuary. Multi-agent mode can remain enabled: when a request is identifiable as Codex and is assigned to a vLLM node, Estuary flattens Codex namespace functions to collision-checked vLLM function names and restores `namespace` plus `name` in both buffered and SSE responses. Standard functions, structured output, image input, full-history replay, and `prompt_cache_key` otherwise retain their Responses shapes.
+
+The selected Codex model profile must use the full Responses request shape (`use_responses_lite: false` in Codex model metadata). Responses Lite custom calls, tool-search items, and `additional_tools` cannot be rendered by vLLM 0.25's Harmony path and receive an actionable `400`. Estuary also rejects Codex web search because this deployment has no search backend; keep `web_search = "disabled"`. If an existing thread already contains one of these unsupported history items, start a new thread after changing the setting. These checks apply only to detected Codex requests routed to vLLM nodes; ordinary OpenAI-compatible Responses traffic remains unchanged.
 
 ## Important production boundaries
 
