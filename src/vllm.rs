@@ -25,7 +25,7 @@ use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage
 use crate::{
     config::{ProviderKind, VllmKvEventsConfig},
     kv_cache::{BlockHash, CacheMutation, ExactCacheDirectory},
-    node::{Node, ProviderState, VllmMetricsSnapshot},
+    node::{HealthState, Node, ProviderState, VllmMetricsSnapshot},
     prefix::PrefixDirectory,
     scheduler::Scheduler,
 };
@@ -33,6 +33,11 @@ use crate::{
 const MIN_VLLM_VERSION: Version = Version::new(0, 25, 0);
 const MAX_MANAGEMENT_BODY_BYTES: usize = 8 * 1024 * 1024;
 const VERSION_RECHECK_TICKS: u64 = 30;
+const KV_HEALTH_POLL_MAX: Duration = Duration::from_millis(250);
+
+#[derive(Debug, thiserror::Error)]
+#[error("vLLM upstream is unhealthy; full KV replay is required")]
+struct KvUpstreamUnhealthy;
 
 #[derive(Debug)]
 pub struct VllmManager {
@@ -691,9 +696,42 @@ async fn run_event_supervisor(
 ) {
     let mut last_seq = None;
     let mut synchronized = false;
+    let mut suspended_for_health = false;
     loop {
         if *shutdown.borrow() {
             break;
+        }
+        if node.health() == HealthState::Unhealthy {
+            if !suspended_for_health {
+                reset_unhealthy_cache_state(
+                    &node,
+                    &exact_cache,
+                    &prefix,
+                    &mut last_seq,
+                    &mut synchronized,
+                );
+                suspended_for_health = true;
+                warn!(
+                    node = node.id(),
+                    "vLLM upstream is unhealthy; KV cache routing suspended"
+                );
+            }
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                () = tokio::time::sleep(kv_health_poll_interval(&config)) => {}
+            }
+            continue;
+        }
+        if suspended_for_health {
+            suspended_for_health = false;
+            info!(
+                node = node.id(),
+                "vLLM upstream recovered; rebuilding KV cache state from replay"
+            );
         }
         match run_event_session(
             &node,
@@ -708,9 +746,27 @@ async fn run_event_supervisor(
         {
             Ok(()) => break,
             Err(error) => {
-                exact_cache.suspend_node_owned(node.id(), node.instance_id());
-                node.record_kv_event_error(format!("KV event subscriber failed: {error}"));
-                warn!(node = node.id(), error = %error, "vLLM KV event subscriber disconnected");
+                let session_detected_unhealthy = error.is::<KvUpstreamUnhealthy>();
+                if session_detected_unhealthy || node.health() == HealthState::Unhealthy {
+                    if !session_detected_unhealthy && !suspended_for_health {
+                        reset_unhealthy_cache_state(
+                            &node,
+                            &exact_cache,
+                            &prefix,
+                            &mut last_seq,
+                            &mut synchronized,
+                        );
+                    }
+                    suspended_for_health = true;
+                    warn!(
+                        node = node.id(),
+                        "vLLM upstream became unhealthy; KV cache routing suspended"
+                    );
+                } else {
+                    exact_cache.suspend_node_owned(node.id(), node.instance_id());
+                    node.record_kv_event_error(format!("KV event subscriber failed: {error}"));
+                    warn!(node = node.id(), error = %error, "vLLM KV event subscriber disconnected");
+                }
             }
         }
         tokio::select! {
@@ -756,7 +812,10 @@ async fn run_event_session(
                 exact_cache.resume_node_owned(node.id(), node.instance_id());
                 node.record_kv_event_success();
             }
-            Ok(None) => {}
+            Ok(None) => {
+                synchronize_empty_replay(node, exact_cache, prefix, synchronized)?;
+                node.record_kv_event_success();
+            }
             Err(error) => {
                 invalidate_cache_state(node, exact_cache, prefix);
                 *last_seq = None;
@@ -767,6 +826,8 @@ async fn run_event_session(
         }
     }
 
+    let mut health_interval = tokio::time::interval(kv_health_poll_interval(config));
+    health_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         if node.is_retired() {
             return Ok(());
@@ -775,6 +836,19 @@ async fn run_event_session(
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
+                }
+                continue;
+            }
+            _ = health_interval.tick() => {
+                if node.health() == HealthState::Unhealthy {
+                    reset_unhealthy_cache_state(
+                        node,
+                        exact_cache,
+                        prefix,
+                        last_seq,
+                        synchronized,
+                    );
+                    return Err(KvUpstreamUnhealthy.into());
                 }
                 continue;
             }
@@ -862,6 +936,38 @@ async fn run_event_session(
         }
         *last_seq = synchronized.then_some(seq);
     }
+}
+
+fn kv_health_poll_interval(config: &VllmKvEventsConfig) -> Duration {
+    Duration::from_millis(config.reconnect_ms).min(KV_HEALTH_POLL_MAX)
+}
+
+fn reset_unhealthy_cache_state(
+    node: &Node,
+    exact_cache: &ExactCacheDirectory,
+    prefix: &PrefixDirectory,
+    last_seq: &mut Option<u64>,
+    synchronized: &mut bool,
+) {
+    invalidate_cache_state(node, exact_cache, prefix);
+    *last_seq = None;
+    *synchronized = false;
+    node.record_kv_event_error(
+        "KV cache state invalidated because the vLLM upstream is unhealthy; awaiting full replay"
+            .to_owned(),
+    );
+}
+
+fn synchronize_empty_replay(
+    node: &Node,
+    exact_cache: &ExactCacheDirectory,
+    prefix: &PrefixDirectory,
+    synchronized: &mut bool,
+) -> Result<()> {
+    exact_cache.apply_owned(node.id(), node.instance_id(), vec![CacheMutation::Clear])?;
+    prefix.clear_node(node.id());
+    *synchronized = true;
+    Ok(())
 }
 
 fn replay_start_sequence(last_seq: Option<u64>, synchronized: bool) -> u64 {
@@ -1197,7 +1303,9 @@ mod tests {
     use zeromq::PubSocket;
 
     use super::*;
-    use crate::config::{NodeConfig, PrefixConfig, ProviderConfig, VllmKvEventsConfig};
+    use crate::config::{
+        HealthConfig, NodeConfig, PrefixConfig, ProviderConfig, VllmKvEventsConfig,
+    };
 
     async fn management_server(version: &'static str) -> (String, JoinHandle<()>) {
         let router = Router::new()
@@ -1441,6 +1549,105 @@ vllm:num_preemptions_total{model_name="a"} 2
     fn unsynchronized_replay_restarts_from_zero() {
         assert_eq!(replay_start_sequence(Some(41), false), 0);
         assert_eq!(replay_start_sequence(Some(41), true), 42);
+    }
+
+    #[test]
+    fn successful_empty_replay_establishes_an_authoritative_empty_directory() {
+        let node = vllm_node("http://127.0.0.1:1");
+        let exact = ExactCacheDirectory::default();
+        exact.configure_node_owned(node.id(), 10, usize::MAX, node.instance_id());
+        exact
+            .apply_owned(
+                node.id(),
+                node.instance_id(),
+                vec![CacheMutation::Store {
+                    hashes: vec![BlockHash::Integer(1)],
+                    parent: None,
+                    token_ids: vec![1, 2],
+                    block_size: 2,
+                    group: 0,
+                }],
+            )
+            .unwrap();
+        let prefix = PrefixDirectory::new(&PrefixConfig::default());
+        let mut synchronized = false;
+
+        synchronize_empty_replay(&node, &exact, &prefix, &mut synchronized).unwrap();
+
+        let snapshot = exact.snapshot(node.id());
+        assert!(synchronized);
+        assert!(snapshot.authoritative);
+        assert_eq!(snapshot.blocks, 0);
+    }
+
+    #[tokio::test]
+    async fn unhealthy_upstream_invalidates_a_silent_subscriber_session() {
+        let mut publisher = PubSocket::new();
+        let endpoint = publisher
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .unwrap()
+            .to_string();
+        let node = vllm_node("http://127.0.0.1:1");
+        let health = HealthConfig {
+            healthy_threshold: 1,
+            unhealthy_threshold: 1,
+            ..HealthConfig::default()
+        };
+        node.record_probe_success(&health);
+        let exact = Arc::new(ExactCacheDirectory::default());
+        exact.configure_node_owned(node.id(), 10, usize::MAX, node.instance_id());
+        exact
+            .apply_owned(
+                node.id(),
+                node.instance_id(),
+                vec![CacheMutation::Store {
+                    hashes: vec![BlockHash::Integer(1)],
+                    parent: None,
+                    token_ids: vec![1, 2],
+                    block_size: 2,
+                    group: 0,
+                }],
+            )
+            .unwrap();
+        let prefix = Arc::new(PrefixDirectory::new(&PrefixConfig::default()));
+        let config = VllmKvEventsConfig {
+            endpoint,
+            reconnect_ms: 10,
+            ..VllmKvEventsConfig::default()
+        };
+        let (_shutdown, mut receiver) = watch::channel(false);
+        let task_node = Arc::clone(&node);
+        let task_exact = Arc::clone(&exact);
+        let task_prefix = Arc::clone(&prefix);
+        let task = tokio::spawn(async move {
+            let mut last_seq = Some(0);
+            let mut synchronized = true;
+            run_event_session(
+                &task_node,
+                &task_exact,
+                &task_prefix,
+                &config,
+                &mut last_seq,
+                &mut synchronized,
+                &mut receiver,
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        node.record_probe_failure("upstream stopped", &health);
+        let error = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("silent ZMQ subscriber should observe unhealthy upstream")
+            .unwrap()
+            .unwrap_err();
+
+        assert!(error.is::<KvUpstreamUnhealthy>());
+        let snapshot = exact.snapshot(node.id());
+        assert!(!snapshot.authoritative);
+        assert_eq!(snapshot.blocks, 0);
+        assert_eq!(node.provider_generation(), 1);
     }
 
     #[tokio::test]
