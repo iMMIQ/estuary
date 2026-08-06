@@ -1,9 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use serde_json::Value;
 
-use crate::error::GatewayError;
+use crate::{error::GatewayError, sse};
 
 const NAMESPACE_SEPARATOR: &str = "__";
 
@@ -316,99 +316,46 @@ fn rewrite_value(value: &mut Value, namespaces: &NamespaceMap) {
 }
 
 pub(crate) struct StreamRewriter {
-    buffer: BytesMut,
     namespaces: Arc<NamespaceMap>,
 }
 
 impl StreamRewriter {
     pub(crate) fn new(namespaces: Arc<NamespaceMap>) -> Self {
-        Self {
-            buffer: BytesMut::new(),
-            namespaces,
-        }
+        Self { namespaces }
     }
 
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Bytes, GatewayError> {
-        self.buffer.extend_from_slice(bytes);
-        let mut output = Vec::new();
-        while let Some((end, delimiter)) = frame_end(&self.buffer) {
-            let frame = self.buffer.split_to(end);
-            let _ = self.buffer.split_to(delimiter);
-            rewrite_sse_frame(&frame, delimiter, &self.namespaces, &mut output)?;
+    pub(crate) fn push_event(
+        &mut self,
+        mut event: sse::Event,
+    ) -> Result<Vec<sse::Event>, GatewayError> {
+        if event.data() != "[DONE]" {
+            let mut value: Value = serde_json::from_str(event.data())
+                .map_err(|_| GatewayError::InvalidUpstreamResponse)?;
+            rewrite_value(&mut value, &self.namespaces);
+            event.set_data(serde_json::to_string(&value).map_err(|_| GatewayError::Internal)?);
         }
-        Ok(Bytes::from(output))
+        Ok(vec![event])
     }
-
-    pub(crate) fn finish(&mut self) -> Result<Bytes, GatewayError> {
-        if !self.buffer.iter().all(u8::is_ascii_whitespace) {
-            return Err(GatewayError::InvalidUpstreamResponse);
-        }
-        self.buffer.clear();
-        Ok(Bytes::new())
-    }
-}
-
-fn frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
-    let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(lf), Some(crlf)) if lf < crlf => Some((lf, 2)),
-        (_, Some(crlf)) => Some((crlf, 4)),
-        (Some(lf), None) => Some((lf, 2)),
-        (None, None) => None,
-    }
-}
-
-fn rewrite_sse_frame(
-    frame: &[u8],
-    delimiter: usize,
-    namespaces: &NamespaceMap,
-    output: &mut Vec<u8>,
-) -> Result<(), GatewayError> {
-    let text = std::str::from_utf8(frame).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
-    let newline = if delimiter == 4 { "\r\n" } else { "\n" };
-    let lines = text
-        .split('\n')
-        .map(|line| line.strip_suffix('\r').unwrap_or(line))
-        .collect::<Vec<_>>();
-    let data = lines
-        .iter()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>();
-    if data.is_empty() || data == ["[DONE]"] {
-        output.extend_from_slice(frame);
-        output.extend_from_slice(newline.as_bytes());
-        output.extend_from_slice(newline.as_bytes());
-        return Ok(());
-    }
-    let mut value: Value = serde_json::from_str(&data.join("\n"))
-        .map_err(|_| GatewayError::InvalidUpstreamResponse)?;
-    rewrite_value(&mut value, namespaces);
-    let encoded = serde_json::to_string(&value).map_err(|_| GatewayError::Internal)?;
-    let mut emitted_data = false;
-    for line in lines {
-        if line.starts_with("data:") {
-            if emitted_data {
-                continue;
-            }
-            output.extend_from_slice(b"data: ");
-            output.extend_from_slice(encoded.as_bytes());
-            emitted_data = true;
-        } else {
-            output.extend_from_slice(line.as_bytes());
-        }
-        output.extend_from_slice(newline.as_bytes());
-    }
-    output.extend_from_slice(newline.as_bytes());
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use serde_json::json;
 
     use super::*;
+
+    async fn rewrite_stream(chunks: Vec<&[u8]>, namespaces: Arc<NamespaceMap>) -> String {
+        let events = sse::parse_chunks(chunks.into_iter().map(Bytes::copy_from_slice).collect())
+            .await
+            .expect("parse SSE");
+        let mut rewriter = StreamRewriter::new(namespaces);
+        let mut output = Vec::new();
+        for event in events {
+            output.extend(rewriter.push_event(event).expect("rewrite event"));
+        }
+        String::from_utf8(sse::encode(output).await.to_vec()).expect("UTF-8 output")
+    }
 
     #[test]
     fn flattens_namespace_tools_and_history() {
@@ -455,8 +402,8 @@ mod tests {
         assert_eq!(response["output"][0]["name"], "spawn_agent");
     }
 
-    #[test]
-    fn rewrites_split_sse_frames() {
+    #[tokio::test]
+    async fn rewrites_split_sse_frames() {
         let mut request = json!({
             "tools": [{"type":"namespace","name":"web","tools":[{
                 "type":"function","name":"run","parameters":{"type":"object"}
@@ -472,21 +419,15 @@ mod tests {
             "data: [DONE]\r\n\r\n"
         );
         let split = source.len() / 3;
-        let mut rewriter = StreamRewriter::new(namespaces);
-        let mut output = Vec::new();
-        output.extend_from_slice(&rewriter.push(&source.as_bytes()[..split]).expect("part 1"));
-        output.extend_from_slice(
-            &rewriter
-                .push(&source.as_bytes()[split..split * 2])
-                .expect("part 2"),
-        );
-        output.extend_from_slice(
-            &rewriter
-                .push(&source.as_bytes()[split * 2..])
-                .expect("part 3"),
-        );
-        output.extend_from_slice(&rewriter.finish().expect("finish"));
-        let output = String::from_utf8(output).expect("UTF-8 output");
+        let output = rewrite_stream(
+            vec![
+                &source.as_bytes()[..split],
+                &source.as_bytes()[split..split * 2],
+                &source.as_bytes()[split * 2..],
+            ],
+            namespaces,
+        )
+        .await;
         assert!(output.contains("\"name\":\"run\",\"namespace\":\"web\""));
         assert!(output.contains("data: [DONE]"));
     }
@@ -526,8 +467,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn processes_the_earliest_sse_frame_with_mixed_newlines() {
+    #[tokio::test]
+    async fn processes_the_earliest_sse_frame_with_mixed_newlines() {
         let mut request = json!({
             "tools": [{"type":"namespace","name":"web","tools":[{
                 "type":"function","name":"run","parameters":{"type":"object"}
@@ -540,10 +481,8 @@ mod tests {
             "data: {\"type\":\"function_call\",\"name\":\"web__run\"}\n\n",
             "data: [DONE]\r\n\r\n"
         );
-        let mut rewriter = StreamRewriter::new(namespaces);
-        let output = rewriter.push(source.as_bytes()).expect("rewrite frames");
-        let output = String::from_utf8(output.to_vec()).expect("UTF-8 output");
+        let output = rewrite_stream(vec![source.as_bytes()], namespaces).await;
         assert!(output.starts_with("data: {\"name\":\"run\",\"namespace\":\"web\""));
-        assert!(output.ends_with("data: [DONE]\r\n\r\n"));
+        assert!(output.ends_with("data: [DONE]\n\n"));
     }
 }

@@ -3,11 +3,38 @@ use std::{path::Path, sync::Arc, time::Duration};
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite_migration::{M, Migrations};
 use serde::Serialize;
 
 use crate::config::{NodeConfig, validate_node_config};
 
-const SCHEMA_VERSION: i64 = 1;
+const MIGRATION_LIST: &[M<'static>] = &[M::up(
+    "CREATE TABLE node_configs (
+        id TEXT PRIMARY KEY NOT NULL,
+        config_json TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        created_at_unix_ms INTEGER NOT NULL,
+        updated_at_unix_ms INTEGER NOT NULL
+    );
+    CREATE TABLE control_state (
+        singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+        revision INTEGER NOT NULL CHECK (revision > 0)
+    );
+    INSERT INTO control_state (singleton, revision) VALUES (1, 1);
+    CREATE TRIGGER node_configs_control_insert
+    AFTER INSERT ON node_configs BEGIN
+        UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
+    END;
+    CREATE TRIGGER node_configs_control_update
+    AFTER UPDATE ON node_configs BEGIN
+        UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
+    END;
+    CREATE TRIGGER node_configs_control_delete
+    AFTER DELETE ON node_configs BEGIN
+        UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
+    END;",
+)];
+const MIGRATIONS: Migrations<'static> = Migrations::from_slice(MIGRATION_LIST);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct StoredNode {
@@ -48,42 +75,9 @@ impl NodeStore {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "wal_autocheckpoint", 1_000)?;
         connection.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(
-            "CREATE TABLE IF NOT EXISTS node_configs (
-                id TEXT PRIMARY KEY NOT NULL,
-                config_json TEXT NOT NULL,
-                revision INTEGER NOT NULL CHECK (revision > 0),
-                created_at_unix_ms INTEGER NOT NULL,
-                updated_at_unix_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS control_state (
-                singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
-                revision INTEGER NOT NULL CHECK (revision > 0)
-            );
-            INSERT OR IGNORE INTO control_state (singleton, revision) VALUES (1, 1);
-            CREATE TRIGGER IF NOT EXISTS node_configs_control_insert
-            AFTER INSERT ON node_configs BEGIN
-                UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
-            END;
-            CREATE TRIGGER IF NOT EXISTS node_configs_control_update
-            AFTER UPDATE ON node_configs BEGIN
-                UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
-            END;
-            CREATE TRIGGER IF NOT EXISTS node_configs_control_delete
-            AFTER DELETE ON node_configs BEGIN
-                UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
-            END;",
-        )?;
-        let current: i64 =
-            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if current > SCHEMA_VERSION {
-            bail!(
-                "database schema version {current} is newer than supported version {SCHEMA_VERSION}"
-            );
-        }
-        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        transaction.commit()?;
+        MIGRATIONS
+            .to_latest(&mut connection)
+            .context("failed to migrate SQLite schema")?;
         Ok(Arc::new(Self {
             connection: Mutex::new(connection),
         }))

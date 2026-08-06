@@ -36,6 +36,7 @@ use reqwest::redirect::Policy;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpListener,
@@ -92,6 +93,7 @@ struct BoundedTcpListener {
     permits: Arc<Semaphore>,
     metrics: Arc<Metrics>,
     track_public: bool,
+    accept_cancellation: CancellationToken,
 }
 
 impl BoundedTcpListener {
@@ -100,12 +102,14 @@ impl BoundedTcpListener {
         max_connections: usize,
         metrics: Arc<Metrics>,
         track_public: bool,
+        accept_cancellation: CancellationToken,
     ) -> Self {
         Self {
             inner,
             permits: Arc::new(Semaphore::new(max_connections)),
             metrics,
             track_public,
+            accept_cancellation,
         }
     }
 }
@@ -115,12 +119,20 @@ impl Listener for BoundedTcpListener {
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        let permit = Arc::clone(&self.permits)
-            .acquire_owned()
-            .await
-            .expect("public connection semaphore is never closed");
+        let permit = tokio::select! {
+            biased;
+            () = self.accept_cancellation.cancelled() => std::future::pending().await,
+            permit = Arc::clone(&self.permits).acquire_owned() => {
+                permit.expect("public connection semaphore is never closed")
+            }
+        };
         loop {
-            match self.inner.accept().await {
+            let accepted = tokio::select! {
+                biased;
+                () = self.accept_cancellation.cancelled() => std::future::pending().await,
+                accepted = self.inner.accept() => accepted,
+            };
+            match accepted {
                 Ok((stream, address)) => {
                     if self.track_public {
                         self.metrics.public_connection_opened();
@@ -345,7 +357,7 @@ impl Gateway {
         let public_listener = TcpListener::bind(public_address)
             .await
             .with_context(|| format!("failed to bind public listener on {public_address}"))?;
-        self.run_with_listener(public_listener).await
+        self.run_with_listener(public_listener, false).await
     }
 
     pub async fn run_with_public_listener(self, listener: StdTcpListener) -> Result<()> {
@@ -354,11 +366,15 @@ impl Gateway {
             .context("failed to make inherited public listener non-blocking")?;
         let listener = TcpListener::from_std(listener)
             .context("failed to register inherited public listener with Tokio")?;
-        self.run_with_listener(listener).await
+        self.run_with_listener(listener, true).await
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn run_with_listener(self, public_listener: TcpListener) -> Result<()> {
+    async fn run_with_listener(
+        self,
+        public_listener: TcpListener,
+        stop_accept_before_withdrawal: bool,
+    ) -> Result<()> {
         let public_address = public_listener.local_addr()?;
         let admin_address: SocketAddr = self.state.settings.server.admin_listen.parse()?;
         let admin_listener = TcpListener::bind(admin_address)
@@ -369,6 +385,7 @@ impl Gateway {
 
         let public_cancellation = CancellationToken::new();
         let admin_cancellation = CancellationToken::new();
+        let public_accept_cancellation = CancellationToken::new();
         let (health_shutdown, health_receiver) = watch::channel(false);
         let (provider_shutdown, provider_receiver) = watch::channel(false);
         let (control_shutdown, control_receiver) = watch::channel(false);
@@ -391,12 +408,14 @@ impl Gateway {
             self.state.settings.server.max_connections,
             Arc::clone(&self.state.metrics),
             true,
+            public_accept_cancellation.clone(),
         );
         let admin_listener = BoundedTcpListener::new(
             admin_listener,
             self.state.settings.server.max_admin_connections,
             Arc::clone(&self.state.metrics),
             false,
+            admin_cancellation.clone(),
         );
         let public_router = self.public_router();
         let admin_router = self.admin_router();
@@ -474,7 +493,9 @@ impl Gateway {
                 &mut public_handle,
                 &mut admin_handle,
                 &public_cancellation,
+                &public_accept_cancellation,
                 &admin_cancellation,
+                stop_accept_before_withdrawal,
             )
             .await
         {
@@ -504,6 +525,7 @@ impl Gateway {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn drain_http_servers(
         &self,
         public_done: bool,
@@ -511,10 +533,15 @@ impl Gateway {
         public_handle: &mut JoinHandle<std::io::Result<()>>,
         admin_handle: &mut JoinHandle<std::io::Result<()>>,
         public_cancellation: &CancellationToken,
+        public_accept_cancellation: &CancellationToken,
         admin_cancellation: &CancellationToken,
+        stop_accept_before_withdrawal: bool,
     ) -> Option<anyhow::Error> {
         let withdrawal_delay =
             Duration::from_millis(self.state.settings.server.withdrawal_delay_ms);
+        if !public_done && stop_accept_before_withdrawal {
+            public_accept_cancellation.cancel();
+        }
         if !public_done && !withdrawal_delay.is_zero() {
             info!(
                 ?withdrawal_delay,
@@ -524,6 +551,7 @@ impl Gateway {
         }
 
         self.state.process.mark_draining();
+        public_accept_cancellation.cancel();
         public_cancellation.cancel();
         let shutdown_grace = Duration::from_millis(self.state.settings.server.shutdown_grace_ms);
         let deadline = tokio::time::Instant::now() + shutdown_grace;
@@ -599,7 +627,7 @@ async fn authorize_admin(
             .and_then(|value| value.to_str().ok())
             .and_then(admin_authorization_token);
         if !candidate
-            .is_some_and(|candidate| constant_time_eq(candidate.as_bytes(), expected.as_bytes()))
+            .is_some_and(|candidate| bool::from(candidate.as_bytes().ct_eq(expected.as_bytes())))
         {
             return Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
@@ -654,18 +682,6 @@ fn admin_authorization_token(value: &str) -> Option<String> {
     decoded
         .split_once(':')
         .map(|(_, password)| password.to_owned())
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (*left ^ *right)
-        })
-        == 0
 }
 
 async fn run_control_reconciler(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
@@ -1719,7 +1735,13 @@ mod tests {
         let inner = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = inner.local_addr().unwrap();
         let metrics = Metrics::new();
-        let mut listener = BoundedTcpListener::new(inner, 1, Arc::clone(&metrics), true);
+        let mut listener = BoundedTcpListener::new(
+            inner,
+            1,
+            Arc::clone(&metrics),
+            true,
+            CancellationToken::new(),
+        );
 
         let first_client = tokio::net::TcpStream::connect(address).await.unwrap();
         let (first_server, _) = listener.accept().await;

@@ -10,7 +10,6 @@ import {
   PauseCircle,
   Play,
   Server,
-  ShieldCheck,
   Trash2,
 } from "lucide-react";
 import type { ReactNode } from "react";
@@ -91,10 +90,8 @@ export function NodeDetails({
       <Tabs defaultValue="overview" className="node-tabs">
         <Tabs.List>
           <Tabs.Tab value="overview">Overview</Tabs.Tab>
-          <Tabs.Tab value="health">Health</Tabs.Tab>
           <Tabs.Tab value="metrics">Metrics</Tabs.Tab>
           <Tabs.Tab value="models">Models</Tabs.Tab>
-          <Tabs.Tab value="config">Config</Tabs.Tab>
         </Tabs.List>
 
         <Tabs.Panel value="overview" pt="md">
@@ -136,22 +133,10 @@ export function NodeDetails({
               <DataRow label="Status" value={<StatusBadge value={runtime.provider_state} />} />
               <DataRow label="Provider" value={isVllm ? "vLLM 0.25+" : "OpenAI compatible"} />
               <DataRow label="Anthropic protocol" value={anthropicProtocolLabels[node.config.provider.anthropic_protocol]} />
+              <DataRow label="Bearer credential" value={node.credentials.api_key_source === "database" ? "Configured in database" : node.credentials.api_key_source === "environment" ? "Configured by environment" : "Not configured"} />
               <DataRow label="Warnings" value={runtime.provider_last_error ? 1 : 0} />
               <DataRow label="Generation" value={runtime.provider_generation} />
             </RuntimeCard>
-          </div>
-        </Tabs.Panel>
-
-        <Tabs.Panel value="health" pt="md">
-          <div className="single-tab-panel">
-            <ShieldCheck size={18} />
-            <div><h2>Health checks</h2><p>Current health and circuit state reported by the runtime monitor.</p></div>
-            <div className="tab-data-grid">
-              <DataRow label="Health" value={<StatusBadge value={runtime.health} />} />
-              <DataRow label="Lifecycle" value={<StatusBadge value={runtime.lifecycle} />} />
-              <DataRow label="Circuit" value={<StatusBadge value={runtime.circuit} />} />
-              <DataRow label="Health endpoint" value={node.config.health_path} />
-            </div>
           </div>
         </Tabs.Panel>
 
@@ -177,18 +162,6 @@ export function NodeDetails({
           </section>
         </Tabs.Panel>
 
-        <Tabs.Panel value="config" pt="md">
-          <section className="config-panel">
-            <DataRow label="Node ID" value={node.config.id} />
-            <DataRow label="Base URL" value={node.config.base_url} />
-            <DataRow label="Provider" value={node.config.provider.type} />
-            <DataRow label="Anthropic protocol" value={anthropicProtocolLabels[node.config.provider.anthropic_protocol]} />
-            <DataRow label="Max concurrency" value={node.config.max_concurrency} />
-            <DataRow label="Scheduling weight" value={node.config.weight} />
-            <DataRow label="Health path" value={node.config.health_path} />
-            <DataRow label="Bearer credential" value={node.credentials.api_key_source === "database" ? "Configured in database" : node.credentials.api_key_source === "environment" ? "Configured by environment" : "Not configured"} />
-          </section>
-        </Tabs.Panel>
       </Tabs>
     </div>
   );

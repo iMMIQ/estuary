@@ -6,6 +6,10 @@ use std::{
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -136,13 +140,22 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
     assert!(!supervisor.runtime.join("admin.freeze").exists());
     assert_public_available(public).await?;
 
-    let availability = tokio::spawn(assert_public_stays_available(public, 80));
+    let stop_requests = Arc::new(AtomicBool::new(false));
+    let availability = (0..8)
+        .map(|_| {
+            let stop = Arc::clone(&stop_requests);
+            tokio::spawn(assert_public_stays_available(public, stop))
+        })
+        .collect::<Vec<_>>();
     let rolled = control_request(
         &supervisor.runtime,
         json!({"command": "rollout", "release": candidate}),
     )
     .await?;
-    availability.await??;
+    stop_requests.store(true, Ordering::Release);
+    for task in availability {
+        assert!(task.await?? > 0);
+    }
     assert_eq!(rolled["ok"], true, "{rolled:#}");
     assert_running_slots(&rolled, &releases.join("candidate"))?;
     assert_eq!(state.join("current").canonicalize()?, candidate);
@@ -267,11 +280,16 @@ async fn assert_public_available(public: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-async fn assert_public_stays_available(public: SocketAddr, requests: usize) -> Result<()> {
-    let client = reqwest::Client::new();
-    for _ in 0..requests {
+async fn assert_public_stays_available(public: SocketAddr, stop: Arc<AtomicBool>) -> Result<usize> {
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .http1_only()
+        .build()?;
+    let mut requests = 0;
+    while !stop.load(Ordering::Acquire) {
         let response = client
             .get(format!("http://{public}/v1/models"))
+            .header("connection", "close")
             .send()
             .await?;
         if response.status() != StatusCode::OK {
@@ -280,7 +298,7 @@ async fn assert_public_stays_available(public: SocketAddr, requests: usize) -> R
                 response.status()
             );
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        requests += 1;
     }
-    Ok(())
+    Ok(requests)
 }

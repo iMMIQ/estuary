@@ -194,11 +194,7 @@ h3 { font-size: 13px; font-weight: 640; }
 .data-row:last-child { border-bottom: 0; }
 .data-row strong { max-width: 68%; overflow-wrap: anywhere; color: #dce1e7; font-size: 11px; font-weight: 550; text-align: right; }
 .admission-callout { display: flex; min-height: 38px; align-items: center; gap: 8px; color: var(--green); font-size: 11px; }
-.single-tab-panel, .models-panel, .config-panel { padding: 16px; border: 1px solid var(--border); border-radius: 5px; background: var(--panel); }
-.single-tab-panel { display: grid; grid-template-columns: 22px 1fr; gap: 9px; }
-.single-tab-panel > svg { color: var(--green); }
-.single-tab-panel p { margin-top: 4px; color: var(--muted); font-size: 11px; }
-.tab-data-grid { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; margin-top: 10px; }
+.models-panel { padding: 16px; border: 1px solid var(--border); border-radius: 5px; background: var(--panel); }
 .metric-tile-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
 .metric-tile-grid > div { display: flex; min-height: 82px; align-items: center; gap: 10px; padding: 12px; border: 1px solid var(--border); border-radius: 5px; background: var(--panel); color: #78818e; }
 .metric-tile-grid span { display: grid; gap: 6px; color: var(--muted); font-size: 11px; }
@@ -209,7 +205,6 @@ h3 { font-size: 13px; font-weight: 640; }
 .models-table { width: 100%; border-collapse: collapse; }
 .models-table th, .models-table td { height: 38px; border-bottom: 1px solid var(--border-soft); color: #9fa7b2; font-size: 11px; text-align: left; }
 .models-table td { color: #d8dce4; }
-.config-panel { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
 
 .editor-page { min-height: 100vh; padding-bottom: 90px; }
 .editor-header { margin-bottom: 14px; }
@@ -361,7 +356,6 @@ h3 { font-size: 13px; font-weight: 640; }
   .detail-grid-layout { grid-template-columns: 1fr; }
   .runtime-card, .runtime-card:nth-child(-n + 2) { grid-column: auto; }
   .metric-tile-grid { grid-template-columns: 1fr 1fr; }
-  .config-panel, .tab-data-grid { grid-template-columns: 1fr; }
   .editor-page { padding-bottom: 86px; }
   .node-stepper { padding: 10px 8px; }
   .node-stepper .mantine-Stepper-stepLabel { font-size: 10px; }

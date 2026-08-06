@@ -28,6 +28,7 @@ const CONTROL_REQUEST_LIMIT: u64 = 64 * 1024;
 const WORKER_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const RESTART_STABLE_UPTIME: Duration = Duration::from_secs(60);
 const RESTART_MAX_BACKOFF: Duration = Duration::from_secs(60);
+pub const WORKER_SETTINGS_ENV: &str = "ESTUARY_WORKER_SETTINGS_JSON";
 
 #[derive(Clone, Debug)]
 pub struct SupervisorConfig {
@@ -296,7 +297,7 @@ impl Supervisor {
             &self.config.settings,
             self.config.slot_admin(slot.id),
             &self.config.freeze_file(),
-        );
+        )?;
         command
             .fd_mappings(vec![FdMapping {
                 parent_fd: listener,
@@ -725,184 +726,21 @@ async fn send_request(
     serde_json::from_slice(&response).context("supervisor returned an invalid response")
 }
 
-#[allow(clippy::too_many_lines)]
 fn apply_worker_environment(
     command: &mut Command,
     settings: &Settings,
     admin: SocketAddr,
     freeze_file: &Path,
-) {
-    let server = &settings.server;
-    let routing = &settings.routing;
-    let health = &settings.health;
-    let circuit = &settings.circuit_breaker;
-    command
-        .env("ESTUARY_ADMIN_LISTEN", admin.to_string())
-        .env("ESTUARY_ADMIN_FREEZE_FILE", freeze_file)
-        .env("ESTUARY_WITHDRAWAL_DELAY_MS", "1")
-        .env(
-            "ESTUARY_CONNECT_TIMEOUT_MS",
-            server.connect_timeout_ms.to_string(),
-        )
-        .env(
-            "ESTUARY_REQUEST_BODY_IDLE_TIMEOUT_MS",
-            server.request_body_idle_timeout_ms.to_string(),
-        )
-        .env(
-            "ESTUARY_REQUEST_BODY_TIMEOUT_MS",
-            server.request_body_timeout_ms.to_string(),
-        )
-        .env(
-            "ESTUARY_UPSTREAM_HEADER_TIMEOUT_MS",
-            server.upstream_header_timeout_ms.to_string(),
-        )
-        .env(
-            "ESTUARY_STREAM_IDLE_TIMEOUT_MS",
-            server.stream_idle_timeout_ms.to_string(),
-        )
-        .env(
-            "ESTUARY_UPSTREAM_BODY_TIMEOUT_MS",
-            server.upstream_body_timeout_ms.to_string(),
-        )
-        .env(
-            "ESTUARY_DOWNSTREAM_STALL_TIMEOUT_MS",
-            server.downstream_stall_timeout_ms.to_string(),
-        )
-        .env(
-            "ESTUARY_CONTROL_SYNC_INTERVAL_MS",
-            server.control_sync_interval_ms.to_string(),
-        )
-        .env(
-            "ESTUARY_NODE_MUTATION_TIMEOUT_MS",
-            server.node_mutation_timeout_ms.to_string(),
-        )
-        .env(
-            "ESTUARY_SHUTDOWN_GRACE_MS",
-            server.shutdown_grace_ms.to_string(),
-        )
-        .env(
-            "ESTUARY_MAX_REQUEST_BODY_BYTES",
-            server.max_request_body_bytes.to_string(),
-        )
-        .env(
-            "ESTUARY_MAX_CONNECTIONS",
-            server.max_connections.to_string(),
-        )
-        .env(
-            "ESTUARY_MAX_ADMIN_CONNECTIONS",
-            server.max_admin_connections.to_string(),
-        )
-        .env(
-            "ESTUARY_MAX_NON_STREAMING_RESPONSE_BYTES",
-            server.max_non_streaming_response_bytes.to_string(),
-        )
-        .env(
-            "ESTUARY_MAX_BUFFERED_RESPONSE_BYTES",
-            server.max_buffered_response_bytes.to_string(),
-        )
-        .env(
-            "ESTUARY_EXPOSE_NODE_HEADER",
-            server.expose_node_header.to_string(),
-        )
-        .env("ESTUARY_LOG_JSON", server.log_json.to_string())
-        .env(
-            "ESTUARY_QUEUE_MAX_REQUESTS",
-            routing.queue_max_requests.to_string(),
-        )
-        .env(
-            "ESTUARY_QUEUE_MAX_BYTES",
-            routing.queue_max_bytes.to_string(),
-        )
-        .env("ESTUARY_LOAD_WEIGHT", routing.load_weight.to_string())
-        .env("ESTUARY_LATENCY_WEIGHT", routing.latency_weight.to_string())
-        .env("ESTUARY_ERROR_WEIGHT", routing.error_weight.to_string())
-        .env(
-            "ESTUARY_TARGET_LATENCY_MS",
-            routing.target_latency_ms.to_string(),
-        )
-        .env("ESTUARY_PREFIX_ENABLED", routing.prefix.enabled.to_string())
-        .env(
-            "ESTUARY_PREFIX_CACHE_THRESHOLD",
-            routing.prefix.cache_threshold.to_string(),
-        )
-        .env(
-            "ESTUARY_PREFIX_BALANCE_ABS_THRESHOLD",
-            routing.prefix.balance_abs_threshold.to_string(),
-        )
-        .env(
-            "ESTUARY_PREFIX_BALANCE_REL_THRESHOLD",
-            routing.prefix.balance_rel_threshold.to_string(),
-        )
-        .env(
-            "ESTUARY_PREFIX_MAX_REQUEST_CHARS",
-            routing.prefix.max_request_chars.to_string(),
-        )
-        .env(
-            "ESTUARY_PREFIX_MAX_TREES",
-            routing.prefix.max_trees.to_string(),
-        )
-        .env(
-            "ESTUARY_PREFIX_MAX_DIRECTORY_CHARS",
-            routing.prefix.max_directory_chars.to_string(),
-        )
-        .env(
-            "ESTUARY_PREFIX_MAX_TREE_CHARS_PER_NODE",
-            routing.prefix.max_tree_chars_per_node.to_string(),
-        )
-        .env("ESTUARY_HEALTH_INTERVAL_MS", health.interval_ms.to_string())
-        .env("ESTUARY_HEALTH_TIMEOUT_MS", health.timeout_ms.to_string())
-        .env(
-            "ESTUARY_HEALTH_UNHEALTHY_THRESHOLD",
-            health.unhealthy_threshold.to_string(),
-        )
-        .env(
-            "ESTUARY_HEALTH_HEALTHY_THRESHOLD",
-            health.healthy_threshold.to_string(),
-        )
-        .env(
-            "ESTUARY_HEALTH_PASSIVE_FAILURE_THRESHOLD",
-            health.passive_failure_threshold.to_string(),
-        )
-        .env(
-            "ESTUARY_HEALTH_ROUTE_WHILE_STARTING",
-            health.route_while_starting.to_string(),
-        )
-        .env(
-            "ESTUARY_HEALTH_JITTER_PERCENT",
-            health.jitter_percent.to_string(),
-        )
-        .env(
-            "ESTUARY_CIRCUIT_FAILURE_THRESHOLD",
-            circuit.failure_threshold.to_string(),
-        )
-        .env("ESTUARY_CIRCUIT_OPEN_MS", circuit.open_ms.to_string())
-        .env(
-            "ESTUARY_CIRCUIT_HALF_OPEN_MAX_REQUESTS",
-            circuit.half_open_max_requests.to_string(),
-        )
-        .env(
-            "ESTUARY_CIRCUIT_HALF_OPEN_SUCCESS_THRESHOLD",
-            circuit.half_open_success_threshold.to_string(),
-        )
-        .env(
-            "ESTUARY_RETRY_MAX_ATTEMPTS",
-            settings.retry.max_attempts.to_string(),
-        )
-        .env(
-            "ESTUARY_RETRY_STATUSES",
-            settings
-                .retry
-                .statuses
-                .iter()
-                .map(u16::to_string)
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-    if let Some(token) = server.admin_token.as_deref() {
-        command.env("ESTUARY_ADMIN_TOKEN", token);
-    } else {
-        command.env_remove("ESTUARY_ADMIN_TOKEN");
-    }
+) -> Result<()> {
+    let mut worker = settings.clone();
+    worker.server.admin_listen = admin.to_string();
+    worker.server.admin_freeze_file = Some(freeze_file.to_owned());
+    worker.server.withdrawal_delay_ms = 1;
+    command.env(
+        WORKER_SETTINGS_ENV,
+        serde_json::to_string(&worker).context("failed to serialize worker settings")?,
+    );
+    Ok(())
 }
 
 fn ensure_state_layout(config: &SupervisorConfig) -> Result<()> {

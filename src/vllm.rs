@@ -1,7 +1,8 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     io::{BufRead, BufReader, Cursor},
     mem::size_of,
+    num::NonZeroUsize,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -9,6 +10,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
+use lru::LruCache;
 use parking_lot::Mutex;
 use prometheus_parse::{Scrape, Value as MetricValue};
 use reqwest::Client;
@@ -705,10 +707,7 @@ fn tokenization_key(
 
 #[derive(Debug)]
 struct TokenizationCache {
-    values: HashMap<[u8; 32], (Vec<u64>, u64, usize)>,
-    order: VecDeque<([u8; 32], u64)>,
-    epoch: u64,
-    capacity: usize,
+    values: LruCache<[u8; 32], (Vec<u64>, usize)>,
     used_bytes: usize,
     max_bytes: usize,
 }
@@ -720,67 +719,39 @@ impl TokenizationCache {
 
     fn with_max_bytes(capacity: usize, max_bytes: usize) -> Self {
         Self {
-            values: HashMap::new(),
-            order: VecDeque::new(),
-            epoch: 0,
-            capacity,
+            values: LruCache::new(NonZeroUsize::new(capacity).expect("cache capacity is positive")),
             used_bytes: 0,
             max_bytes,
         }
     }
 
     fn raise_capacity(&mut self, capacity: usize) {
-        self.capacity = self.capacity.max(capacity);
+        if capacity > self.values.cap().get() {
+            self.values
+                .resize(NonZeroUsize::new(capacity).expect("cache capacity is positive"));
+        }
     }
 
     fn get(&mut self, key: &[u8; 32]) -> Option<Vec<u64>> {
-        let tokens = self.values.get(key)?.0.clone();
-        self.epoch = self.epoch.wrapping_add(1);
-        let bytes = self.values.get(key)?.2;
-        self.values
-            .insert(*key, (tokens.clone(), self.epoch, bytes));
-        self.order.push_back((*key, self.epoch));
-        self.compact_order_if_needed();
-        Some(tokens)
+        self.values.get(key).map(|(tokens, _)| tokens.clone())
     }
 
     fn insert(&mut self, key: [u8; 32], tokens: Vec<u64>) {
-        self.epoch = self.epoch.wrapping_add(1);
         let bytes = TOKENIZATION_CACHE_ENTRY_OVERHEAD
             .saturating_add(tokens.capacity().saturating_mul(size_of::<u64>()));
-        if let Some((_, _, previous_bytes)) = self.values.remove(&key) {
+        if let Some((_, previous_bytes)) = self.values.pop(&key) {
             self.used_bytes = self.used_bytes.saturating_sub(previous_bytes);
         }
         self.used_bytes = self.used_bytes.saturating_add(bytes);
-        self.values.insert(key, (tokens, self.epoch, bytes));
-        self.order.push_back((key, self.epoch));
-        while self.values.len() > self.capacity || self.used_bytes > self.max_bytes {
-            let Some((old_key, old_epoch)) = self.order.pop_front() else {
+        if let Some((_, (_, evicted_bytes))) = self.values.push(key, (tokens, bytes)) {
+            self.used_bytes = self.used_bytes.saturating_sub(evicted_bytes);
+        }
+        while self.used_bytes > self.max_bytes {
+            let Some((_, (_, evicted_bytes))) = self.values.pop_lru() else {
                 break;
             };
-            if self
-                .values
-                .get(&old_key)
-                .is_some_and(|(_, epoch, _)| *epoch == old_epoch)
-            {
-                if let Some((_, _, bytes)) = self.values.remove(&old_key) {
-                    self.used_bytes = self.used_bytes.saturating_sub(bytes);
-                }
-            }
+            self.used_bytes = self.used_bytes.saturating_sub(evicted_bytes);
         }
-        self.compact_order_if_needed();
-    }
-
-    fn compact_order_if_needed(&mut self) {
-        let limit = self.capacity.saturating_mul(2).max(1);
-        if self.order.len() <= limit {
-            return;
-        }
-        self.order.retain(|(key, epoch)| {
-            self.values
-                .get(key)
-                .is_some_and(|(_, current_epoch, _)| current_epoch == epoch)
-        });
     }
 }
 
@@ -1473,7 +1444,7 @@ mod tests {
             assert_eq!(cache.get(&key), Some(vec![1, 2, 3]));
         }
         assert_eq!(cache.values.len(), 1);
-        assert!(cache.order.len() <= cache.capacity.saturating_mul(2));
+        assert_eq!(cache.values.cap().get(), 4);
     }
 
     #[test]

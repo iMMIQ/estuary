@@ -5,10 +5,10 @@ use axum::{
     http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
 };
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use serde_json::{Map, Value, json};
 
-use crate::error::GatewayError;
+use crate::{error::GatewayError, sse};
 
 pub(crate) fn convert_request(body: &Value) -> Result<Value, GatewayError> {
     convert_request_inner(body, true)
@@ -750,14 +750,11 @@ pub(crate) fn convert_error_response(
         .into_response()
 }
 
-#[derive(Default)]
 pub(crate) struct StreamConverter {
-    buffer: BytesMut,
     state: StreamState,
 }
 
 pub(crate) struct NativeStreamRewriter {
-    buffer: BytesMut,
     public_model: String,
     expose_thinking: bool,
 }
@@ -765,55 +762,43 @@ pub(crate) struct NativeStreamRewriter {
 impl NativeStreamRewriter {
     pub(crate) fn new(public_model: String, expose_thinking: bool) -> Self {
         Self {
-            buffer: BytesMut::new(),
             public_model,
             expose_thinking,
         }
     }
 
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Bytes, GatewayError> {
-        self.buffer.extend_from_slice(bytes);
-        let mut output = Vec::new();
-        while let Some((end, delimiter)) = frame_end(&self.buffer) {
-            let frame = self.buffer.split_to(end);
-            let _ = self.buffer.split_to(delimiter);
-            let Some(data) = event_data(&frame)? else {
-                continue;
-            };
-            let mut value: Value =
-                serde_json::from_str(&data).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
-            if value.get("type").and_then(Value::as_str) == Some("message_start") {
-                let message = value
-                    .get_mut("message")
-                    .and_then(Value::as_object_mut)
-                    .ok_or(GatewayError::InvalidUpstreamResponse)?;
-                message.insert("model".to_owned(), Value::String(self.public_model.clone()));
-            }
-            if !self.expose_thinking {
-                if value.get("type").and_then(Value::as_str) == Some("content_block_start") {
-                    if let Some(block) = value.get_mut("content_block") {
-                        suppress_native_thinking(block);
-                    }
-                } else if value.get("type").and_then(Value::as_str) == Some("content_block_delta") {
-                    if let Some(delta) = value.get_mut("delta") {
-                        suppress_native_thinking(delta);
-                    }
+    pub(crate) fn push_event(
+        &mut self,
+        mut event: sse::Event,
+    ) -> Result<Vec<sse::Event>, GatewayError> {
+        let mut value: Value = serde_json::from_str(event.data())
+            .map_err(|_| GatewayError::InvalidUpstreamResponse)?;
+        if value.get("type").and_then(Value::as_str) == Some("message_start") {
+            let message = value
+                .get_mut("message")
+                .and_then(Value::as_object_mut)
+                .ok_or(GatewayError::InvalidUpstreamResponse)?;
+            message.insert("model".to_owned(), Value::String(self.public_model.clone()));
+        }
+        if !self.expose_thinking {
+            if value.get("type").and_then(Value::as_str) == Some("content_block_start") {
+                if let Some(block) = value.get_mut("content_block") {
+                    suppress_native_thinking(block);
+                }
+            } else if value.get("type").and_then(Value::as_str) == Some("content_block_delta") {
+                if let Some(delta) = value.get_mut("delta") {
+                    suppress_native_thinking(delta);
                 }
             }
-            let name = event_name(&frame)
-                .or_else(|| value.get("type").and_then(Value::as_str))
-                .ok_or(GatewayError::InvalidUpstreamResponse)?
-                .to_owned();
-            event(&mut output, &name, value)?;
         }
-        Ok(Bytes::from(output))
-    }
-
-    pub(crate) fn finish(&mut self) -> Result<Bytes, GatewayError> {
-        if !self.buffer.iter().all(u8::is_ascii_whitespace) {
-            return Err(GatewayError::InvalidUpstreamResponse);
-        }
-        Ok(Bytes::new())
+        let name = event
+            .name()
+            .or_else(|| value.get("type").and_then(Value::as_str))
+            .ok_or(GatewayError::InvalidUpstreamResponse)?
+            .to_owned();
+        event.set_name(name);
+        event.set_data(serde_json::to_string(&value).map_err(|_| GatewayError::Internal)?);
+        Ok(vec![event])
     }
 }
 
@@ -833,70 +818,32 @@ impl StreamConverter {
     pub(crate) fn new(public_model: String, expose_thinking: bool) -> Self {
         Self {
             state: StreamState::new(public_model, expose_thinking),
-            ..Self::default()
         }
     }
 
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Bytes, GatewayError> {
-        self.buffer.extend_from_slice(bytes);
+    pub(crate) fn push_event(
+        &mut self,
+        event: &sse::Event,
+    ) -> Result<Vec<sse::Event>, GatewayError> {
         let mut output = Vec::new();
-        while let Some((end, delimiter)) = frame_end(&self.buffer) {
-            let frame = self.buffer.split_to(end);
-            let _ = self.buffer.split_to(delimiter);
-            let data = event_data(&frame)?;
-            if let Some(data) = data {
-                if data.trim() == "[DONE]" {
-                    self.state.finish(&mut output)?;
-                } else {
-                    let chunk = serde_json::from_str::<Value>(&data)
-                        .map_err(|_| GatewayError::InvalidUpstreamResponse)?;
-                    self.state.chunk(&chunk, &mut output)?;
-                }
-            }
+        if event.data().trim() == "[DONE]" {
+            self.state.finish(&mut output)?;
+        } else {
+            let chunk = serde_json::from_str::<Value>(event.data())
+                .map_err(|_| GatewayError::InvalidUpstreamResponse)?;
+            self.state.chunk(&chunk, &mut output)?;
         }
-        Ok(Bytes::from(output))
+        Ok(output)
     }
 
-    pub(crate) fn finish(&mut self) -> Result<Bytes, GatewayError> {
-        if !self.buffer.iter().all(u8::is_ascii_whitespace) {
-            return Err(GatewayError::InvalidUpstreamResponse);
-        }
+    pub(crate) fn finish(&mut self) -> Result<Vec<sse::Event>, GatewayError> {
         let mut output = Vec::new();
         self.state.finish(&mut output)?;
-        Ok(Bytes::from(output))
+        Ok(output)
     }
 }
 
-fn frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
-    let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(lf), Some(crlf)) if lf < crlf => Some((lf, 2)),
-        (_, Some(crlf)) => Some((crlf, 4)),
-        (Some(lf), None) => Some((lf, 2)),
-        (None, None) => None,
-    }
-}
-
-fn event_data(frame: &[u8]) -> Result<Option<String>, GatewayError> {
-    let frame = std::str::from_utf8(frame).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
-    let data = frame
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>();
-    Ok((!data.is_empty()).then(|| data.join("\n")))
-}
-
-fn event_name(frame: &[u8]) -> Option<&str> {
-    std::str::from_utf8(frame)
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("event:"))
-        .map(str::trim)
-}
-
-pub(crate) fn stream_error_event(message: &str) -> Bytes {
+pub(crate) fn stream_error_event(message: &str) -> sse::Event {
     let mut output = Vec::new();
     let _ = event(
         &mut output,
@@ -906,13 +853,13 @@ pub(crate) fn stream_error_event(message: &str) -> Bytes {
             "error": {"type": "api_error", "message": message}
         }),
     );
-    Bytes::from(output)
+    output.pop().expect("error event is emitted")
 }
 
-pub(crate) fn ping_event() -> Bytes {
+pub(crate) fn ping_event() -> sse::Event {
     let mut output = Vec::new();
     let _ = event(&mut output, "ping", json!({"type": "ping"}));
-    Bytes::from(output)
+    output.pop().expect("ping event is emitted")
 }
 
 #[derive(Default)]
@@ -939,7 +886,7 @@ impl StreamState {
         }
     }
 
-    fn chunk(&mut self, chunk: &Value, output: &mut Vec<u8>) -> Result<(), GatewayError> {
+    fn chunk(&mut self, chunk: &Value, output: &mut Vec<sse::Event>) -> Result<(), GatewayError> {
         if self.finished {
             return Ok(());
         }
@@ -1039,7 +986,7 @@ impl StreamState {
         Ok(())
     }
 
-    fn start(&mut self, output: &mut Vec<u8>) -> Result<(), GatewayError> {
+    fn start(&mut self, output: &mut Vec<sse::Event>) -> Result<(), GatewayError> {
         if self.started {
             return Ok(());
         }
@@ -1060,7 +1007,11 @@ impl StreamState {
         )
     }
 
-    fn tool_delta(&mut self, call: &Value, output: &mut Vec<u8>) -> Result<(), GatewayError> {
+    fn tool_delta(
+        &mut self,
+        call: &Value,
+        output: &mut Vec<sse::Event>,
+    ) -> Result<(), GatewayError> {
         let upstream_index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
         let tool = self.tools.entry(upstream_index).or_insert_with(|| {
             let index = self.next_index;
@@ -1115,7 +1066,7 @@ impl StreamState {
         Ok(())
     }
 
-    fn finish_thinking(&mut self, output: &mut Vec<u8>) -> Result<(), GatewayError> {
+    fn finish_thinking(&mut self, output: &mut Vec<sse::Event>) -> Result<(), GatewayError> {
         let Some(index) = self.thinking_index.take() else {
             return Ok(());
         };
@@ -1137,7 +1088,7 @@ impl StreamState {
         )
     }
 
-    fn finish_text(&mut self, output: &mut Vec<u8>) -> Result<(), GatewayError> {
+    fn finish_text(&mut self, output: &mut Vec<sse::Event>) -> Result<(), GatewayError> {
         let Some(index) = self.text_index.take() else {
             return Ok(());
         };
@@ -1148,7 +1099,7 @@ impl StreamState {
         )
     }
 
-    fn finish(&mut self, output: &mut Vec<u8>) -> Result<(), GatewayError> {
+    fn finish(&mut self, output: &mut Vec<sse::Event>) -> Result<(), GatewayError> {
         if self.finished {
             return Ok(());
         }
@@ -1210,7 +1161,7 @@ struct ToolStream {
 }
 
 impl ToolStream {
-    fn start(&mut self, output: &mut Vec<u8>) -> Result<(), GatewayError> {
+    fn start(&mut self, output: &mut Vec<sse::Event>) -> Result<(), GatewayError> {
         if self.started {
             return Ok(());
         }
@@ -1231,14 +1182,9 @@ impl ToolStream {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn event(output: &mut Vec<u8>, name: &str, value: Value) -> Result<(), GatewayError> {
-    let data = serde_json::to_string(&value).map_err(|_| GatewayError::Internal)?;
-    output.extend_from_slice(b"event: ");
-    output.extend_from_slice(name.as_bytes());
-    output.extend_from_slice(b"\ndata: ");
-    output.extend_from_slice(data.as_bytes());
-    output.extend_from_slice(b"\n\n");
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn event(output: &mut Vec<sse::Event>, name: &str, value: Value) -> Result<(), GatewayError> {
+    output.push(sse::Event::json(name, &value));
     Ok(())
 }
 
@@ -1256,6 +1202,31 @@ pub(crate) fn set_anthropic_content_type(response: &mut Response, streaming: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn rewrite_native_chunks(chunks: Vec<&[u8]>, expose_thinking: bool) -> String {
+        let events = sse::parse_chunks(chunks.into_iter().map(Bytes::copy_from_slice).collect())
+            .await
+            .unwrap();
+        let mut rewriter = NativeStreamRewriter::new("public".to_owned(), expose_thinking);
+        let mut output = Vec::new();
+        for event in events {
+            output.extend(rewriter.push_event(event).unwrap());
+        }
+        String::from_utf8(sse::encode(output).await.to_vec()).unwrap()
+    }
+
+    async fn convert_chat_chunks(chunks: Vec<&[u8]>, expose_thinking: bool) -> String {
+        let events = sse::parse_chunks(chunks.into_iter().map(Bytes::copy_from_slice).collect())
+            .await
+            .unwrap();
+        let mut converter = StreamConverter::new("public-model".to_owned(), expose_thinking);
+        let mut output = Vec::new();
+        for event in events {
+            output.extend(converter.push_event(&event).unwrap());
+        }
+        output.extend(converter.finish().unwrap());
+        String::from_utf8(sse::encode(output).await.to_vec()).unwrap()
+    }
 
     #[test]
     fn converts_tools_and_tool_results() {
@@ -1397,36 +1368,33 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rewrites_fragmented_native_stream_model_without_losing_events() {
+    #[tokio::test]
+    async fn rewrites_fragmented_native_stream_model_without_losing_events() {
         let source = concat!(
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"internal\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
             "event: ping\ndata: {\"type\":\"ping\"}\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
         );
-        let mut rewriter = NativeStreamRewriter::new("public".to_owned(), true);
         let split = source.len() / 2;
-        let mut output = Vec::new();
-        output.extend_from_slice(&rewriter.push(&source.as_bytes()[..split]).unwrap());
-        output.extend_from_slice(&rewriter.push(&source.as_bytes()[split..]).unwrap());
-        output.extend_from_slice(&rewriter.finish().unwrap());
-        let output = String::from_utf8(output).unwrap();
+        let output = rewrite_native_chunks(
+            vec![&source.as_bytes()[..split], &source.as_bytes()[split..]],
+            true,
+        )
+        .await;
         assert!(output.contains(r#""model":"public""#));
         assert!(output.contains("event: ping"));
         assert!(output.contains("event: message_stop"));
         assert!(!output.contains("internal"));
     }
 
-    #[test]
-    fn hides_native_stream_thinking_but_preserves_signature() {
+    #[tokio::test]
+    async fn hides_native_stream_thinking_but_preserves_signature() {
         let source = concat!(
             "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"private\"}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"private delta\",\"estimated_tokens\":16}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\n\n"
         );
-        let mut rewriter = NativeStreamRewriter::new("public".to_owned(), false);
-        let output = rewriter.push(source.as_bytes()).unwrap();
-        let output = String::from_utf8(output.to_vec()).unwrap();
+        let output = rewrite_native_chunks(vec![source.as_bytes()], false).await;
         assert!(!output.contains("private"));
         assert!(output.contains(r#""thinking":"""#));
         assert!(output.contains(r#""estimated_tokens":16"#));
@@ -1450,8 +1418,8 @@ mod tests {
         assert_eq!(converted["messages"][2]["content"], "after");
     }
 
-    #[test]
-    fn converts_fragmented_stream() {
+    #[tokio::test]
+    async fn converts_fragmented_stream() {
         let source = concat!(
             "data: {\"id\":\"chatcmpl_1\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"chatcmpl_1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}\n\n",
@@ -1459,18 +1427,16 @@ mod tests {
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n",
             "data: [DONE]\n\n"
         );
-        let mut converter = StreamConverter::new("public-model".to_owned(), false);
         let split = source.len() / 3;
-        let mut result = Vec::new();
-        result.extend_from_slice(&converter.push(&source.as_bytes()[..split]).unwrap());
-        result.extend_from_slice(
-            &converter
-                .push(&source.as_bytes()[split..split * 2])
-                .unwrap(),
-        );
-        result.extend_from_slice(&converter.push(&source.as_bytes()[split * 2..]).unwrap());
-        result.extend_from_slice(&converter.finish().unwrap());
-        let output = String::from_utf8(result).unwrap();
+        let output = convert_chat_chunks(
+            vec![
+                &source.as_bytes()[..split],
+                &source.as_bytes()[split..split * 2],
+                &source.as_bytes()[split * 2..],
+            ],
+            false,
+        )
+        .await;
         assert!(output.contains("event: message_start"));
         assert!(output.contains("event: content_block_delta"));
         assert!(output.contains(r#""partial_json":"{\"path\":"#));
@@ -1478,17 +1444,15 @@ mod tests {
         assert!(output.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
     }
 
-    #[test]
-    fn streaming_thinking_blocks_close_before_text_and_tools() {
+    #[tokio::test]
+    async fn streaming_thinking_blocks_close_before_text_and_tools() {
         let source = concat!(
             "data: {\"id\":\"chatcmpl_reasoning\",\"choices\":[{\"delta\":{\"reasoning\":\"work\"},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"chatcmpl_reasoning\",\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"Read\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
             "data: [DONE]\n\n"
         );
-        let mut converter = StreamConverter::new("public-model".to_owned(), true);
-        let output = converter.push(source.as_bytes()).unwrap();
-        let output = String::from_utf8(output.to_vec()).unwrap();
+        let output = convert_chat_chunks(vec![source.as_bytes()], true).await;
 
         let thinking = output.find(r#""type":"thinking""#).unwrap();
         let thinking_delta = output.find(r#""type":"thinking_delta""#).unwrap();
@@ -1509,8 +1473,8 @@ mod tests {
         assert!(output.contains(r#""partial_json":"{}""#));
     }
 
-    #[test]
-    fn streaming_text_closes_before_late_reasoning_and_repeated_tool_metadata_is_stable() {
+    #[tokio::test]
+    async fn streaming_text_closes_before_late_reasoning_and_repeated_tool_metadata_is_stable() {
         let source = concat!(
             "data: {\"id\":\"chatcmpl_reasoning\",\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"chatcmpl_reasoning\",\"choices\":[{\"delta\":{\"reasoning\":\"late\"},\"finish_reason\":null}]}\n\n",
@@ -1518,9 +1482,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"Read\",\"arguments\":\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
             "data: [DONE]\n\n"
         );
-        let mut converter = StreamConverter::new("public-model".to_owned(), true);
-        let output =
-            String::from_utf8(converter.push(source.as_bytes()).unwrap().to_vec()).unwrap();
+        let output = convert_chat_chunks(vec![source.as_bytes()], true).await;
         let text = output.find(r#""type":"text""#).unwrap();
         let text_stop = output[text..].find("event: content_block_stop").unwrap() + text;
         let thinking = output.find(r#""type":"thinking""#).unwrap();

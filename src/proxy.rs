@@ -1,7 +1,9 @@
 use std::{
     collections::HashSet,
-    io,
+    fmt, io,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -13,10 +15,11 @@ use axum::{
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
         header::{CONTENT_LENGTH, CONTENT_TYPE},
     },
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Response, Sse},
 };
 use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
+use eventsource_stream::Eventsource;
+use futures_util::{Stream, StreamExt};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
@@ -31,9 +34,11 @@ use crate::{
     prefix::{PrefixInput, routing_text},
     response_buffer::{ResponseBufferBudget, ResponseBufferReservation},
     server::{AppState, RequestId},
+    sse,
 };
 
 const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Serialize)]
 pub(crate) struct ModelList {
@@ -684,21 +689,20 @@ enum ResponseStreamAdapter {
 }
 
 impl ResponseStreamAdapter {
-    fn push(&mut self, bytes: &[u8]) -> Result<Bytes, GatewayError> {
+    fn push_event(&mut self, event: sse::Event) -> Result<Vec<sse::Event>, GatewayError> {
         match self {
-            Self::Codex(rewriter) => rewriter.push(bytes),
-            Self::Chat(converter) => converter.push(bytes),
-            Self::Responses(converter) => converter.push(bytes),
-            Self::Native(rewriter) => rewriter.push(bytes),
+            Self::Codex(rewriter) => rewriter.push_event(event),
+            Self::Chat(converter) => converter.push_event(&event),
+            Self::Responses(converter) => converter.push_event(&event),
+            Self::Native(rewriter) => rewriter.push_event(event),
         }
     }
 
-    fn finish(&mut self) -> Result<Bytes, GatewayError> {
+    fn finish(&mut self) -> Result<Vec<sse::Event>, GatewayError> {
         match self {
-            Self::Codex(rewriter) => rewriter.finish(),
+            Self::Codex(_) | Self::Native(_) => Ok(Vec::new()),
             Self::Chat(converter) => converter.finish(),
             Self::Responses(converter) => converter.finish(),
-            Self::Native(rewriter) => rewriter.finish(),
         }
     }
 }
@@ -1179,6 +1183,106 @@ async fn buffered_success_response(
     Ok(response)
 }
 
+enum StreamingInput {
+    Raw(Bytes),
+    Event(sse::Event),
+}
+
+enum StreamingOutput {
+    Raw(Bytes),
+    Events(Vec<sse::Event>),
+}
+
+struct LimitedSseInput<S> {
+    inner: Pin<Box<S>>,
+    event_bytes: usize,
+    line_has_data: bool,
+    after_cr: bool,
+    max_event_bytes: usize,
+}
+
+impl<S> LimitedSseInput<S> {
+    fn new(inner: S, max_event_bytes: usize) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            event_bytes: 0,
+            line_has_data: false,
+            after_cr: false,
+            max_event_bytes,
+        }
+    }
+
+    fn inspect(&mut self, bytes: &[u8]) -> bool {
+        for byte in bytes {
+            self.event_bytes = self.event_bytes.saturating_add(1);
+            if self.event_bytes > self.max_event_bytes {
+                return false;
+            }
+            match *byte {
+                b'\r' => {
+                    if !self.line_has_data {
+                        self.event_bytes = 0;
+                    }
+                    self.line_has_data = false;
+                    self.after_cr = true;
+                }
+                b'\n' if self.after_cr => {
+                    self.after_cr = false;
+                }
+                b'\n' => {
+                    if !self.line_has_data {
+                        self.event_bytes = 0;
+                    }
+                    self.line_has_data = false;
+                }
+                _ => {
+                    self.line_has_data = true;
+                    self.after_cr = false;
+                }
+            }
+        }
+        true
+    }
+}
+
+#[derive(Debug)]
+enum SseInputError<E> {
+    Transport(E),
+    EventTooLarge,
+}
+
+impl<E: fmt::Display> fmt::Display for SseInputError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(error) => error.fmt(formatter),
+            Self::EventTooLarge => formatter.write_str("upstream SSE event exceeded 16 MiB"),
+        }
+    }
+}
+
+impl<S, B, E> Stream for LimitedSseInput<S>
+where
+    S: Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+{
+    type Item = Result<B, SseInputError<E>>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(context) {
+            Poll::Ready(Some(Ok(bytes))) if this.inspect(bytes.as_ref()) => {
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Ok(_))) => Poll::Ready(Some(Err(SseInputError::EventTooLarge))),
+            Poll::Ready(Some(Err(error))) => {
+                Poll::Ready(Some(Err(SseInputError::Transport(error))))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn streaming_response(
     upstream: reqwest::Response,
@@ -1199,11 +1303,10 @@ fn streaming_response(
 ) -> Response {
     let status = upstream.status();
     let headers = upstream.headers().clone();
-    let expected_body_bytes = upstream.content_length();
     let upstream_request_id = headers.get("x-request-id").cloned();
     let node_id = node.id().to_owned();
     let stream_node_id = node_id.clone();
-    let (sender, mut receiver) = mpsc::channel::<Bytes>(1);
+    let (sender, mut receiver) = mpsc::channel::<StreamingOutput>(1);
     let terminal_failure = Arc::new(parking_lot::Mutex::new(None));
     let pump_failure = Arc::clone(&terminal_failure);
     let is_anthropic = response_mode.is_anthropic();
@@ -1217,7 +1320,6 @@ fn streaming_response(
             stream_node_id.clone(),
             header_latency,
         );
-        let mut body = upstream.bytes_stream();
         let needs_keepalive = is_anthropic;
         let keepalive_period = Duration::from_secs(10);
         let mut keepalive = tokio::time::interval_at(
@@ -1226,7 +1328,6 @@ fn streaming_response(
         );
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut indexed = false;
-        let mut received_body_bytes = 0_u64;
         let body_deadline = tokio::time::Instant::now() + upstream_body_timeout;
         let mut idle_deadline = tokio::time::Instant::now() + stream_idle_timeout;
         let mut stream_adapter = match response_mode {
@@ -1250,6 +1351,26 @@ fn streaming_response(
                 anthropic::NativeStreamRewriter::new(public_model, expose_thinking),
             )),
         };
+        let raw_body = upstream.bytes_stream();
+        let mut body: Pin<Box<dyn Stream<Item = Result<StreamingInput, String>> + Send>> =
+            if stream_adapter.is_some() {
+                Box::pin(
+                    LimitedSseInput::new(raw_body, MAX_SSE_EVENT_BYTES)
+                        .eventsource()
+                        .map(|result| {
+                            result
+                                .map(sse::Event::from_parsed)
+                                .map(StreamingInput::Event)
+                                .map_err(|error| error.to_string())
+                        }),
+                )
+            } else {
+                Box::pin(raw_body.map(|result| {
+                    result
+                        .map(StreamingInput::Raw)
+                        .map_err(|error| error.to_string())
+                }))
+            };
 
         loop {
             let permit = tokio::select! {
@@ -1302,68 +1423,38 @@ fn streaming_response(
                         return;
                 },
                 _ = keepalive.tick(), if needs_keepalive => {
-                    permit.send(anthropic::ping_event());
+                    permit.send(StreamingOutput::Events(vec![anthropic::ping_event()]));
                     continue;
                 },
                 item = body.next() => item,
             };
 
             match item {
-                Some(Ok(bytes)) => {
+                Some(Ok(input)) => {
                     idle_deadline = tokio::time::Instant::now() + stream_idle_timeout;
-                    if record_prefix && !indexed && !bytes.is_empty() {
+                    if record_prefix && !indexed {
                         prefix_directory.record(&stream_node_id, &prefix_input);
                         indexed = true;
                     }
-                    received_body_bytes = received_body_bytes
-                        .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-                    let reached_expected =
-                        expected_body_bytes.is_some_and(|expected| received_body_bytes >= expected);
-                    let mut bytes = if let Some(adapter) = stream_adapter.as_mut() {
-                        match adapter.push(&bytes) {
-                            Ok(bytes) => bytes,
-                            Err(error) => {
-                                fail_response_stream(
-                                    &pump_failure,
-                                    &health_config,
-                                    &mut guard,
-                                    StreamFailure::upstream(error.to_string()),
-                                );
-                                return;
-                            }
+                    let output = match (input, stream_adapter.as_mut()) {
+                        (StreamingInput::Raw(bytes), None) => Ok(StreamingOutput::Raw(bytes)),
+                        (StreamingInput::Event(event), Some(adapter)) => {
+                            adapter.push_event(event).map(StreamingOutput::Events)
                         }
-                    } else {
-                        bytes
+                        _ => Err(GatewayError::InvalidUpstreamResponse),
                     };
-                    if reached_expected {
-                        if let Some(adapter) = stream_adapter.as_mut() {
-                            match adapter.finish() {
-                                Ok(tail) if !tail.is_empty() => {
-                                    let mut joined =
-                                        BytesMut::with_capacity(bytes.len() + tail.len());
-                                    joined.extend_from_slice(&bytes);
-                                    joined.extend_from_slice(&tail);
-                                    bytes = joined.freeze();
-                                }
-                                Ok(_) => {}
-                                Err(error) => {
-                                    fail_response_stream(
-                                        &pump_failure,
-                                        &health_config,
-                                        &mut guard,
-                                        StreamFailure::upstream(error.to_string()),
-                                    );
-                                    return;
-                                }
-                            }
+                    match output {
+                        Ok(StreamingOutput::Events(events)) if events.is_empty() => {}
+                        Ok(output) => permit.send(output),
+                        Err(error) => {
+                            fail_response_stream(
+                                &pump_failure,
+                                &health_config,
+                                &mut guard,
+                                StreamFailure::upstream(error.to_string()),
+                            );
+                            return;
                         }
-                    }
-                    if !bytes.is_empty() {
-                        permit.send(bytes);
-                    }
-                    if reached_expected {
-                        guard.completed();
-                        return;
                     }
                 }
                 Some(Err(error)) => {
@@ -1371,14 +1462,16 @@ fn streaming_response(
                         &pump_failure,
                         &health_config,
                         &mut guard,
-                        StreamFailure::upstream(error.to_string()),
+                        StreamFailure::upstream(error),
                     );
                     return;
                 }
                 None => {
                     if let Some(adapter) = stream_adapter.as_mut() {
                         match adapter.finish() {
-                            Ok(bytes) if !bytes.is_empty() => permit.send(bytes),
+                            Ok(events) if !events.is_empty() => {
+                                permit.send(StreamingOutput::Events(events));
+                            }
                             Ok(_) => {}
                             Err(error) => {
                                 fail_response_stream(
@@ -1401,20 +1494,48 @@ fn streaming_response(
         }
     });
 
-    let stream = async_stream::stream! {
-        while let Some(bytes) = receiver.recv().await {
-            yield Ok::<Bytes, io::Error>(bytes);
-        }
-        let failure = terminal_failure.lock().take();
-        if let Some(failure) = failure {
-            if is_anthropic {
-                yield Ok(anthropic::stream_error_event(&failure.message));
-            } else {
+    let body = if rewrites_body {
+        let stream = async_stream::stream! {
+            while let Some(output) = receiver.recv().await {
+                match output {
+                    StreamingOutput::Events(events) => {
+                        for event in events {
+                            yield Ok::<_, io::Error>(event.into_axum());
+                        }
+                    }
+                    StreamingOutput::Raw(_) => {
+                        yield Err(io::Error::other("raw bytes in rewritten SSE stream"));
+                    }
+                }
+            }
+            let failure = { terminal_failure.lock().take() };
+            if let Some(failure) = failure {
+                if is_anthropic {
+                    yield Ok(anthropic::stream_error_event(&failure.message).into_axum());
+                } else {
+                    yield Err(failure.into_io_error());
+                }
+            }
+        };
+        Sse::new(stream).into_response().into_body()
+    } else {
+        let stream = async_stream::stream! {
+            while let Some(output) = receiver.recv().await {
+                match output {
+                    StreamingOutput::Raw(bytes) => yield Ok::<_, io::Error>(bytes),
+                    StreamingOutput::Events(_) => {
+                        yield Err(io::Error::other("SSE events in passthrough stream"));
+                    }
+                }
+            }
+            let failure = { terminal_failure.lock().take() };
+            if let Some(failure) = failure {
                 yield Err(failure.into_io_error());
             }
-        }
+        };
+        Body::from_stream(stream)
     };
-    let mut response = Response::new(Body::from_stream(stream));
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     copy_response_headers(&headers, response.headers_mut());
     if rewrites_body {
@@ -1728,7 +1849,7 @@ mod tests {
     use std::io;
 
     use bytes::Bytes;
-    use futures_util::stream;
+    use futures_util::{StreamExt, stream};
     use serde_json::json;
 
     use super::*;
@@ -1754,6 +1875,41 @@ mod tests {
             .await,
             Err(GatewayError::RequestTimeout)
         ));
+    }
+
+    #[tokio::test]
+    async fn sse_input_rejects_an_event_over_the_configured_limit() {
+        let source = stream::iter([Ok::<_, io::Error>(Bytes::from_static(
+            b"data: too large\n\n",
+        ))]);
+        let error = LimitedSseInput::new(source, 8)
+            .next()
+            .await
+            .expect("one input chunk")
+            .expect_err("oversized event must fail");
+        assert!(matches!(error, SseInputError::EventTooLarge));
+    }
+
+    #[tokio::test]
+    async fn sse_input_resets_its_limit_for_all_line_endings_and_split_boundaries() {
+        for chunks in [
+            vec![
+                Bytes::from_static(b"1234567\n"),
+                Bytes::from_static(b"\n1234567\n\n"),
+            ],
+            vec![
+                Bytes::from_static(b"1234567\r\n\r"),
+                Bytes::from_static(b"\n1234567\r\n\r\n"),
+            ],
+            vec![
+                Bytes::from_static(b"1234567\r"),
+                Bytes::from_static(b"\r1234567\r\r"),
+            ],
+        ] {
+            let source = stream::iter(chunks.into_iter().map(Ok::<_, io::Error>));
+            let results = LimitedSseInput::new(source, 11).collect::<Vec<_>>().await;
+            assert!(results.iter().all(Result::is_ok));
+        }
     }
 
     #[test]

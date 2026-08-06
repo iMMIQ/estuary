@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use serde_json::{Map, Value, json};
 
-use crate::error::GatewayError;
+use crate::{error::GatewayError, sse};
 
 const REASONING_SIGNATURE_PREFIX: &str = "estuary_responses:";
 
@@ -609,9 +609,7 @@ fn reasoning_signature(item: &Value) -> Result<String, GatewayError> {
     Ok(format!("{REASONING_SIGNATURE_PREFIX}{encoded}"))
 }
 
-#[derive(Default)]
 pub(crate) struct StreamConverter {
-    buffer: BytesMut,
     state: ResponseStreamState,
 }
 
@@ -619,32 +617,23 @@ impl StreamConverter {
     pub(crate) fn new(public_model: String, expose_thinking: bool) -> Self {
         Self {
             state: ResponseStreamState::new(public_model, expose_thinking),
-            ..Self::default()
         }
     }
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Bytes, GatewayError> {
-        self.buffer.extend_from_slice(bytes);
+    pub(crate) fn push_event(
+        &mut self,
+        event: &sse::Event,
+    ) -> Result<Vec<sse::Event>, GatewayError> {
         let mut output = Vec::new();
-        while let Some((end, delimiter)) = frame_end(&self.buffer) {
-            let frame = self.buffer.split_to(end);
-            let _ = self.buffer.split_to(delimiter);
-            let name = event_name(&frame).unwrap_or_default();
-            let Some(data) = event_data(&frame)? else {
-                continue;
-            };
-            let value: Value =
-                serde_json::from_str(&data).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
-            self.state.event(name, &value, &mut output)?;
-        }
-        Ok(Bytes::from(output))
+        let value: Value = serde_json::from_str(event.data())
+            .map_err(|_| GatewayError::InvalidUpstreamResponse)?;
+        self.state
+            .event(event.name().unwrap_or_default(), &value, &mut output)?;
+        Ok(output)
     }
-    pub(crate) fn finish(&mut self) -> Result<Bytes, GatewayError> {
-        if !self.buffer.iter().all(u8::is_ascii_whitespace) {
-            return Err(GatewayError::InvalidUpstreamResponse);
-        }
+    pub(crate) fn finish(&mut self) -> Result<Vec<sse::Event>, GatewayError> {
         let mut output = Vec::new();
         self.state.finish(&mut output)?;
-        Ok(Bytes::from(output))
+        Ok(output)
     }
 }
 
@@ -702,7 +691,7 @@ impl ResponseStreamState {
         &mut self,
         name: &str,
         value: &Value,
-        output: &mut Vec<u8>,
+        output: &mut Vec<sse::Event>,
     ) -> Result<(), GatewayError> {
         if self.lifecycle == StreamLifecycle::Finished {
             return Ok(());
@@ -858,7 +847,7 @@ impl ResponseStreamState {
         }
         Ok(())
     }
-    fn start(&mut self, output: &mut Vec<u8>) -> Result<(), GatewayError> {
+    fn start(&mut self, output: &mut Vec<sse::Event>) -> Result<(), GatewayError> {
         if self.lifecycle != StreamLifecycle::Initial {
             return Ok(());
         }
@@ -879,7 +868,11 @@ impl ResponseStreamState {
         self.active.insert(index, block);
         index
     }
-    fn ensure_text(&mut self, value: &Value, output: &mut Vec<u8>) -> Result<u64, GatewayError> {
+    fn ensure_text(
+        &mut self,
+        value: &Value,
+        output: &mut Vec<sse::Event>,
+    ) -> Result<u64, GatewayError> {
         let upstream = value
             .get("output_index")
             .and_then(Value::as_u64)
@@ -898,7 +891,7 @@ impl ResponseStreamState {
     fn ensure_thinking(
         &mut self,
         value: &Value,
-        output: &mut Vec<u8>,
+        output: &mut Vec<sse::Event>,
     ) -> Result<u64, GatewayError> {
         let upstream = value
             .get("output_index")
@@ -926,7 +919,11 @@ impl ResponseStreamState {
         )?;
         Ok(index)
     }
-    fn ensure_tool(&mut self, value: &Value, output: &mut Vec<u8>) -> Result<u64, GatewayError> {
+    fn ensure_tool(
+        &mut self,
+        value: &Value,
+        output: &mut Vec<sse::Event>,
+    ) -> Result<u64, GatewayError> {
         let upstream = value
             .get("output_index")
             .and_then(Value::as_u64)
@@ -951,7 +948,7 @@ impl ResponseStreamState {
     fn close_output(
         &mut self,
         output_index: u64,
-        output: &mut Vec<u8>,
+        output: &mut Vec<sse::Event>,
     ) -> Result<(), GatewayError> {
         let Some(index) = self.output_to_block.remove(&output_index) else {
             return Ok(());
@@ -982,7 +979,7 @@ impl ResponseStreamState {
             json!({"type":"content_block_stop","index":index}),
         )
     }
-    fn finish(&mut self, output: &mut Vec<u8>) -> Result<(), GatewayError> {
+    fn finish(&mut self, output: &mut Vec<sse::Event>) -> Result<(), GatewayError> {
         if self.lifecycle == StreamLifecycle::Finished {
             return Ok(());
         }
@@ -1009,40 +1006,9 @@ impl ResponseStreamState {
     }
 }
 
-fn frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
-    let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(lf), Some(crlf)) if lf < crlf => Some((lf, 2)),
-        (_, Some(crlf)) => Some((crlf, 4)),
-        (Some(lf), None) => Some((lf, 2)),
-        _ => None,
-    }
-}
-fn event_data(frame: &[u8]) -> Result<Option<String>, GatewayError> {
-    let frame = std::str::from_utf8(frame).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
-    let data = frame
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>();
-    Ok((!data.is_empty()).then(|| data.join("\n")))
-}
-fn event_name(frame: &[u8]) -> Option<&str> {
-    std::str::from_utf8(frame)
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("event:"))
-        .map(str::trim)
-}
-#[allow(clippy::needless_pass_by_value)]
-fn emit(output: &mut Vec<u8>, name: &str, value: Value) -> Result<(), GatewayError> {
-    let data = serde_json::to_string(&value).map_err(|_| GatewayError::Internal)?;
-    output.extend_from_slice(b"event: ");
-    output.extend_from_slice(name.as_bytes());
-    output.extend_from_slice(b"\ndata: ");
-    output.extend_from_slice(data.as_bytes());
-    output.extend_from_slice(b"\n\n");
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn emit(output: &mut Vec<sse::Event>, name: &str, value: Value) -> Result<(), GatewayError> {
+    output.push(sse::Event::json(name, &value));
     Ok(())
 }
 
@@ -1116,8 +1082,8 @@ mod tests {
         assert_eq!(request["input"][0]["encrypted_content"], "opaque-token");
     }
 
-    #[test]
-    fn responses_stream_converts_parallel_tools_and_usage() {
+    #[tokio::test]
+    async fn responses_stream_converts_parallel_tools_and_usage() {
         let source = concat!(
             "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
             "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"Read\"}}\n\n",
@@ -1129,11 +1095,18 @@ mod tests {
         );
         let mut converter = StreamConverter::new("claude-public".to_owned(), false);
         let split = source.len() / 2;
+        let events = sse::parse_chunks(vec![
+            Bytes::copy_from_slice(&source.as_bytes()[..split]),
+            Bytes::copy_from_slice(&source.as_bytes()[split..]),
+        ])
+        .await
+        .unwrap();
         let mut output = Vec::new();
-        output.extend_from_slice(&converter.push(&source.as_bytes()[..split]).unwrap());
-        output.extend_from_slice(&converter.push(&source.as_bytes()[split..]).unwrap());
-        output.extend_from_slice(&converter.finish().unwrap());
-        let output = String::from_utf8(output).unwrap();
+        for event in events {
+            output.extend(converter.push_event(&event).unwrap());
+        }
+        output.extend(converter.finish().unwrap());
+        let output = String::from_utf8(sse::encode(output).await.to_vec()).unwrap();
         assert_eq!(output.matches(r#""type":"tool_use""#).count(), 2);
         assert!(output.contains(r#""id":"call_1""#));
         assert!(output.contains(r#""id":"call_2""#));
