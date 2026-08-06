@@ -61,6 +61,7 @@ pub struct Scheduler {
     queue_kib: Arc<Semaphore>,
     queued_requests: Arc<AtomicUsize>,
     queued_bytes: Arc<AtomicUsize>,
+    admission_waiters: Arc<AtomicUsize>,
 }
 
 #[derive(Debug)]
@@ -74,6 +75,24 @@ struct QueueAccounting {
     requests: Arc<AtomicUsize>,
     bytes: Arc<AtomicUsize>,
     rounded_bytes: usize,
+}
+
+#[derive(Debug)]
+struct AdmissionWaiter {
+    waiters: Arc<AtomicUsize>,
+}
+
+impl AdmissionWaiter {
+    fn new(waiters: Arc<AtomicUsize>) -> Self {
+        waiters.fetch_add(1, AtomicOrdering::Relaxed);
+        Self { waiters }
+    }
+}
+
+impl Drop for AdmissionWaiter {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
 }
 
 impl QueueAccounting {
@@ -113,6 +132,7 @@ impl Scheduler {
             queue_kib: Arc::new(Semaphore::new(queue_max_kib)),
             queued_requests: Arc::new(AtomicUsize::new(0)),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
+            admission_waiters: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -222,6 +242,7 @@ impl Scheduler {
     pub async fn admit_ingress(&self, body_bytes: usize) -> IngressAdmission {
         let body_kib = u32::try_from(body_bytes.div_ceil(1024).max(1).min(u32::MAX as usize))
             .unwrap_or(u32::MAX);
+        let waiter = AdmissionWaiter::new(Arc::clone(&self.admission_waiters));
         let request = Arc::clone(&self.queue_slots)
             .acquire_owned()
             .await
@@ -230,6 +251,7 @@ impl Scheduler {
             .acquire_many_owned(body_kib)
             .await
             .expect("ingress byte semaphore is never closed");
+        drop(waiter);
         IngressAdmission {
             _request: request,
             _bytes: bytes,
@@ -485,6 +507,10 @@ impl Scheduler {
         )
     }
 
+    pub fn admission_waiters(&self) -> usize {
+        self.admission_waiters.load(AtomicOrdering::Relaxed)
+    }
+
     pub fn notify_state_change(&self) {
         self.notify.notify_waiters();
     }
@@ -610,6 +636,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(selected.node.id(), "second");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn ingress_admission_reports_waiters_and_releases_them_on_cancel() {
+        let config = RoutingConfig {
+            queue_max_requests: 1,
+            queue_max_bytes: 1_024,
+            ..RoutingConfig::default()
+        };
+        let scheduler = Arc::new(Scheduler::new(Vec::new(), config));
+        let held = scheduler.admit_ingress(1).await;
+        let pending = tokio::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            async move { scheduler.admit_ingress(1).await }
+        });
+        while scheduler.admission_waiters() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(scheduler.admission_waiters(), 1);
+        pending.abort();
+        let _ = pending.await;
+        assert_eq!(scheduler.admission_waiters(), 0);
         drop(held);
     }
 

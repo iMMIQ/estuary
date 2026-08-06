@@ -130,8 +130,13 @@ export interface GatewayStatus {
   queue: {
     requests: number;
     bytes: number;
+    admission_waiters: number;
     max_requests: number;
     max_bytes: number;
+  };
+  connections: {
+    public: number;
+    max_public: number;
   };
   response_buffer: {
     used_bytes: number;

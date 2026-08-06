@@ -865,8 +865,9 @@ impl Node {
         }
     }
 
-    pub fn record_probe_failure(&self, message: impl Into<String>, health: &HealthConfig) {
+    pub fn record_probe_failure(&self, message: impl Into<String>, health: &HealthConfig) -> bool {
         let mut stats = self.stats.lock();
+        let previous = self.health();
         stats.consecutive_probe_successes = 0;
         stats.consecutive_active_failures = stats.consecutive_active_failures.saturating_add(1);
         stats.last_error = Some(message.into());
@@ -875,6 +876,7 @@ impl Node {
         } else if self.health() == HealthState::Healthy {
             self.set_health_locked(HealthState::Degraded, &mut stats);
         }
+        self.health() != previous
     }
 
     fn set_health_locked(&self, next_health: HealthState, runtime: &mut RuntimeStats) {

@@ -1,12 +1,14 @@
 use std::{
     collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, Cursor},
+    mem::size_of,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
 use parking_lot::Mutex;
 use prometheus_parse::{Scrape, Value as MetricValue};
 use reqwest::Client;
@@ -34,6 +36,10 @@ const MIN_VLLM_VERSION: Version = Version::new(0, 25, 0);
 const MAX_MANAGEMENT_BODY_BYTES: usize = 8 * 1024 * 1024;
 const VERSION_RECHECK_TICKS: u64 = 30;
 const KV_HEALTH_POLL_MAX: Duration = Duration::from_millis(250);
+const TASK_STABLE_UPTIME: Duration = Duration::from_secs(60);
+const TASK_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_TOKENIZATION_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const TOKENIZATION_CACHE_ENTRY_OVERHEAD: usize = 128;
 
 #[derive(Debug, thiserror::Error)]
 #[error("vLLM upstream is unhealthy; full KV replay is required")]
@@ -78,6 +84,14 @@ struct ManagedNodeTasks {
     node: Arc<Node>,
     shutdown: watch::Sender<bool>,
     handles: Vec<JoinHandle<()>>,
+    started_at: Instant,
+}
+
+#[derive(Debug)]
+struct TaskRestart {
+    instance_id: u64,
+    failures: u32,
+    not_before: Instant,
 }
 
 impl VllmManager {
@@ -111,6 +125,7 @@ impl VllmManager {
 
     pub async fn run(self: Arc<Self>, client: Client, mut shutdown: watch::Receiver<bool>) {
         let mut tasks = HashMap::<String, ManagedNodeTasks>::new();
+        let mut restarts = HashMap::<String, TaskRestart>::new();
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
@@ -120,7 +135,7 @@ impl VllmManager {
                         break;
                     }
                 }
-                _ = interval.tick() => self.reconcile_tasks(&client, &mut tasks).await,
+                _ = interval.tick() => self.reconcile_tasks(&client, &mut tasks, &mut restarts).await,
             }
         }
         for (_, task) in tasks {
@@ -145,6 +160,7 @@ impl VllmManager {
         &self,
         client: &Client,
         tasks: &mut HashMap<String, ManagedNodeTasks>,
+        restarts: &mut HashMap<String, TaskRestart>,
     ) {
         let nodes = self
             .scheduler
@@ -166,9 +182,46 @@ impl VllmManager {
             if let Some(task) = tasks.remove(&id) {
                 stop_managed_tasks(task).await;
             }
+            restarts.remove(&id);
+        }
+        let failed = tasks
+            .iter()
+            .filter(|(_, task)| task.handles.iter().any(JoinHandle::is_finished))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in failed {
+            if let Some(task) = tasks.remove(&id) {
+                let instance_id = task.node.instance_id();
+                warn!(
+                    node = id,
+                    "vLLM provider task exited unexpectedly; restarting node monitors"
+                );
+                stop_managed_tasks(task).await;
+                let restart = restarts.entry(id).or_insert(TaskRestart {
+                    instance_id,
+                    failures: 0,
+                    not_before: Instant::now(),
+                });
+                if restart.instance_id != instance_id {
+                    restart.instance_id = instance_id;
+                    restart.failures = 0;
+                }
+                restart.failures = restart.failures.saturating_add(1);
+                let delay = task_restart_delay(restart.failures);
+                restart.not_before = Instant::now() + delay;
+            }
         }
         for (id, node) in nodes {
-            if tasks.contains_key(&id) {
+            if let Some(task) = tasks.get(&id) {
+                if task.started_at.elapsed() >= TASK_STABLE_UPTIME {
+                    restarts.remove(&id);
+                }
+                continue;
+            }
+            if let Some(restart) = restarts.get(&id)
+                && restart.instance_id == node.instance_id()
+                && Instant::now() < restart.not_before
+            {
                 continue;
             }
             self.token_cache
@@ -200,6 +253,7 @@ impl VllmManager {
             node,
             shutdown,
             handles,
+            started_at: Instant::now(),
         }
     }
 
@@ -288,6 +342,11 @@ impl VllmManager {
             }
         }
     }
+}
+
+fn task_restart_delay(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(5);
+    Duration::from_secs(1_u64 << exponent).min(TASK_MAX_BACKOFF)
 }
 
 async fn stop_managed_tasks(task: ManagedNodeTasks) {
@@ -441,11 +500,7 @@ async fn management_get(client: &Client, node: &Node, path: &str) -> Result<Byte
     {
         bail!("vLLM management response is too large");
     }
-    let body = response.bytes().await?;
-    if body.len() > MAX_MANAGEMENT_BODY_BYTES {
-        bail!("vLLM management response is too large");
-    }
-    Ok(body)
+    read_bounded_response(response, "vLLM management response").await
 }
 
 fn parse_metrics(body: &[u8]) -> Result<VllmMetricsSnapshot> {
@@ -610,13 +665,23 @@ async fn request_tokenization(
     {
         bail!("vLLM tokenize response is too large");
     }
-    let body = response.bytes().await?;
-    if body.len() > MAX_MANAGEMENT_BODY_BYTES {
-        bail!("vLLM tokenize response is too large");
-    }
+    let body = read_bounded_response(response, "vLLM tokenize response").await?;
     Ok(serde_json::from_slice::<TokenizeResponse>(&body)
         .context("invalid /tokenize JSON")?
         .tokens)
+}
+
+async fn read_bounded_response(response: reqwest::Response, name: &str) -> Result<Bytes> {
+    let mut stream = response.bytes_stream();
+    let mut body = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > MAX_MANAGEMENT_BODY_BYTES {
+            bail!("{name} is too large");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
 }
 
 fn tokenization_key(
@@ -640,19 +705,27 @@ fn tokenization_key(
 
 #[derive(Debug)]
 struct TokenizationCache {
-    values: HashMap<[u8; 32], (Vec<u64>, u64)>,
+    values: HashMap<[u8; 32], (Vec<u64>, u64, usize)>,
     order: VecDeque<([u8; 32], u64)>,
     epoch: u64,
     capacity: usize,
+    used_bytes: usize,
+    max_bytes: usize,
 }
 
 impl TokenizationCache {
     fn new(capacity: usize) -> Self {
+        Self::with_max_bytes(capacity, MAX_TOKENIZATION_CACHE_BYTES)
+    }
+
+    fn with_max_bytes(capacity: usize, max_bytes: usize) -> Self {
         Self {
             values: HashMap::new(),
             order: VecDeque::new(),
             epoch: 0,
             capacity,
+            used_bytes: 0,
+            max_bytes,
         }
     }
 
@@ -663,27 +736,51 @@ impl TokenizationCache {
     fn get(&mut self, key: &[u8; 32]) -> Option<Vec<u64>> {
         let tokens = self.values.get(key)?.0.clone();
         self.epoch = self.epoch.wrapping_add(1);
-        self.values.insert(*key, (tokens.clone(), self.epoch));
+        let bytes = self.values.get(key)?.2;
+        self.values
+            .insert(*key, (tokens.clone(), self.epoch, bytes));
         self.order.push_back((*key, self.epoch));
+        self.compact_order_if_needed();
         Some(tokens)
     }
 
     fn insert(&mut self, key: [u8; 32], tokens: Vec<u64>) {
         self.epoch = self.epoch.wrapping_add(1);
-        self.values.insert(key, (tokens, self.epoch));
+        let bytes = TOKENIZATION_CACHE_ENTRY_OVERHEAD
+            .saturating_add(tokens.capacity().saturating_mul(size_of::<u64>()));
+        if let Some((_, _, previous_bytes)) = self.values.remove(&key) {
+            self.used_bytes = self.used_bytes.saturating_sub(previous_bytes);
+        }
+        self.used_bytes = self.used_bytes.saturating_add(bytes);
+        self.values.insert(key, (tokens, self.epoch, bytes));
         self.order.push_back((key, self.epoch));
-        while self.values.len() > self.capacity {
+        while self.values.len() > self.capacity || self.used_bytes > self.max_bytes {
             let Some((old_key, old_epoch)) = self.order.pop_front() else {
                 break;
             };
             if self
                 .values
                 .get(&old_key)
-                .is_some_and(|(_, epoch)| *epoch == old_epoch)
+                .is_some_and(|(_, epoch, _)| *epoch == old_epoch)
             {
-                self.values.remove(&old_key);
+                if let Some((_, _, bytes)) = self.values.remove(&old_key) {
+                    self.used_bytes = self.used_bytes.saturating_sub(bytes);
+                }
             }
         }
+        self.compact_order_if_needed();
+    }
+
+    fn compact_order_if_needed(&mut self) {
+        let limit = self.capacity.saturating_mul(2).max(1);
+        if self.order.len() <= limit {
+            return;
+        }
+        self.order.retain(|(key, epoch)| {
+            self.values
+                .get(key)
+                .is_some_and(|(_, current_epoch, _)| current_epoch == epoch)
+        });
     }
 }
 
@@ -1292,6 +1389,7 @@ mod tests {
 
     use axum::{
         Json, Router,
+        body::Body,
         extract::State,
         http::StatusCode,
         response::{IntoResponse, Response},
@@ -1364,6 +1462,64 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         (format!("http://{address}"), calls, handle)
+    }
+
+    #[test]
+    fn tokenization_lru_access_log_remains_bounded_on_hot_hits() {
+        let mut cache = TokenizationCache::new(4);
+        let key = [7; 32];
+        cache.insert(key, vec![1, 2, 3]);
+        for _ in 0..10_000 {
+            assert_eq!(cache.get(&key), Some(vec![1, 2, 3]));
+        }
+        assert_eq!(cache.values.len(), 1);
+        assert!(cache.order.len() <= cache.capacity.saturating_mul(2));
+    }
+
+    #[test]
+    fn tokenization_lru_enforces_its_byte_budget() {
+        let mut cache = TokenizationCache::with_max_bytes(10, 300);
+        cache.insert([1; 32], vec![1; 10]);
+        cache.insert([2; 32], vec![2; 10]);
+        assert!(cache.used_bytes <= cache.max_bytes);
+        assert_eq!(cache.values.len(), 1);
+        assert!(cache.get(&[1; 32]).is_none());
+        assert!(cache.get(&[2; 32]).is_some());
+    }
+
+    #[test]
+    fn provider_task_restart_delay_is_exponential_and_bounded() {
+        assert_eq!(task_restart_delay(1), Duration::from_secs(1));
+        assert_eq!(task_restart_delay(3), Duration::from_secs(4));
+        assert_eq!(task_restart_delay(100), TASK_MAX_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn management_response_is_rejected_while_streaming_past_limit() {
+        let router = Router::new().route(
+            "/large",
+            get(|| async {
+                Body::from_stream(futures_util::stream::iter([
+                    Ok::<_, std::io::Error>(Bytes::from(vec![0; MAX_MANAGEMENT_BODY_BYTES])),
+                    Ok(Bytes::from_static(b"x")),
+                ]))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let response = Client::new()
+            .get(format!("http://{address}/large"))
+            .send()
+            .await
+            .unwrap();
+        let error = read_bounded_response(response, "test body")
+            .await
+            .expect_err("response must be bounded");
+        assert!(error.to_string().contains("too large"));
+        server.abort();
     }
 
     fn vllm_node(base_url: &str) -> Arc<Node> {

@@ -46,6 +46,8 @@ impl NodeStore {
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "wal_autocheckpoint", 1_000)?;
+        connection.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS node_configs (

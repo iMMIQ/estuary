@@ -26,6 +26,8 @@ use crate::Settings;
 const PUBLIC_FD: i32 = 3;
 const CONTROL_REQUEST_LIMIT: u64 = 64 * 1024;
 const WORKER_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+const RESTART_STABLE_UPTIME: Duration = Duration::from_secs(60);
+const RESTART_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 pub struct SupervisorConfig {
@@ -96,6 +98,9 @@ struct SlotRuntime {
     release: PathBuf,
     child: Option<Child>,
     must_be_ready: bool,
+    started_at: Option<std::time::Instant>,
+    restart_failures: u32,
+    restart_not_before: std::time::Instant,
 }
 
 #[derive(Clone)]
@@ -138,6 +143,7 @@ struct RolloutJournal {
     phase: String,
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn run(config: SupervisorConfig) -> Result<()> {
     fs::create_dir_all(&config.runtime_dir).with_context(|| {
         format!(
@@ -168,6 +174,9 @@ pub async fn run(config: SupervisorConfig) -> Result<()> {
                 release,
                 child: None,
                 must_be_ready: false,
+                started_at: None,
+                restart_failures: 0,
+                restart_not_before: std::time::Instant::now(),
             })))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -200,6 +209,7 @@ pub async fn run(config: SupervisorConfig) -> Result<()> {
             let _ = fs::remove_file(supervisor.config.control_socket());
             return Err(error);
         }
+        reset_restart_backoff(&mut slot);
     }
     if let Err(error) = supervisor.finalize_recovered_rollout().await {
         supervisor.shutdown.cancel();
@@ -315,6 +325,7 @@ impl Supervisor {
             slot.must_be_ready = true;
         }
         info!(slot = slot.id.name(), release = %slot.release.display(), "worker is accepting traffic");
+        slot.started_at = Some(std::time::Instant::now());
         Ok(())
     }
 
@@ -442,6 +453,7 @@ impl Supervisor {
                 })?;
             return Err(error);
         }
+        reset_restart_backoff(&mut slot);
         Ok(previous)
     }
 
@@ -552,9 +564,9 @@ impl Supervisor {
                         false
                     }
                 },
-                None => true,
+                None => false,
             };
-            if !exited {
+            if slot.child.is_some() && !exited {
                 let ready = self
                     .client
                     .get(format!(
@@ -565,20 +577,35 @@ impl Supervisor {
                     .await
                     .is_ok_and(|response| response.status() == StatusCode::OK);
                 slot.must_be_ready |= ready;
+                if slot
+                    .started_at
+                    .is_some_and(|started| started.elapsed() >= RESTART_STABLE_UPTIME)
+                {
+                    reset_restart_backoff(&mut slot);
+                }
                 continue;
             }
             if exited {
                 slot.child = None;
+                schedule_restart(&mut slot);
+                continue;
+            }
+            if std::time::Instant::now() < slot.restart_not_before {
+                continue;
+            }
+            if slot.child.is_none() {
                 match read_release_link(&self.config.slot_link(slot.id)) {
                     Ok(release) => slot.release = release,
                     Err(error) => {
                         error!(slot = slot.id.name(), %error, "cannot resolve worker release");
+                        schedule_restart(&mut slot);
                         continue;
                     }
                 }
                 let require_ready = slot.must_be_ready;
                 if let Err(error) = self.start_slot(&mut slot, require_ready).await {
                     error!(slot = slot.id.name(), %error, "worker restart failed");
+                    schedule_restart(&mut slot);
                 }
             }
         }
@@ -718,6 +745,14 @@ fn apply_worker_environment(
             server.connect_timeout_ms.to_string(),
         )
         .env(
+            "ESTUARY_REQUEST_BODY_IDLE_TIMEOUT_MS",
+            server.request_body_idle_timeout_ms.to_string(),
+        )
+        .env(
+            "ESTUARY_REQUEST_BODY_TIMEOUT_MS",
+            server.request_body_timeout_ms.to_string(),
+        )
+        .env(
             "ESTUARY_UPSTREAM_HEADER_TIMEOUT_MS",
             server.upstream_header_timeout_ms.to_string(),
         )
@@ -748,6 +783,14 @@ fn apply_worker_environment(
         .env(
             "ESTUARY_MAX_REQUEST_BODY_BYTES",
             server.max_request_body_bytes.to_string(),
+        )
+        .env(
+            "ESTUARY_MAX_CONNECTIONS",
+            server.max_connections.to_string(),
+        )
+        .env(
+            "ESTUARY_MAX_ADMIN_CONNECTIONS",
+            server.max_admin_connections.to_string(),
         )
         .env(
             "ESTUARY_MAX_NON_STREAMING_RESPONSE_BYTES",
@@ -793,6 +836,14 @@ fn apply_worker_environment(
         .env(
             "ESTUARY_PREFIX_MAX_REQUEST_CHARS",
             routing.prefix.max_request_chars.to_string(),
+        )
+        .env(
+            "ESTUARY_PREFIX_MAX_TREES",
+            routing.prefix.max_trees.to_string(),
+        )
+        .env(
+            "ESTUARY_PREFIX_MAX_DIRECTORY_CHARS",
+            routing.prefix.max_directory_chars.to_string(),
         )
         .env(
             "ESTUARY_PREFIX_MAX_TREE_CHARS_PER_NODE",
@@ -1062,6 +1113,24 @@ fn stop_child(slot: &mut SlotRuntime) {
     }
 }
 
+fn reset_restart_backoff(slot: &mut SlotRuntime) {
+    slot.restart_failures = 0;
+    slot.restart_not_before = std::time::Instant::now();
+}
+
+fn schedule_restart(slot: &mut SlotRuntime) {
+    slot.restart_failures = slot.restart_failures.saturating_add(1);
+    let exponent = slot.restart_failures.saturating_sub(1).min(6);
+    let delay = Duration::from_secs(1_u64 << exponent).min(RESTART_MAX_BACKOFF);
+    slot.restart_not_before = std::time::Instant::now() + delay;
+    warn!(
+        slot = slot.id.name(),
+        failures = slot.restart_failures,
+        delay_ms = delay.as_millis(),
+        "worker restart scheduled"
+    );
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -1081,6 +1150,26 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_restart_backoff_is_bounded_and_resets() {
+        let mut slot = SlotRuntime {
+            id: SlotId::A,
+            release: PathBuf::from("release"),
+            child: None,
+            must_be_ready: false,
+            started_at: None,
+            restart_failures: 0,
+            restart_not_before: std::time::Instant::now(),
+        };
+        for _ in 0..20 {
+            schedule_restart(&mut slot);
+        }
+        assert_eq!(slot.restart_failures, 20);
+        assert!(slot.restart_not_before <= std::time::Instant::now() + RESTART_MAX_BACKOFF);
+        reset_restart_backoff(&mut slot);
+        assert_eq!(slot.restart_failures, 0);
+    }
 
     #[test]
     fn atomic_symlink_replaces_existing_target() {

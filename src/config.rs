@@ -9,6 +9,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+pub const MAX_TOKENIZE_CACHE_ENTRIES: usize = 65_536;
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
@@ -50,6 +52,8 @@ impl Settings {
             bail!("server.admin_token must not be empty");
         }
         if self.server.connect_timeout_ms == 0
+            || self.server.request_body_idle_timeout_ms == 0
+            || self.server.request_body_timeout_ms == 0
             || self.server.upstream_header_timeout_ms == 0
             || self.server.stream_idle_timeout_ms == 0
             || self.server.upstream_body_timeout_ms == 0
@@ -63,6 +67,13 @@ impl Settings {
         }
         if self.server.max_request_body_bytes == 0 {
             bail!("server.max_request_body_bytes must be greater than zero");
+        }
+        if self.server.max_connections == 0
+            || self.server.max_connections > tokio::sync::Semaphore::MAX_PERMITS
+            || self.server.max_admin_connections == 0
+            || self.server.max_admin_connections > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            bail!("server connection limits must be within the runtime semaphore limit");
         }
         if self.server.max_non_streaming_response_bytes == 0 {
             bail!("server.max_non_streaming_response_bytes must be greater than zero");
@@ -81,6 +92,9 @@ impl Settings {
 
         if self.routing.queue_max_requests == 0 || self.routing.queue_max_bytes < 1024 {
             bail!("routing queue limits must be greater than zero");
+        }
+        if self.routing.prefix.max_trees == 0 || self.routing.prefix.max_directory_chars == 0 {
+            bail!("routing prefix directory limits must be greater than zero");
         }
         if self.routing.queue_max_requests > tokio::sync::Semaphore::MAX_PERMITS {
             bail!("routing.queue_max_requests exceeds the runtime semaphore limit");
@@ -278,10 +292,12 @@ fn validate_provider(node: &NodeConfig, base_url: &Url) -> Result<()> {
             node.id
         );
     }
-    if provider.tokenize_cache_entries == 0 {
+    if provider.tokenize_cache_entries == 0
+        || provider.tokenize_cache_entries > MAX_TOKENIZE_CACHE_ENTRIES
+    {
         bail!(
-            "node {} provider.tokenize_cache_entries must be greater than zero",
-            node.id
+            "node {} provider.tokenize_cache_entries must be between 1 and {MAX_TOKENIZE_CACHE_ENTRIES}",
+            node.id,
         );
     }
     for (name, path) in [
@@ -345,6 +361,8 @@ pub struct ServerConfig {
     pub admin_token: Option<String>,
     pub admin_freeze_file: Option<PathBuf>,
     pub connect_timeout_ms: u64,
+    pub request_body_idle_timeout_ms: u64,
+    pub request_body_timeout_ms: u64,
     pub upstream_header_timeout_ms: u64,
     pub stream_idle_timeout_ms: u64,
     pub upstream_body_timeout_ms: u64,
@@ -354,6 +372,8 @@ pub struct ServerConfig {
     pub withdrawal_delay_ms: u64,
     pub shutdown_grace_ms: u64,
     pub max_request_body_bytes: usize,
+    pub max_connections: usize,
+    pub max_admin_connections: usize,
     pub max_non_streaming_response_bytes: usize,
     pub max_buffered_response_bytes: usize,
     pub expose_node_header: bool,
@@ -368,6 +388,8 @@ impl Default for ServerConfig {
             admin_token: None,
             admin_freeze_file: None,
             connect_timeout_ms: 5_000,
+            request_body_idle_timeout_ms: 30_000,
+            request_body_timeout_ms: 300_000,
             upstream_header_timeout_ms: 120_000,
             stream_idle_timeout_ms: 300_000,
             upstream_body_timeout_ms: 3_600_000,
@@ -377,6 +399,8 @@ impl Default for ServerConfig {
             withdrawal_delay_ms: 10_000,
             shutdown_grace_ms: 3_660_000,
             max_request_body_bytes: 16 * 1024 * 1024,
+            max_connections: 2_048,
+            max_admin_connections: 128,
             max_non_streaming_response_bytes: 64 * 1024 * 1024,
             max_buffered_response_bytes: 256 * 1024 * 1024,
             expose_node_header: false,
@@ -420,6 +444,8 @@ pub struct PrefixConfig {
     pub balance_rel_threshold: f64,
     pub max_request_chars: usize,
     pub max_tree_chars_per_node: usize,
+    pub max_trees: usize,
+    pub max_directory_chars: usize,
 }
 
 impl Default for PrefixConfig {
@@ -431,6 +457,8 @@ impl Default for PrefixConfig {
             balance_rel_threshold: 1.1,
             max_request_chars: 128 * 1024,
             max_tree_chars_per_node: 1_000_000,
+            max_trees: 256,
+            max_directory_chars: 16_000_000,
         }
     }
 }
@@ -738,6 +766,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_long_running_resource_limits() {
+        let mut settings = Settings::default();
+        settings.server.max_connections = 0;
+        assert!(settings.validate().is_err());
+
+        let mut settings = Settings::default();
+        settings.routing.prefix.max_trees = 0;
+        assert!(settings.validate().is_err());
+
+        let mut settings = Settings::default();
+        settings.routing.prefix.max_directory_chars = 0;
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
     fn rejects_zero_circuit_breaker_limits() {
         let node = NodeConfig {
             id: "node".to_owned(),
@@ -797,6 +840,23 @@ mod tests {
         };
         node.provider.kind = ProviderKind::Vllm;
         node.provider.waiting_threshold = 0;
+        let settings = Settings {
+            nodes: vec![node],
+            ..Settings::default()
+        };
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_excessive_vllm_tokenization_cache_capacity() {
+        let mut node = NodeConfig {
+            id: "vllm".to_owned(),
+            base_url: "http://localhost:8000/v1".to_owned(),
+            models: HashMap::from([("model".to_owned(), "model".to_owned())]),
+            ..NodeConfig::default()
+        };
+        node.provider.kind = ProviderKind::Vllm;
+        node.provider.tokenize_cache_entries = MAX_TOKENIZE_CACHE_ENTRIES + 1;
         let settings = Settings {
             nodes: vec![node],
             ..Settings::default()

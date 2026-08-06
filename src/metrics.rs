@@ -1,6 +1,10 @@
-use std::sync::{Arc, atomic::AtomicU64};
+use std::{
+    collections::HashSet,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 use anyhow::Result;
+use parking_lot::Mutex;
 use prometheus_client::{
     encoding::{EncodeLabelSet, text::encode},
     metrics::{
@@ -62,6 +66,8 @@ pub struct Metrics {
     node_exact_kv_ready: Family<NodeLabels, Gauge>,
     queue_requests: Gauge,
     queue_bytes: Gauge,
+    admission_waiters: Gauge,
+    public_connections: Gauge,
     response_buffer_bytes: Gauge,
     response_buffer_waiters: Gauge,
     request_duration: Histogram,
@@ -69,6 +75,9 @@ pub struct Metrics {
     tokenization_duration: Histogram,
     prefix_match_chars: Histogram,
     prefix_match_tokens: Histogram,
+    node_labels: Mutex<HashSet<NodeLabels>>,
+    attempt_labels: Mutex<HashSet<AttemptLabels>>,
+    retry_labels: Mutex<HashSet<AttemptLabels>>,
 }
 
 impl Metrics {
@@ -94,6 +103,8 @@ impl Metrics {
         let node_exact_kv_ready = Family::default();
         let queue_requests = Gauge::default();
         let queue_bytes = Gauge::default();
+        let admission_waiters = Gauge::default();
+        let public_connections = Gauge::default();
         let response_buffer_bytes = Gauge::default();
         let response_buffer_waiters = Gauge::default();
         let request_duration = Histogram::new(exponential_buckets(0.005, 2.0, 18));
@@ -195,13 +206,23 @@ impl Metrics {
         );
         registry.register(
             "queue_requests",
-            "Current requests waiting for queue admission or an upstream concurrency permit.",
+            "Requests waiting for an upstream concurrency permit after ingress admission.",
             queue_requests.clone(),
         );
         registry.register(
             "queue_bytes",
             "KiB-rounded request-body bytes held by all queued requests.",
             queue_bytes.clone(),
+        );
+        registry.register(
+            "admission_waiters",
+            "Requests waiting to enter the bounded ingress queue.",
+            admission_waiters.clone(),
+        );
+        registry.register(
+            "public_connections",
+            "Currently accepted public TCP connections.",
+            public_connections.clone(),
         );
         registry.register(
             "response_buffer_bytes",
@@ -261,6 +282,8 @@ impl Metrics {
             node_exact_kv_ready,
             queue_requests,
             queue_bytes,
+            admission_waiters,
+            public_connections,
             response_buffer_bytes,
             response_buffer_waiters,
             request_duration,
@@ -268,6 +291,9 @@ impl Metrics {
             tokenization_duration,
             prefix_match_chars,
             prefix_match_tokens,
+            node_labels: Mutex::new(HashSet::new()),
+            attempt_labels: Mutex::new(HashSet::new()),
+            retry_labels: Mutex::new(HashSet::new()),
         })
     }
 
@@ -281,21 +307,23 @@ impl Metrics {
     }
 
     pub fn attempt(&self, node: &str, outcome: &str) {
-        self.attempts
-            .get_or_create(&AttemptLabels {
-                node: node.to_owned(),
-                outcome: outcome.to_owned(),
-            })
-            .inc();
+        let labels = AttemptLabels {
+            node: node.to_owned(),
+            outcome: outcome.to_owned(),
+        };
+        let mut tracked = self.attempt_labels.lock();
+        tracked.insert(labels.clone());
+        self.attempts.get_or_create(&labels).inc();
     }
 
     pub fn retry(&self, node: &str, reason: &str) {
-        self.retries
-            .get_or_create(&AttemptLabels {
-                node: node.to_owned(),
-                outcome: reason.to_owned(),
-            })
-            .inc();
+        let labels = AttemptLabels {
+            node: node.to_owned(),
+            outcome: reason.to_owned(),
+        };
+        let mut tracked = self.retry_labels.lock();
+        tracked.insert(labels.clone());
+        self.retries.get_or_create(&labels).inc();
     }
 
     pub fn tokenization(&self, outcome: &str, elapsed: std::time::Duration) {
@@ -308,19 +336,21 @@ impl Metrics {
     }
 
     pub fn stream_cancelled(&self, node: &str) {
-        self.stream_cancellations
-            .get_or_create(&NodeLabels {
-                node: node.to_owned(),
-            })
-            .inc();
+        let labels = NodeLabels {
+            node: node.to_owned(),
+        };
+        let mut tracked = self.node_labels.lock();
+        tracked.insert(labels.clone());
+        self.stream_cancellations.get_or_create(&labels).inc();
     }
 
     pub fn stream_error(&self, node: &str) {
-        self.stream_errors
-            .get_or_create(&NodeLabels {
-                node: node.to_owned(),
-            })
-            .inc();
+        let labels = NodeLabels {
+            node: node.to_owned(),
+        };
+        let mut tracked = self.node_labels.lock();
+        tracked.insert(labels.clone());
+        self.stream_errors.get_or_create(&labels).inc();
     }
 
     pub fn observe_request_duration(&self, seconds: f64) {
@@ -349,11 +379,69 @@ impl Metrics {
             .set(waiters.try_into().unwrap_or(i64::MAX));
     }
 
+    pub fn public_connection_opened(&self) {
+        self.public_connections.inc();
+    }
+
+    pub fn public_connection_closed(&self) {
+        self.public_connections.dec();
+    }
+
+    pub fn public_connections(&self) -> i64 {
+        self.public_connections.get()
+    }
+
+    pub fn remove_node(&self, node: &str) {
+        self.node_labels.lock().retain(|labels| {
+            if labels.node != node {
+                return true;
+            }
+            self.stream_cancellations.remove(labels);
+            self.stream_errors.remove(labels);
+            self.node_active.remove(labels);
+            self.node_health.remove(labels);
+            self.node_accepting_requests.remove(labels);
+            self.node_circuit_state.remove(labels);
+            self.node_provider_ready.remove(labels);
+            self.node_provider_state.remove(labels);
+            self.node_upstream_running.remove(labels);
+            self.node_upstream_waiting.remove(labels);
+            self.node_kv_cache_usage.remove(labels);
+            self.node_exact_kv_blocks.remove(labels);
+            self.node_exact_kv_bytes.remove(labels);
+            self.node_exact_kv_ready.remove(labels);
+            false
+        });
+        self.attempt_labels.lock().retain(|labels| {
+            if labels.node == node {
+                self.attempts.remove(labels);
+                false
+            } else {
+                true
+            }
+        });
+        self.retry_labels.lock().retain(|labels| {
+            if labels.node == node {
+                self.retries.remove(labels);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     pub fn encode(&self, scheduler: &Scheduler) -> Result<String> {
-        for node in scheduler.nodes() {
+        let nodes = scheduler.nodes();
+        let current_nodes = nodes
+            .iter()
+            .map(|node| node.id().to_owned())
+            .collect::<HashSet<_>>();
+        self.prune_removed_nodes(&current_nodes);
+        for node in nodes {
             let labels = NodeLabels {
                 node: node.id().to_owned(),
             };
+            self.node_labels.lock().insert(labels.clone());
             self.node_active
                 .get_or_create(&labels)
                 .set(node.active().try_into().unwrap_or(i64::MAX));
@@ -421,9 +509,33 @@ impl Metrics {
             .set(queued_requests.try_into().unwrap_or(i64::MAX));
         self.queue_bytes
             .set(queued_bytes.try_into().unwrap_or(i64::MAX));
+        self.admission_waiters
+            .set(scheduler.admission_waiters().try_into().unwrap_or(i64::MAX));
         let mut output = String::new();
         encode(&mut output, &self.registry)?;
         Ok(output)
+    }
+
+    fn prune_removed_nodes(&self, current_nodes: &HashSet<String>) {
+        let mut removed = HashSet::new();
+        for labels in &*self.node_labels.lock() {
+            if !current_nodes.contains(&labels.node) {
+                removed.insert(labels.node.clone());
+            }
+        }
+        for labels in &*self.attempt_labels.lock() {
+            if !current_nodes.contains(&labels.node) {
+                removed.insert(labels.node.clone());
+            }
+        }
+        for labels in &*self.retry_labels.lock() {
+            if !current_nodes.contains(&labels.node) {
+                removed.insert(labels.node.clone());
+            }
+        }
+        for node in removed.drain() {
+            self.remove_node(&node);
+        }
     }
 }
 
@@ -460,5 +572,35 @@ mod tests {
         assert!(output.contains("estuary_tokenization_duration_seconds_count 1"));
         assert!(output.contains("estuary_response_buffer_bytes 1024"));
         assert!(output.contains("estuary_response_buffer_waiters 2"));
+    }
+
+    #[test]
+    fn removes_all_series_for_deleted_nodes() {
+        let node = Node::from_config(&NodeConfig {
+            id: "temporary".to_owned(),
+            base_url: "http://node.invalid/v1".to_owned(),
+            models: HashMap::from([("model".to_owned(), "model".to_owned())]),
+            ..NodeConfig::default()
+        })
+        .unwrap();
+        let scheduler = Scheduler::new(vec![node], RoutingConfig::default());
+        let metrics = Metrics::new();
+        metrics.attempt("temporary", "success");
+        metrics.retry("temporary", "connect");
+        metrics.stream_error("temporary");
+        assert!(
+            metrics
+                .encode(&scheduler)
+                .unwrap()
+                .contains("node=\"temporary\"")
+        );
+
+        scheduler.remove_node("temporary");
+        assert!(
+            !metrics
+                .encode(&scheduler)
+                .unwrap()
+                .contains("node=\"temporary\"")
+        );
     }
 }

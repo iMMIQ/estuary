@@ -1,11 +1,14 @@
 use std::{
     collections::HashMap,
+    io,
     net::{SocketAddr, TcpListener as StdTcpListener},
     path::Path as FsPath,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering as AtomicOrdering},
     },
+    task::{Context as TaskContext, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -24,6 +27,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::{any, get, put},
+    serve::Listener,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::StreamExt;
@@ -33,8 +37,9 @@ use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpListener,
-    sync::{Mutex as AsyncMutex, watch},
+    sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, watch},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -80,6 +85,115 @@ pub struct Gateway {
 #[derive(RustEmbed)]
 #[folder = "web/dist"]
 struct AdminAssets;
+
+#[derive(Debug)]
+struct BoundedTcpListener {
+    inner: TcpListener,
+    permits: Arc<Semaphore>,
+    metrics: Arc<Metrics>,
+    track_public: bool,
+}
+
+impl BoundedTcpListener {
+    fn new(
+        inner: TcpListener,
+        max_connections: usize,
+        metrics: Arc<Metrics>,
+        track_public: bool,
+    ) -> Self {
+        Self {
+            inner,
+            permits: Arc::new(Semaphore::new(max_connections)),
+            metrics,
+            track_public,
+        }
+    }
+}
+
+impl Listener for BoundedTcpListener {
+    type Io = BoundedTcpStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .expect("public connection semaphore is never closed");
+        loop {
+            match self.inner.accept().await {
+                Ok((stream, address)) => {
+                    if self.track_public {
+                        self.metrics.public_connection_opened();
+                    }
+                    return (
+                        BoundedTcpStream {
+                            inner: stream,
+                            _permit: permit,
+                            metrics: Arc::clone(&self.metrics),
+                            track_public: self.track_public,
+                        },
+                        address,
+                    );
+                }
+                Err(error) => {
+                    warn!(%error, "failed to accept public connection");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+#[derive(Debug)]
+struct BoundedTcpStream {
+    inner: tokio::net::TcpStream,
+    _permit: OwnedSemaphorePermit,
+    metrics: Arc<Metrics>,
+    track_public: bool,
+}
+
+impl AsyncRead for BoundedTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for BoundedTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+impl Drop for BoundedTcpStream {
+    fn drop(&mut self) {
+        if self.track_public {
+            self.metrics.public_connection_closed();
+        }
+    }
+}
 
 impl Gateway {
     pub fn build(settings: Settings) -> Result<Self> {
@@ -258,20 +372,32 @@ impl Gateway {
         let (health_shutdown, health_receiver) = watch::channel(false);
         let (provider_shutdown, provider_receiver) = watch::channel(false);
         let (control_shutdown, control_receiver) = watch::channel(false);
-        let health_handle = tokio::spawn(run_health_monitor(
+        let mut health_handle = tokio::spawn(run_health_monitor(
             self.state.client.clone(),
             Arc::clone(&self.state.scheduler),
             self.state.settings.health.clone(),
             health_receiver,
         ));
-        let provider_handle = tokio::spawn(
+        let mut provider_handle = tokio::spawn(
             Arc::clone(&self.state.vllm).run(self.state.client.clone(), provider_receiver),
         );
-        let control_handle = tokio::spawn(run_control_reconciler(
+        let mut control_handle = tokio::spawn(run_control_reconciler(
             Arc::clone(&self.state),
             control_receiver,
         ));
 
+        let public_listener = BoundedTcpListener::new(
+            public_listener,
+            self.state.settings.server.max_connections,
+            Arc::clone(&self.state.metrics),
+            true,
+        );
+        let admin_listener = BoundedTcpListener::new(
+            admin_listener,
+            self.state.settings.server.max_admin_connections,
+            Arc::clone(&self.state.metrics),
+            false,
+        );
         let public_router = self.public_router();
         let admin_router = self.admin_router();
         let public_token = public_cancellation.clone();
@@ -298,6 +424,9 @@ impl Gateway {
 
         let mut public_done = false;
         let mut admin_done = false;
+        let mut health_done = false;
+        let mut provider_done = false;
+        let mut control_done = false;
         let mut first_error: Option<anyhow::Error> = None;
         tokio::select! {
             result = &mut public_handle => {
@@ -312,6 +441,21 @@ impl Gateway {
                 if let Err(error) = flatten_server_result(result) {
                     first_error = Some(error);
                 }
+                self.state.process.request_shutdown();
+            }
+            result = &mut health_handle => {
+                health_done = true;
+                first_error = Some(unexpected_background_exit("health monitor", result));
+                self.state.process.request_shutdown();
+            }
+            result = &mut provider_handle => {
+                provider_done = true;
+                first_error = Some(unexpected_background_exit("vLLM provider monitor", result));
+                self.state.process.request_shutdown();
+            }
+            result = &mut control_handle => {
+                control_done = true;
+                first_error = Some(unexpected_background_exit("control-plane reconciler", result));
                 self.state.process.request_shutdown();
             }
             () = shutdown_signal() => {
@@ -339,14 +483,19 @@ impl Gateway {
         let _ = health_shutdown.send(true);
         let _ = provider_shutdown.send(true);
         let _ = control_shutdown.send(true);
-        if let Err(error) = health_handle.await {
-            error!(error = %error, "health monitor task failed");
+        if !health_done && let Err(error) = health_handle.await {
+            first_error
+                .get_or_insert_with(|| anyhow::anyhow!("health monitor task failed: {error}"));
         }
-        if let Err(error) = provider_handle.await {
-            error!(error = %error, "vLLM provider monitor task failed");
+        if !provider_done && let Err(error) = provider_handle.await {
+            first_error.get_or_insert_with(|| {
+                anyhow::anyhow!("vLLM provider monitor task failed: {error}")
+            });
         }
-        if let Err(error) = control_handle.await {
-            error!(error = %error, "control-plane reconciler task failed");
+        if !control_done && let Err(error) = control_handle.await {
+            first_error.get_or_insert_with(|| {
+                anyhow::anyhow!("control-plane reconciler task failed: {error}")
+            });
         }
         self.state.process.mark_drained();
         if let Some(error) = first_error {
@@ -401,6 +550,16 @@ impl Gateway {
             }
         }
         first_error
+    }
+}
+
+fn unexpected_background_exit(
+    name: &'static str,
+    result: Result<(), tokio::task::JoinError>,
+) -> anyhow::Error {
+    match result {
+        Ok(()) => anyhow::anyhow!("{name} exited unexpectedly"),
+        Err(error) => anyhow::anyhow!("{name} task failed: {error}"),
     }
 }
 
@@ -514,6 +673,7 @@ async fn run_control_reconciler(state: Arc<AppState>, mut shutdown: watch::Recei
         state.settings.server.control_sync_interval_ms,
     ));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut failure_backoff = Duration::ZERO;
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -524,6 +684,21 @@ async fn run_control_reconciler(state: Arc<AppState>, mut shutdown: watch::Recei
             _ = interval.tick() => {
                 if let Err(error) = reconcile_control_plane(&state).await {
                     warn!(error = %error, "failed to reconcile shared node configuration");
+                    failure_backoff = if failure_backoff.is_zero() {
+                        Duration::from_secs(1)
+                    } else {
+                        failure_backoff.saturating_mul(2).min(Duration::from_secs(30))
+                    };
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                break;
+                            }
+                        }
+                        () = tokio::time::sleep(failure_backoff) => {}
+                    }
+                } else {
+                    failure_backoff = Duration::ZERO;
                 }
             }
         }
@@ -612,6 +787,7 @@ async fn reconcile_control_plane(state: &Arc<AppState>) -> Result<()> {
             continue;
         }
         state.scheduler.remove_node(node.id());
+        state.metrics.remove_node(node.id());
         state.runtime_revisions.write().remove(node.id());
     }
 
@@ -1008,8 +1184,13 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
         "queue": {
             "requests": queued_requests,
             "bytes": queued_bytes,
+            "admission_waiters": state.scheduler.admission_waiters(),
             "max_requests": state.settings.routing.queue_max_requests,
             "max_bytes": state.settings.routing.queue_max_bytes,
+        },
+        "connections": {
+            "public": state.metrics.public_connections(),
+            "max_public": state.settings.server.max_connections,
         },
         "response_buffer": {
             "used_bytes": response_buffer.used_bytes,
@@ -1304,6 +1485,7 @@ async fn delete_node(
         }
     }
     state.scheduler.remove_node(&node_id);
+    state.metrics.remove_node(&node_id);
     state.runtime_revisions.write().remove(&node_id);
     Json(json!({"deleted": true, "node": node_id})).into_response()
 }
@@ -1530,5 +1712,31 @@ mod tests {
         assert_eq!(metric_endpoint("/v1/chat/completions"), "chat_completions");
         assert_eq!(metric_endpoint("/v1/messages"), "anthropic_messages");
         assert_eq!(metric_endpoint("/v1/unknown/user-value"), "other");
+    }
+
+    #[tokio::test]
+    async fn public_listener_waits_before_accepting_above_connection_limit() {
+        let inner = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = inner.local_addr().unwrap();
+        let metrics = Metrics::new();
+        let mut listener = BoundedTcpListener::new(inner, 1, Arc::clone(&metrics), true);
+
+        let first_client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (first_server, _) = listener.accept().await;
+        assert_eq!(metrics.public_connections(), 1);
+        let second_client = tokio::net::TcpStream::connect(address).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+
+        drop(first_server);
+        let (second_server, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap();
+        assert_eq!(metrics.public_connections(), 1);
+        drop((first_client, second_client, second_server));
+        assert_eq!(metrics.public_connections(), 0);
     }
 }

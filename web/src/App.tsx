@@ -182,6 +182,7 @@ function Overview({
         <div className="usage-list">
           <UsageRow label="Local concurrency" value={active} total={totalConcurrency} tone="green" />
           <UsageRow label="Available capacity" value={status?.fleet.available_concurrency ?? 0} total={totalConcurrency} />
+          <UsageRow label="Public connections" value={status?.connections?.public ?? 0} total={status?.connections?.max_public ?? 0} />
           <div className="panel-stat-row"><span>Routable nodes</span><strong>{status?.fleet.routable_nodes ?? 0} <small>/ {status?.fleet.total_nodes ?? 0}</small></strong></div>
         </div>
       </section>
@@ -189,6 +190,7 @@ function Overview({
         <h2>Queue &amp; Response Memory</h2>
         <div className="usage-list">
           <UsageRow label="Queued requests" value={status?.queue.requests ?? 0} total={status?.queue.max_requests ?? 0} tone="amber" />
+          <div className="panel-stat-row"><span>Waiting for admission</span><strong className={(status?.queue.admission_waiters ?? 0) > 0 ? "metric-amber" : ""}>{status?.queue.admission_waiters ?? 0}</strong></div>
           <UsageRow label="Queued request bodies" value={status?.queue.bytes ?? 0} total={status?.queue.max_bytes ?? 0} display={formatBytes(status?.queue.bytes ?? 0)} totalDisplay={formatBytes(status?.queue.max_bytes ?? 0)} tone="amber" />
           <UsageRow label="Buffered responses" value={status?.response_buffer?.used_bytes ?? 0} total={status?.response_buffer?.max_bytes ?? 0} display={formatBytes(status?.response_buffer?.used_bytes ?? 0)} totalDisplay={formatBytes(status?.response_buffer?.max_bytes ?? 0)} />
           <div className="panel-stat-row"><span>Waiting for memory</span><strong className={(status?.response_buffer?.waiting_responses ?? 0) > 0 ? "metric-amber" : ""}>{status?.response_buffer?.waiting_responses ?? 0}</strong></div>

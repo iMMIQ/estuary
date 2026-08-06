@@ -18,6 +18,8 @@ pub enum GatewayError {
     NoHealthyNode(String),
     #[error("request body exceeds the configured gateway limit")]
     PayloadTooLarge,
+    #[error("request body was not received before the configured timeout")]
+    RequestTimeout,
     #[error("this feature is not supported by the gateway yet: {0}")]
     UnsupportedFeature(&'static str),
     #[error("invalid request: {0}")]
@@ -46,6 +48,7 @@ impl GatewayError {
             Self::UnknownModel(_) | Self::RouteNotFound => StatusCode::NOT_FOUND,
             Self::NoHealthyNode(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::InvalidUpstreamResponse | Self::Upstream(_) => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::UpstreamStatus(status) => {
@@ -62,6 +65,7 @@ impl GatewayError {
             Self::UnknownModel(_) => "model_not_found",
             Self::NoHealthyNode(_) => "no_healthy_upstream",
             Self::PayloadTooLarge => "request_too_large",
+            Self::RequestTimeout => "request_timeout",
             Self::UnsupportedFeature(_) => "unsupported_feature",
             Self::InvalidRequest(_) => "invalid_request",
             Self::InvalidUpstreamResponse => "invalid_upstream_response",
@@ -95,6 +99,7 @@ impl IntoResponse for GatewayError {
             | Self::MissingModel
             | Self::UnknownModel(_)
             | Self::PayloadTooLarge
+            | Self::RequestTimeout
             | Self::UnsupportedFeature(_)
             | Self::InvalidRequest(_)
             | Self::RouteNotFound => "invalid_request_error",

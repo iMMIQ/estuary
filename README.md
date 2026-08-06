@@ -86,6 +86,7 @@ For generic OpenAI-compatible servers, the gateway stores canonical prompt mater
 - it improves repeated-system-prompt and multi-turn locality;
 - it never bypasses model, health, or concurrency checks;
 - it switches completely to load-first routing when both configured load-imbalance thresholds are exceeded;
+- its model-tree count, total approximate-directory characters, and per-node tree footprint are independently bounded;
 - it is lost on restart and can differ from the server's real tokenizer or cache eviction state.
 
 Before routing or forwarding a JSON inference request, Estuary removes Claude Code's standalone `x-anthropic-billing-header:` system text block. That block contains the CLI version/build identifier and entrypoint but no model instruction, so retaining it fragments both local affinity and upstream KV prefixes across Claude Code releases. The match is intentionally narrow: multiline content, environment details, tool instructions, ordinary system messages, and user content are preserved. This cleanup applies before Messages-to-Chat conversion and vLLM tokenization.
@@ -282,6 +283,8 @@ Important metric families include:
 - `estuary_queue_duration_seconds`
 - `estuary_response_buffer_bytes`
 - `estuary_response_buffer_waiters`
+- `estuary_admission_waiters`
+- `estuary_public_connections`
 - `estuary_tokenization_outcomes_total`
 - `estuary_tokenization_duration_seconds`
 - `estuary_prefix_match_chars`

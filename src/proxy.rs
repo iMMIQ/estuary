@@ -87,16 +87,58 @@ pub async fn proxy(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let is_anthropic = matches!(endpoint.as_str(), "messages" | "messages/count_tokens")
         || endpoint.starts_with("files/");
     let gateway_request_id = request_id.0.clone();
+    let body = match read_request_body(
+        body,
+        state.settings.server.max_request_body_bytes,
+        Duration::from_millis(state.settings.server.request_body_idle_timeout_ms),
+        Duration::from_millis(state.settings.server.request_body_timeout_ms),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(error) if is_anthropic => {
+            return anthropic::error_response(&error, &gateway_request_id);
+        }
+        Err(error) => return error.into_response(),
+    };
     match proxy_inner(state, endpoint, request_id, method, uri, headers, body).await {
         Ok(response) => response,
         Err(error) if is_anthropic => anthropic::error_response(&error, &gateway_request_id),
         Err(error) => error.into_response(),
     }
+}
+
+async fn read_request_body(
+    body: Body,
+    limit: usize,
+    idle_timeout: Duration,
+    total_timeout: Duration,
+) -> Result<Bytes, GatewayError> {
+    let mut stream = body.into_data_stream();
+    let mut output = BytesMut::new();
+    let deadline = tokio::time::Instant::now() + total_timeout;
+    loop {
+        let item =
+            tokio::time::timeout_at(deadline, tokio::time::timeout(idle_timeout, stream.next()))
+                .await
+                .map_err(|_| GatewayError::RequestTimeout)?
+                .map_err(|_| GatewayError::RequestTimeout)?;
+        let Some(item) = item else {
+            break;
+        };
+        let bytes = item
+            .map_err(|_| GatewayError::InvalidRequest("failed to read request body".to_owned()))?;
+        if output.len().saturating_add(bytes.len()) > limit {
+            return Err(GatewayError::PayloadTooLarge);
+        }
+        output.extend_from_slice(&bytes);
+    }
+    Ok(output.freeze())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1683,9 +1725,36 @@ pub async fn not_found() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
+    use bytes::Bytes;
+    use futures_util::stream;
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test]
+    async fn request_body_reader_enforces_size_and_idle_timeouts() {
+        let oversized = Body::from_stream(stream::iter([Ok::<_, io::Error>(Bytes::from_static(
+            b"too large",
+        ))]));
+        assert!(matches!(
+            read_request_body(oversized, 4, Duration::from_secs(1), Duration::from_secs(1)).await,
+            Err(GatewayError::PayloadTooLarge)
+        ));
+
+        let stalled = Body::from_stream(stream::pending::<Result<Bytes, io::Error>>());
+        assert!(matches!(
+            read_request_body(
+                stalled,
+                16,
+                Duration::from_millis(10),
+                Duration::from_secs(1)
+            )
+            .await,
+            Err(GatewayError::RequestTimeout)
+        ));
+    }
 
     #[test]
     fn strips_client_credentials_and_hop_headers() {

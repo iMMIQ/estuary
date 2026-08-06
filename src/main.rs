@@ -25,6 +25,10 @@ struct Cli {
     log_json: bool,
     #[arg(long, env = "ESTUARY_CONNECT_TIMEOUT_MS")]
     connect_timeout_ms: Option<u64>,
+    #[arg(long, env = "ESTUARY_REQUEST_BODY_IDLE_TIMEOUT_MS")]
+    request_body_idle_timeout_ms: Option<u64>,
+    #[arg(long, env = "ESTUARY_REQUEST_BODY_TIMEOUT_MS")]
+    request_body_timeout_ms: Option<u64>,
     #[arg(long, env = "ESTUARY_UPSTREAM_HEADER_TIMEOUT_MS")]
     upstream_header_timeout_ms: Option<u64>,
     #[arg(long, env = "ESTUARY_STREAM_IDLE_TIMEOUT_MS")]
@@ -43,6 +47,10 @@ struct Cli {
     shutdown_grace_ms: Option<u64>,
     #[arg(long, env = "ESTUARY_MAX_REQUEST_BODY_BYTES")]
     max_request_body_bytes: Option<usize>,
+    #[arg(long, env = "ESTUARY_MAX_CONNECTIONS")]
+    max_connections: Option<usize>,
+    #[arg(long, env = "ESTUARY_MAX_ADMIN_CONNECTIONS")]
+    max_admin_connections: Option<usize>,
     #[arg(long, env = "ESTUARY_MAX_NON_STREAMING_RESPONSE_BYTES")]
     max_non_streaming_response_bytes: Option<usize>,
     #[arg(long, env = "ESTUARY_MAX_BUFFERED_RESPONSE_BYTES")]
@@ -71,6 +79,10 @@ struct Cli {
     prefix_balance_rel_threshold: Option<f64>,
     #[arg(long, env = "ESTUARY_PREFIX_MAX_REQUEST_CHARS")]
     prefix_max_request_chars: Option<usize>,
+    #[arg(long, env = "ESTUARY_PREFIX_MAX_TREES")]
+    prefix_max_trees: Option<usize>,
+    #[arg(long, env = "ESTUARY_PREFIX_MAX_DIRECTORY_CHARS")]
+    prefix_max_directory_chars: Option<usize>,
     #[arg(long, env = "ESTUARY_PREFIX_MAX_TREE_CHARS_PER_NODE")]
     prefix_max_tree_chars_per_node: Option<usize>,
     #[arg(long, env = "ESTUARY_HEALTH_INTERVAL_MS")]
@@ -265,6 +277,14 @@ fn apply_cli(settings: &mut Settings, cli: &Cli) {
     settings.server.log_json = cli.log_json;
     apply!(settings.server.connect_timeout_ms, cli.connect_timeout_ms);
     apply!(
+        settings.server.request_body_idle_timeout_ms,
+        cli.request_body_idle_timeout_ms
+    );
+    apply!(
+        settings.server.request_body_timeout_ms,
+        cli.request_body_timeout_ms
+    );
+    apply!(
         settings.server.upstream_header_timeout_ms,
         cli.upstream_header_timeout_ms
     );
@@ -293,6 +313,11 @@ fn apply_cli(settings: &mut Settings, cli: &Cli) {
     apply!(
         settings.server.max_request_body_bytes,
         cli.max_request_body_bytes
+    );
+    apply!(settings.server.max_connections, cli.max_connections);
+    apply!(
+        settings.server.max_admin_connections,
+        cli.max_admin_connections
     );
     apply!(
         settings.server.max_non_streaming_response_bytes,
@@ -325,6 +350,11 @@ fn apply_cli(settings: &mut Settings, cli: &Cli) {
     apply!(
         settings.routing.prefix.max_request_chars,
         cli.prefix_max_request_chars
+    );
+    apply!(settings.routing.prefix.max_trees, cli.prefix_max_trees);
+    apply!(
+        settings.routing.prefix.max_directory_chars,
+        cli.prefix_max_directory_chars
     );
     apply!(
         settings.routing.prefix.max_tree_chars_per_node,

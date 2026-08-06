@@ -99,12 +99,18 @@ async fn probe(client: &Client, node: &Arc<Node>, config: &HealthConfig) {
         }
         Ok(response) => {
             let message = format!("health probe returned {}", response.status());
-            node.record_probe_failure(&message, config);
-            warn!(node = node.id(), status = %response.status(), "health probe failed");
+            if node.record_probe_failure(&message, config) {
+                warn!(node = node.id(), status = %response.status(), "health state changed after probe failure");
+            } else {
+                debug!(node = node.id(), status = %response.status(), "health probe remains unsuccessful");
+            }
         }
         Err(error) => {
-            node.record_probe_failure(error.to_string(), config);
-            warn!(node = node.id(), error = %error, "health probe failed");
+            if node.record_probe_failure(error.to_string(), config) {
+                warn!(node = node.id(), error = %error, "health state changed after probe failure");
+            } else {
+                debug!(node = node.id(), error = %error, "health probe remains unsuccessful");
+            }
         }
     }
 }

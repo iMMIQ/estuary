@@ -9,6 +9,8 @@ use serde_json::Value;
 
 use crate::config::PrefixConfig;
 
+const MAX_TREE_KEY_BYTES: usize = 1_024;
+
 #[derive(Clone, Debug, Default)]
 pub struct PrefixInput {
     tree_key: String,
@@ -277,7 +279,22 @@ fn remove_tenant_at_path(node: &mut RadixNode, tenant: &str, path: &[char], dept
 pub struct PrefixDirectory {
     enabled: bool,
     max_tree_chars_per_node: usize,
-    trees: RwLock<HashMap<String, Arc<RwLock<RadixTree>>>>,
+    max_trees: usize,
+    max_directory_chars: usize,
+    trees: RwLock<PrefixTrees>,
+}
+
+#[derive(Debug, Default)]
+struct PrefixTrees {
+    values: HashMap<String, TreeEntry>,
+    epoch: u64,
+}
+
+#[derive(Debug)]
+struct TreeEntry {
+    tree: Arc<RwLock<RadixTree>>,
+    last_recorded: u64,
+    accounted_chars: usize,
 }
 
 impl PrefixDirectory {
@@ -285,39 +302,86 @@ impl PrefixDirectory {
         Self {
             enabled: config.enabled,
             max_tree_chars_per_node: config.max_tree_chars_per_node,
-            trees: RwLock::new(HashMap::new()),
+            max_trees: config.max_trees,
+            max_directory_chars: config.max_directory_chars,
+            trees: RwLock::new(PrefixTrees::default()),
         }
     }
 
     pub fn record(&self, node_id: &str, input: &PrefixInput) {
-        if !self.enabled || input.text.is_empty() {
+        if !self.enabled || input.text.is_empty() || input.tree_key.len() > MAX_TREE_KEY_BYTES {
             return;
         }
-        let tree = self
-            .trees
-            .write()
+        let mut trees = self.trees.write();
+        trees.epoch = trees.epoch.wrapping_add(1);
+        let epoch = trees.epoch;
+        if !trees.values.contains_key(&input.tree_key) && trees.values.len() >= self.max_trees {
+            evict_oldest_tree(&mut trees.values);
+        }
+        let entry = trees
+            .values
             .entry(input.tree_key.clone())
-            .or_insert_with(|| Arc::new(RwLock::new(RadixTree::default())))
-            .clone();
-        tree.write()
-            .insert(&input.text, node_id, self.max_tree_chars_per_node);
+            .or_insert_with(|| TreeEntry {
+                tree: Arc::new(RwLock::new(RadixTree::default())),
+                last_recorded: epoch,
+                accounted_chars: 0,
+            });
+        entry.last_recorded = epoch;
+        let mut tree = entry.tree.write();
+        tree.insert(&input.text, node_id, self.max_tree_chars_per_node);
+        entry.accounted_chars = tree
+            .tenant_char_count
+            .values()
+            .fold(0_usize, |total, chars| total.saturating_add(*chars));
+        drop(tree);
+        while trees.values.values().fold(0_usize, |total, entry| {
+            total.saturating_add(entry.accounted_chars)
+        }) > self.max_directory_chars
+        {
+            if !evict_oldest_tree(&mut trees.values) {
+                break;
+            }
+        }
     }
 
     pub fn best_match(&self, input: &PrefixInput) -> PrefixMatch {
-        if !self.enabled || input.text.is_empty() {
+        if !self.enabled || input.text.is_empty() || input.tree_key.len() > MAX_TREE_KEY_BYTES {
             return PrefixMatch::default();
         }
-        let tree = self.trees.read().get(&input.tree_key).cloned();
+        let tree = self
+            .trees
+            .read()
+            .values
+            .get(&input.tree_key)
+            .map(|entry| Arc::clone(&entry.tree));
         tree.map_or_else(PrefixMatch::default, |tree| {
             tree.read().prefix_match(&input.text, input.char_count())
         })
     }
 
     pub fn clear_node(&self, node_id: &str) {
-        for tree in self.trees.read().values() {
-            tree.write().clear_tenant(node_id);
-        }
+        self.trees.write().values.retain(|_, entry| {
+            let mut tree = entry.tree.write();
+            tree.clear_tenant(node_id);
+            entry.accounted_chars = tree
+                .tenant_char_count
+                .values()
+                .fold(0_usize, |total, chars| total.saturating_add(*chars));
+            entry.accounted_chars > 0
+        });
     }
+}
+
+fn evict_oldest_tree(trees: &mut HashMap<String, TreeEntry>) -> bool {
+    let Some(oldest) = trees
+        .iter()
+        .min_by_key(|(_, entry)| entry.last_recorded)
+        .map(|(key, _)| key.clone())
+    else {
+        return false;
+    };
+    trees.remove(&oldest);
+    true
 }
 
 pub fn routing_text(
@@ -604,6 +668,79 @@ mod tests {
     }
 
     #[test]
+    fn directory_evicts_old_model_trees_and_removes_empty_trees() {
+        let config = PrefixConfig {
+            max_trees: 2,
+            ..PrefixConfig::default()
+        };
+        let directory = PrefixDirectory::new(&config);
+        for model in ["a", "b", "c"] {
+            let input = routing_text(
+                "completions",
+                Some(model),
+                Some(&json!({"prompt": model})),
+                &config,
+            );
+            directory.record("node-a", &input);
+        }
+        assert_eq!(directory.trees.read().values.len(), 2);
+        let evicted = routing_text(
+            "completions",
+            Some("a"),
+            Some(&json!({"prompt": "a"})),
+            &config,
+        );
+        assert!(directory.best_match(&evicted).node_ids.is_empty());
+
+        directory.clear_node("node-a");
+        assert!(directory.trees.read().values.is_empty());
+    }
+
+    #[test]
+    fn directory_enforces_global_character_budget_and_tree_key_limit() {
+        let config = PrefixConfig {
+            max_trees: 10,
+            max_directory_chars: 80,
+            ..PrefixConfig::default()
+        };
+        let directory = PrefixDirectory::new(&config);
+        for model in ["a", "b", "c"] {
+            directory.record(
+                "node-a",
+                &routing_text(
+                    "completions",
+                    Some(model),
+                    Some(&json!({"prompt": "a moderately long prompt value"})),
+                    &config,
+                ),
+            );
+        }
+        let trees = directory.trees.read();
+        assert!(
+            trees
+                .values
+                .values()
+                .map(|entry| entry.accounted_chars)
+                .sum::<usize>()
+                <= config.max_directory_chars
+        );
+        drop(trees);
+
+        let before = directory.trees.read().values.len();
+        let long_model = "m".repeat(MAX_TREE_KEY_BYTES + 1);
+        directory.record(
+            "node-a",
+            &routing_text(
+                "completions",
+                Some(&long_model),
+                Some(&json!({"prompt": "ignored"})),
+                &config,
+            ),
+        );
+        assert_eq!(directory.trees.read().values.len(), before);
+    }
+
+    #[test]
     fn eviction_bounds_each_tenant_tree() {
         let config = PrefixConfig {
             max_tree_chars_per_node: 24,
@@ -620,7 +757,13 @@ mod tests {
             directory.record("node-a", &input);
         }
         let trees = directory.trees.read();
-        let tree = trees.values().next().expect("one model tree").read();
+        let tree = trees
+            .values
+            .values()
+            .next()
+            .expect("one model tree")
+            .tree
+            .read();
         assert!(
             tree.tenant_char_count
                 .get("node-a")
