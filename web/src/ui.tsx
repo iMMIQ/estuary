@@ -15,8 +15,8 @@ export function formatBytes(value: number): string {
   return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
-export function formatPercent(value: number | null): string {
-  return value === null ? "Unavailable" : `${Math.round(value * 100)}%`;
+export function formatPercent(value: number | null | undefined): string {
+  return value == null || !Number.isFinite(value) ? "Unavailable" : `${Math.round(value * 100)}%`;
 }
 
 export function formatTimestamp(value: number | null): string {

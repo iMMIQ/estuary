@@ -63,6 +63,13 @@ export interface NodeRuntime {
   upstream_running: number | null;
   upstream_waiting: number | null;
   kv_cache_usage: number | null;
+  prompt_tokens_per_second: number | null;
+  generation_tokens_per_second: number | null;
+  requests_per_second: number | null;
+  prefix_cache_queries_total: number | null;
+  prefix_cache_hits_total: number | null;
+  prefix_cache_hit_rate: number | null;
+  preemptions_total: number | null;
   latency_ewma_ms: number;
   error_ewma: number;
   last_error: string | null;

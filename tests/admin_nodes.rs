@@ -1,7 +1,10 @@
 use std::{collections::HashMap, time::Duration};
 
 use axum::{Json, Router, routing::get};
-use estuary::{Gateway, Settings, config::NodeConfig};
+use estuary::{
+    Gateway, Settings,
+    config::{NodeConfig, ProviderKind},
+};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
@@ -59,6 +62,61 @@ fn assert_empty_gateway_status(status: &Value) {
         status["response_buffer"]["max_bytes"],
         Settings::default().server.max_buffered_response_bytes
     );
+}
+
+#[tokio::test]
+async fn vllm_operational_metrics_are_exposed_as_structured_admin_data() {
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route(
+                "/v1/models",
+                get(|| async { Json(json!({"object": "list", "data": []})) }),
+            )
+            .route(
+                "/version",
+                get(|| async { Json(json!({"version": "0.25.0"})) }),
+            )
+            .route(
+                "/metrics",
+                get(|| async {
+                    concat!(
+                        "vllm:num_requests_running 2\n",
+                        "vllm:num_requests_waiting 1\n",
+                        "vllm:kv_cache_usage_perc 0.62\n",
+                        "vllm:prompt_tokens_total 1200\n",
+                        "vllm:generation_tokens_total 340\n",
+                        "vllm:request_success_total{finished_reason=\"stop\"} 8\n",
+                        "vllm:prefix_cache_queries_total 1000\n",
+                        "vllm:prefix_cache_hits_total 740\n",
+                        "vllm:num_preemptions_total 2\n",
+                    )
+                }),
+            ),
+    )
+    .await;
+    let mut config = node(&upstream.base_url);
+    config.provider.kind = ProviderKind::Vllm;
+    let mut settings = Settings::default();
+    settings.health.timeout_ms = 500;
+    let admin = TestServer::spawn(Gateway::build(settings).unwrap().admin_router()).await;
+
+    let created = client()
+        .post(admin.url("/admin/api/nodes"))
+        .json(&config)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = created.json::<Value>().await.unwrap();
+    assert_eq!(created["runtime"]["provider_version"], "0.25.0");
+    assert_eq!(created["runtime"]["upstream_running"], 2);
+    assert_eq!(created["runtime"]["upstream_waiting"], 1);
+    assert_eq!(created["runtime"]["kv_cache_usage"], 0.62);
+    assert_eq!(created["runtime"]["prefix_cache_hit_rate"], 0.74);
+    assert_eq!(created["runtime"]["prefix_cache_queries_total"], 1000.0);
+    assert_eq!(created["runtime"]["prefix_cache_hits_total"], 740.0);
+    assert_eq!(created["runtime"]["preemptions_total"], 2.0);
+    assert!(created["runtime"]["prompt_tokens_per_second"].is_null());
 }
 
 #[tokio::test]

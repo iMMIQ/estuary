@@ -110,6 +110,16 @@ struct ProviderRuntime {
     running: usize,
     waiting: usize,
     kv_cache_usage: Option<f64>,
+    prompt_tokens_total: Option<f64>,
+    generation_tokens_total: Option<f64>,
+    requests_total: Option<f64>,
+    prompt_tokens_per_second: Option<f64>,
+    generation_tokens_per_second: Option<f64>,
+    requests_per_second: Option<f64>,
+    prefix_cache_queries_total: Option<f64>,
+    prefix_cache_hits_total: Option<f64>,
+    prefix_cache_hit_rate: Option<f64>,
+    preemptions_total: Option<f64>,
     telemetry_updated_unix_ms: Option<u64>,
     compatibility_error: Option<String>,
     telemetry_error: Option<String>,
@@ -194,8 +204,28 @@ pub struct NodeSnapshot {
     pub upstream_running: Option<usize>,
     pub upstream_waiting: Option<usize>,
     pub kv_cache_usage: Option<f64>,
+    pub prompt_tokens_per_second: Option<f64>,
+    pub generation_tokens_per_second: Option<f64>,
+    pub requests_per_second: Option<f64>,
+    pub prefix_cache_queries_total: Option<f64>,
+    pub prefix_cache_hits_total: Option<f64>,
+    pub prefix_cache_hit_rate: Option<f64>,
+    pub preemptions_total: Option<f64>,
     pub provider_telemetry_updated_unix_ms: Option<u64>,
     pub provider_last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VllmMetricsSnapshot {
+    pub running: usize,
+    pub waiting: usize,
+    pub kv_cache_usage: Option<f64>,
+    pub prompt_tokens_total: Option<f64>,
+    pub generation_tokens_total: Option<f64>,
+    pub requests_total: Option<f64>,
+    pub prefix_cache_queries_total: Option<f64>,
+    pub prefix_cache_hits_total: Option<f64>,
+    pub preemptions_total: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -506,11 +536,49 @@ impl Node {
     }
 
     pub fn record_vllm_telemetry(&self, running: usize, waiting: usize, kv_usage: Option<f64>) {
+        self.record_vllm_metrics(VllmMetricsSnapshot {
+            running,
+            waiting,
+            kv_cache_usage: kv_usage,
+            ..VllmMetricsSnapshot::default()
+        });
+    }
+
+    pub(crate) fn record_vllm_metrics(&self, telemetry: VllmMetricsSnapshot) {
+        let updated_at = unix_millis();
         let mut runtime = self.provider_runtime.lock();
-        runtime.running = running;
-        runtime.waiting = waiting;
-        runtime.kv_cache_usage = kv_usage;
-        runtime.telemetry_updated_unix_ms = Some(unix_millis());
+        let elapsed_seconds = runtime
+            .telemetry_updated_unix_ms
+            .map(|previous| updated_at.saturating_sub(previous) as f64 / 1_000.0);
+        runtime.prompt_tokens_per_second = counter_rate(
+            telemetry.prompt_tokens_total,
+            runtime.prompt_tokens_total,
+            elapsed_seconds,
+        );
+        runtime.generation_tokens_per_second = counter_rate(
+            telemetry.generation_tokens_total,
+            runtime.generation_tokens_total,
+            elapsed_seconds,
+        );
+        runtime.requests_per_second = counter_rate(
+            telemetry.requests_total,
+            runtime.requests_total,
+            elapsed_seconds,
+        );
+        runtime.running = telemetry.running;
+        runtime.waiting = telemetry.waiting;
+        runtime.kv_cache_usage = telemetry.kv_cache_usage;
+        runtime.prompt_tokens_total = telemetry.prompt_tokens_total;
+        runtime.generation_tokens_total = telemetry.generation_tokens_total;
+        runtime.requests_total = telemetry.requests_total;
+        runtime.prefix_cache_queries_total = telemetry.prefix_cache_queries_total;
+        runtime.prefix_cache_hits_total = telemetry.prefix_cache_hits_total;
+        runtime.prefix_cache_hit_rate = prefix_cache_hit_rate(
+            telemetry.prefix_cache_hits_total,
+            telemetry.prefix_cache_queries_total,
+        );
+        runtime.preemptions_total = telemetry.preemptions_total;
+        runtime.telemetry_updated_unix_ms = Some(updated_at);
         runtime.telemetry_error = None;
     }
 
@@ -847,6 +915,13 @@ impl Node {
             upstream_running: has_telemetry.then_some(provider.running),
             upstream_waiting: has_telemetry.then_some(provider.waiting),
             kv_cache_usage: provider.kv_cache_usage,
+            prompt_tokens_per_second: provider.prompt_tokens_per_second,
+            generation_tokens_per_second: provider.generation_tokens_per_second,
+            requests_per_second: provider.requests_per_second,
+            prefix_cache_queries_total: provider.prefix_cache_queries_total,
+            prefix_cache_hits_total: provider.prefix_cache_hits_total,
+            prefix_cache_hit_rate: provider.prefix_cache_hit_rate,
+            preemptions_total: provider.preemptions_total,
             provider_telemetry_updated_unix_ms: provider.telemetry_updated_unix_ms,
             provider_last_error: provider
                 .compatibility_error
@@ -856,6 +931,25 @@ impl Node {
                 .cloned(),
         }
     }
+}
+
+fn counter_rate(current: Option<f64>, previous: Option<f64>, elapsed: Option<f64>) -> Option<f64> {
+    let (current, previous, elapsed) = (current?, previous?, elapsed?);
+    if !current.is_finite()
+        || !previous.is_finite()
+        || !elapsed.is_finite()
+        || current < previous
+        || elapsed <= 0.0
+    {
+        return None;
+    }
+    Some((current - previous) / elapsed)
+}
+
+fn prefix_cache_hit_rate(hits: Option<f64>, queries: Option<f64>) -> Option<f64> {
+    let (hits, queries) = (hits?, queries?);
+    (queries > 0.0 && hits.is_finite() && queries.is_finite())
+        .then(|| (hits / queries).clamp(0.0, 1.0))
 }
 
 #[derive(Debug)]
@@ -940,6 +1034,20 @@ fn unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vllm_counter_rates_handle_resets_and_prefix_hit_ratio() {
+        assert_eq!(
+            counter_rate(Some(140.0), Some(100.0), Some(2.0)),
+            Some(20.0)
+        );
+        assert_eq!(counter_rate(Some(20.0), Some(100.0), Some(2.0)), None);
+        assert_eq!(
+            prefix_cache_hit_rate(Some(625.0), Some(1000.0)),
+            Some(0.625)
+        );
+        assert_eq!(prefix_cache_hit_rate(Some(0.0), Some(0.0)), None);
+    }
 
     fn config() -> NodeConfig {
         NodeConfig {

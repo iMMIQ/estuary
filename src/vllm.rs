@@ -25,7 +25,7 @@ use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage
 use crate::{
     config::{ProviderKind, VllmKvEventsConfig},
     kv_cache::{BlockHash, CacheMutation, ExactCacheDirectory},
-    node::{Node, ProviderState},
+    node::{Node, ProviderState, VllmMetricsSnapshot},
     prefix::PrefixDirectory,
     scheduler::Scheduler,
 };
@@ -379,11 +379,7 @@ async fn poll_node(client: &Client, node: &Arc<Node>, check_version: bool) {
         return;
     }
     match fetch_metrics(client, node).await {
-        Ok(telemetry) => node.record_vllm_telemetry(
-            telemetry.running,
-            telemetry.waiting,
-            telemetry.kv_cache_usage,
-        ),
+        Ok(telemetry) => node.record_vllm_metrics(telemetry),
         Err(error) => {
             node.record_provider_telemetry_error(format!("metrics scrape failed: {error}"));
             debug!(node = node.id(), error = %error, "vLLM metrics scrape failed");
@@ -401,11 +397,7 @@ pub async fn preflight_vllm(client: &Client, node: &Arc<Node>) -> Result<()> {
     }
     node.record_vllm_ready(raw);
     let telemetry = fetch_metrics(client, node).await?;
-    node.record_vllm_telemetry(
-        telemetry.running,
-        telemetry.waiting,
-        telemetry.kv_cache_usage,
-    );
+    node.record_vllm_metrics(telemetry);
     Ok(())
 }
 
@@ -424,14 +416,7 @@ async fn fetch_version(client: &Client, node: &Node) -> Result<(String, Version)
     Ok((response.version, version))
 }
 
-#[derive(Clone, Copy, Debug)]
-struct VllmTelemetry {
-    running: usize,
-    waiting: usize,
-    kv_cache_usage: Option<f64>,
-}
-
-async fn fetch_metrics(client: &Client, node: &Node) -> Result<VllmTelemetry> {
+async fn fetch_metrics(client: &Client, node: &Node) -> Result<VllmMetricsSnapshot> {
     let body = management_get(client, node, &node.provider().metrics_path).await?;
     parse_metrics(&body)
 }
@@ -458,7 +443,7 @@ async fn management_get(client: &Client, node: &Node, path: &str) -> Result<Byte
     Ok(body)
 }
 
-fn parse_metrics(body: &[u8]) -> Result<VllmTelemetry> {
+fn parse_metrics(body: &[u8]) -> Result<VllmMetricsSnapshot> {
     let reader = BufReader::new(body);
     // prometheus-parse accepts the Prometheus grammar except ':' in metric names.
     // Normalize vLLM's legal namespace separator before structured parsing.
@@ -469,6 +454,12 @@ fn parse_metrics(body: &[u8]) -> Result<VllmTelemetry> {
     let mut running = None;
     let mut waiting = None;
     let mut kv_usage = None;
+    let mut prompt_tokens = None;
+    let mut generation_tokens = None;
+    let mut requests = None;
+    let mut prefix_queries = None;
+    let mut prefix_hits = None;
+    let mut preemptions = None;
     for sample in scrape.samples {
         let value = scalar_metric(&sample.value);
         match sample.metric.as_str() {
@@ -481,6 +472,24 @@ fn parse_metrics(body: &[u8]) -> Result<VllmTelemetry> {
             "vllm_kv_cache_usage_perc" => {
                 kv_usage = Some(kv_usage.unwrap_or(0.0_f64).max(value.unwrap_or(0.0)));
             }
+            "vllm_prompt_tokens" | "vllm_prompt_tokens_total" => {
+                accumulate_counter(&mut prompt_tokens, value);
+            }
+            "vllm_generation_tokens" | "vllm_generation_tokens_total" => {
+                accumulate_counter(&mut generation_tokens, value);
+            }
+            "vllm_request_success" | "vllm_request_success_total" => {
+                accumulate_counter(&mut requests, value);
+            }
+            "vllm_prefix_cache_queries" | "vllm_prefix_cache_queries_total" => {
+                accumulate_counter(&mut prefix_queries, value);
+            }
+            "vllm_prefix_cache_hits" | "vllm_prefix_cache_hits_total" => {
+                accumulate_counter(&mut prefix_hits, value);
+            }
+            "vllm_num_preemptions" | "vllm_num_preemptions_total" => {
+                accumulate_counter(&mut preemptions, value);
+            }
             _ => {}
         }
     }
@@ -489,11 +498,23 @@ fn parse_metrics(body: &[u8]) -> Result<VllmTelemetry> {
     let kv_cache_usage = kv_usage
         .filter(|value| value.is_finite())
         .map(|value| value.clamp(0.0, 1.0));
-    Ok(VllmTelemetry {
+    Ok(VllmMetricsSnapshot {
         running,
         waiting,
         kv_cache_usage,
+        prompt_tokens_total: prompt_tokens,
+        generation_tokens_total: generation_tokens,
+        requests_total: requests,
+        prefix_cache_queries_total: prefix_queries,
+        prefix_cache_hits_total: prefix_hits,
+        preemptions_total: preemptions,
     })
+}
+
+fn accumulate_counter(total: &mut Option<f64>, value: Option<f64>) {
+    if let Some(value) = value.filter(|value| value.is_finite() && *value >= 0.0) {
+        *total = Some(total.unwrap_or_default() + value);
+    }
 }
 
 fn scalar_metric(value: &MetricValue) -> Option<f64> {
@@ -1266,11 +1287,31 @@ vllm:num_requests_running{model_name="a"} 2
 vllm:num_requests_waiting{model_name="a"} 3
 # TYPE vllm:kv_cache_usage_perc gauge
 vllm:kv_cache_usage_perc{model_name="a"} 0.75
+# TYPE vllm:prompt_tokens_total counter
+vllm:prompt_tokens_total{model_name="a",engine="0"} 1200
+vllm:prompt_tokens_total{model_name="a",engine="1"} 300
+# TYPE vllm:generation_tokens_total counter
+vllm:generation_tokens_total{model_name="a"} 450
+# TYPE vllm:request_success_total counter
+vllm:request_success_total{model_name="a",finished_reason="stop"} 9
+vllm:request_success_total{model_name="a",finished_reason="length"} 1
+# TYPE vllm:prefix_cache_queries_total counter
+vllm:prefix_cache_queries_total{model_name="a"} 1000
+# TYPE vllm:prefix_cache_hits_total counter
+vllm:prefix_cache_hits_total{model_name="a"} 625
+# TYPE vllm:num_preemptions_total counter
+vllm:num_preemptions_total{model_name="a"} 2
 "#;
         let telemetry = parse_metrics(body).unwrap();
         assert_eq!(telemetry.running, 2);
         assert_eq!(telemetry.waiting, 3);
         assert_eq!(telemetry.kv_cache_usage, Some(0.75));
+        assert_eq!(telemetry.prompt_tokens_total, Some(1500.0));
+        assert_eq!(telemetry.generation_tokens_total, Some(450.0));
+        assert_eq!(telemetry.requests_total, Some(10.0));
+        assert_eq!(telemetry.prefix_cache_queries_total, Some(1000.0));
+        assert_eq!(telemetry.prefix_cache_hits_total, Some(625.0));
+        assert_eq!(telemetry.preemptions_total, Some(2.0));
     }
 
     #[test]

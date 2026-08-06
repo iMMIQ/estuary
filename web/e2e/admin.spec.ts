@@ -78,7 +78,14 @@ function record(config: Record<string, unknown>) {
       provider_last_error: null,
       upstream_running: 0,
       upstream_waiting: 0,
-      kv_cache_usage: 0,
+      kv_cache_usage: 0.62,
+      prompt_tokens_per_second: 1240,
+      generation_tokens_per_second: 186,
+      requests_per_second: 2.4,
+      prefix_cache_queries_total: 10000,
+      prefix_cache_hits_total: 7400,
+      prefix_cache_hit_rate: 0.74,
+      preemptions_total: 2,
       latency_ewma_ms: 0,
       error_ewma: 0,
       last_error: null,
@@ -161,6 +168,8 @@ test("creates an upstream through the management workflow", async ({ page }) => 
   await page.goto("/admin/");
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
   await expect(page.getByText("All systems nominal")).toBeVisible();
+  await expect(page.getByText("Raw Metrics")).toHaveCount(0);
+  await expect(page.getByText("Prompt throughput")).toBeVisible();
 
   await page.locator("button:visible").filter({ hasText: /^Upstreams$/ }).click();
   await expect(page.getByText("No upstream nodes")).toBeVisible();

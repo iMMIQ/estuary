@@ -8,7 +8,6 @@ import {
 } from "@mantine/core";
 import {
   AlertTriangle,
-  BarChart3,
   Check,
   Edit3,
   ExternalLink,
@@ -51,6 +50,56 @@ function relativeSync(value: number | null): string {
 
 function MetricBox({ label, value, accent }: { label: string; value: string | number; accent?: "green" | "amber" | "red" }) {
   return <div className="metric-box"><span>{label}</span><strong className={accent ? `metric-${accent}` : ""}>{value}</strong></div>;
+}
+
+function formatRate(value: number | null | undefined): string {
+  return value == null || !Number.isFinite(value) ? "--" : formatCompactNumber(Math.max(0, value));
+}
+
+function formatRatio(value: number | null | undefined): string {
+  return value == null || !Number.isFinite(value) ? "--" : `${Math.round(value * 100)}%`;
+}
+
+function summarizeVllm(nodes: NodeRecord[]) {
+  const vllm = nodes.filter((node) => node.config.provider.type === "vllm");
+  const fresh = vllm.filter((node) => node.admission.telemetry_fresh);
+  const sum = (read: (node: NodeRecord) => number | null) => {
+    const values = fresh.map(read).filter((value): value is number => value !== null);
+    return values.length ? values.reduce((total, value) => total + value, 0) : null;
+  };
+  const prefixQueries = sum((node) => node.runtime.prefix_cache_queries_total);
+  const prefixHits = sum((node) => node.runtime.prefix_cache_hits_total);
+  const kvValues = fresh.map((node) => node.runtime.kv_cache_usage).filter((value): value is number => value !== null);
+  return {
+    nodes: vllm.length,
+    fresh: fresh.length,
+    running: fresh.reduce((total, node) => total + (node.runtime.upstream_running ?? 0), 0),
+    waiting: fresh.reduce((total, node) => total + (node.runtime.upstream_waiting ?? 0), 0),
+    promptRate: sum((node) => node.runtime.prompt_tokens_per_second),
+    generationRate: sum((node) => node.runtime.generation_tokens_per_second),
+    requestRate: sum((node) => node.runtime.requests_per_second),
+    prefixHitRate: prefixQueries && prefixHits !== null ? Math.min(1, prefixHits / prefixQueries) : null,
+    maxKvUsage: kvValues.length ? Math.max(...kvValues) : null,
+    preemptions: sum((node) => node.runtime.preemptions_total),
+    exactReady: vllm.filter((node) => node.exact_kv_authoritative).length,
+    waitingBlocked: vllm.filter((node) => node.admission.waiting_watermark_blocked).length,
+    kvPressure: fresh.filter((node) => (node.runtime.kv_cache_usage ?? 0) >= 0.9).length,
+  };
+}
+
+function VllmRuntimePanel({ nodes, compact = false }: { nodes: NodeRecord[]; compact?: boolean }) {
+  const runtime = summarizeVllm(nodes);
+  return <section className={`dashboard-panel vllm-runtime-panel ${compact ? "compact" : ""}`}>
+    <div className="panel-heading"><h2>vLLM Runtime</h2><span>{runtime.fresh} / {runtime.nodes} nodes reporting fresh telemetry</span></div>
+    <div className="vllm-runtime-grid">
+      <MetricBox label="Prompt throughput" value={`${formatRate(runtime.promptRate)} tok/s`} />
+      <MetricBox label="Generation throughput" value={`${formatRate(runtime.generationRate)} tok/s`} />
+      <MetricBox label="Completed requests" value={`${formatRate(runtime.requestRate)} req/s`} />
+      <MetricBox label="Engine demand" value={`${runtime.running} / ${runtime.waiting}`} accent={runtime.waiting > 0 ? "amber" : undefined} />
+      <MetricBox label="Peak GPU KV usage" value={formatRatio(runtime.maxKvUsage)} accent={(runtime.maxKvUsage ?? 0) >= 0.9 ? "amber" : undefined} />
+      <MetricBox label="Prefix cache hit" value={formatRatio(runtime.prefixHitRate)} />
+    </div>
+  </section>;
 }
 
 function UsageRow({ label, value, total, display, totalDisplay, tone = "blue" }: {
@@ -99,6 +148,7 @@ function Overview({
   const attention = nodes.filter((node) => !node.admission.accepting_assignments && node.admission.state !== "at_capacity");
   const totalConcurrency = status?.fleet.total_concurrency ?? 0;
   const active = status?.fleet.active_requests ?? 0;
+  const vllm = summarizeVllm(nodes);
 
   return <div className="page-frame overview-page">
     <header className="page-title-row"><div><h1>Overview</h1><p>Gateway health, capacity, and admission pressure</p></div></header>
@@ -123,6 +173,8 @@ function Overview({
         <MetricBox label="Connection Lost" value={connectionLost} />
       </div>
     </section>
+
+    <VllmRuntimePanel nodes={nodes} />
 
     <div className="dashboard-two-column">
       <section className="dashboard-panel compact-panel">
@@ -154,10 +206,13 @@ function Overview({
         </div>}
       </section>
       <section className="dashboard-panel quick-actions">
-        <h2>Quick Actions</h2>
+        <h2>Routing Signals</h2>
+        <div className="routing-signal"><span>Exact KV directories</span><strong>{vllm.exactReady} / {vllm.nodes}</strong></div>
+        <div className="routing-signal"><span>Waiting watermark</span><strong className={vllm.waitingBlocked ? "metric-amber" : ""}>{vllm.waitingBlocked}</strong></div>
+        <div className="routing-signal"><span>KV pressure ≥ 90%</span><strong className={vllm.kvPressure ? "metric-amber" : ""}>{vllm.kvPressure}</strong></div>
+        <div className="routing-signal"><span>Preemptions since restart</span><strong>{vllm.preemptions === null ? "--" : formatCompactNumber(vllm.preemptions)}</strong></div>
         <Button fullWidth leftSection={<Plus size={14} />} onClick={onAdd}>Add Upstream Node</Button>
         <Button fullWidth variant="default" onClick={onShowNodes}>View All Nodes</Button>
-        <Button component="a" href="/metrics" target="_blank" rel="noreferrer" fullWidth variant="default" leftSection={<BarChart3 size={14} />}>Raw Metrics</Button>
       </section>
     </div>
   </div>;
@@ -227,6 +282,8 @@ function Upstreams({
       <div className="heading-actions"><Button variant="default" leftSection={<RefreshCw className={refreshing ? "spin" : ""} size={14} />} disabled={refreshing} onClick={onRefresh}>Refresh</Button><Button leftSection={<Plus size={14} />} onClick={onAdd}>Add Node</Button></div>
     </header>
 
+    <VllmRuntimePanel nodes={nodes} compact />
+
     <TextInput className="node-search" leftSection={<Search size={14} />} placeholder="Search by Node ID, URL, public model, or upstream model..." aria-label="Search nodes" value={query} onChange={(event) => { setPage(1); onQuery(event.target.value); }} />
     <div className="filter-row" aria-label="Filter nodes">
       {(["all", "accepting", "attention", "draining", "not_ready"] as NodeFilter[]).map((value) => <button key={value} className={filter === value ? `active ${value}` : ""} onClick={() => changeFilter(value)}>
@@ -237,19 +294,19 @@ function Upstreams({
     <section className="upstream-table-shell">
       {loading ? <div className="empty-state"><LoaderCircle className="spin" size={20} />Loading nodes</div> : visible.length === 0 ? <div className="empty-state"><Server size={22} /><strong>{query || filter !== "all" ? "No matching nodes" : "No upstream nodes"}</strong>{!query && filter === "all" && <Button leftSection={<Plus size={14} />} onClick={onAdd}>Add Node</Button>}</div> : <div className="table-scroll">
         <table className="upstream-table">
-          <thead><tr><th>Node ID / Base URL</th><th>Status / Admission</th><th>Provider</th><th>Requests (Upstream)</th><th>Active / Max Concurrency</th><th>Latency (EWMA)</th><th>KV Blocks</th><th>Models</th><th /></tr></thead>
+          <thead><tr><th>Node ID / Base URL</th><th>Status / Admission</th><th>Provider / Telemetry</th><th>Engine</th><th>Token Rate</th><th>Active / Limit</th><th>KV Cache</th><th>Latency</th><th /></tr></thead>
           <tbody>{visible.map((node) => {
             const running = node.runtime.upstream_running ?? node.runtime.active;
             const waiting = node.runtime.upstream_waiting ?? 0;
             return <tr key={node.config.id} tabIndex={0} onClick={() => onSelect(node)} onKeyDown={(event) => { if (event.key === "Enter") onSelect(node); }}>
               <td data-label="Node"><strong>{node.config.id}</strong><span>{node.config.base_url}</span></td>
               <td data-label="Admission"><StatusBadge value={node.admission.state} /><span>{node.admission.reason}</span></td>
-              <td data-label="Provider"><strong>{node.config.provider.type === "vllm" ? "vLLM 0.25+" : "OpenAI"}</strong><span>{node.runtime.provider_version ?? node.runtime.provider_state}</span></td>
-              <td data-label="Upstream demand"><strong>{running} / {waiting}</strong><span>Running / Waiting</span></td>
+              <td data-label="Provider"><strong>{node.config.provider.type === "vllm" ? `vLLM ${node.runtime.provider_version ?? "checking"}` : "OpenAI compatible"}</strong><span>{node.config.provider.type === "vllm" ? node.admission.telemetry_fresh ? "Telemetry fresh" : "Telemetry stale" : "Generic provider"}</span></td>
+              <td data-label="Engine"><strong>{running} / {waiting}</strong><span>Running / Waiting</span></td>
+              <td data-label="Token rate"><strong>{formatRate(node.runtime.prompt_tokens_per_second)} / {formatRate(node.runtime.generation_tokens_per_second)}</strong><span>Prompt / Generation tok/s</span></td>
               <td data-label="Local load"><ProgressValue value={node.runtime.active} total={node.runtime.max_concurrency} /></td>
-              <td data-label="Latency"><strong>{Math.round(node.runtime.latency_ewma_ms)} ms</strong></td>
-              <td data-label="KV blocks"><strong>{formatCompactNumber(node.exact_kv_blocks)}</strong><span>{node.exact_kv_authoritative ? `Authoritative / ${formatBytes(node.exact_kv_bytes)}` : "Approximate"}</span></td>
-              <td data-label="Models"><strong>{Object.keys(node.config.models).length}</strong></td>
+              <td data-label="KV cache"><strong>{node.config.provider.type === "vllm" ? `${formatRatio(node.runtime.kv_cache_usage)} used` : "--"}</strong><span>{node.config.provider.type === "vllm" ? `${formatRatio(node.runtime.prefix_cache_hit_rate)} hit · ${formatCompactNumber(node.exact_kv_blocks)} blocks ${node.exact_kv_authoritative ? "synced" : "fallback"}` : "No vLLM telemetry"}</span></td>
+              <td data-label="Latency"><strong>{Math.round(node.runtime.latency_ewma_ms)} ms</strong><span>Header EWMA</span></td>
               <td className="row-menu-cell" onClick={(event) => event.stopPropagation()}>
                 <Menu position="bottom-end" shadow="md" width={170} withinPortal>
                   <Menu.Target><button className="bare-icon" aria-label={`Actions for ${node.config.id}`}><MoreHorizontal size={16} /></button></Menu.Target>
@@ -377,7 +434,6 @@ export default function App() {
       <nav aria-label="Control plane navigation">
         <button className={view === "overview" && !selectedNode && !editor ? "active" : ""} onClick={() => changeView("overview")}><LayoutDashboard size={16} />Overview</button>
         <button className={view === "upstreams" || selectedNode || editor ? "active" : ""} onClick={() => changeView("upstreams")}><Server size={16} />Upstreams</button>
-        <a href="/metrics" target="_blank" rel="noreferrer"><BarChart3 size={16} />Raw Metrics</a>
       </nav>
       <div className="system-status"><span>Control plane</span><div><i className={connectionError ? "down" : ""} /><strong>{connectionError ? "Disconnected" : "Connected"}</strong><small>estuary-admin</small></div></div>
     </aside>
@@ -393,7 +449,6 @@ export default function App() {
     {!editor && !selectedNode && <nav className="mobile-bottom-nav" aria-label="Mobile navigation">
       <button className={view === "overview" ? "active" : ""} onClick={() => changeView("overview")}><LayoutDashboard size={16} />Overview</button>
       <button className={view === "upstreams" ? "active" : ""} onClick={() => changeView("upstreams")}><Server size={16} />Upstreams</button>
-      <a href="/metrics" target="_blank" rel="noreferrer"><BarChart3 size={16} />Raw Metrics</a>
       <button onClick={openAdd}><Plus size={16} />Add</button>
     </nav>}
 

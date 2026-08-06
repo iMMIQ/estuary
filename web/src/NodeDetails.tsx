@@ -6,6 +6,7 @@ import {
   Check,
   Edit3,
   Gauge,
+  Layers3,
   PauseCircle,
   Play,
   Server,
@@ -22,6 +23,11 @@ const anthropicProtocolLabels = {
   responses: "OpenAI Responses",
   chat: "OpenAI Chat Completions",
 } as const;
+
+function metricRate(value: number | null | undefined, unit: string): string {
+  if (value == null || !Number.isFinite(value)) return "Unavailable";
+  return `${new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value)} ${unit}`;
+}
 
 function DataRow({ label, value }: { label: string; value: ReactNode }) {
   return <div className="data-row"><span>{label}</span><strong>{value}</strong></div>;
@@ -153,8 +159,12 @@ export function NodeDetails({
           <div className="metric-tile-grid">
             <div><Activity size={16} /><span>Local load<strong>{runtime.active} / {runtime.max_concurrency}</strong></span></div>
             <div><Server size={16} /><span>Upstream demand<strong>{runtime.upstream_running ?? runtime.active} / {runtime.upstream_waiting ?? 0}</strong></span></div>
-            <div><Gauge size={16} /><span>Latency EWMA<strong>{Math.round(runtime.latency_ewma_ms)} ms</strong></span></div>
-            <div><AlertTriangle size={16} /><span>Error EWMA<strong>{(runtime.error_ewma * 100).toFixed(2)}%</strong></span></div>
+            <div><Gauge size={16} /><span>Prompt throughput<strong>{metricRate(runtime.prompt_tokens_per_second, "tok/s")}</strong></span></div>
+            <div><Gauge size={16} /><span>Generation throughput<strong>{metricRate(runtime.generation_tokens_per_second, "tok/s")}</strong></span></div>
+            <div><Activity size={16} /><span>Completed requests<strong>{metricRate(runtime.requests_per_second, "req/s")}</strong></span></div>
+            <div><Layers3 size={16} /><span>GPU KV / Prefix hit<strong>{formatPercent(runtime.kv_cache_usage)} / {formatPercent(runtime.prefix_cache_hit_rate)}</strong></span></div>
+            <div><AlertTriangle size={16} /><span>Preemptions<strong>{runtime.preemptions_total == null ? "Unavailable" : runtime.preemptions_total.toLocaleString()}</strong></span></div>
+            <div><Gauge size={16} /><span>Latency / Error EWMA<strong>{Math.round(runtime.latency_ewma_ms)} ms / {(runtime.error_ewma * 100).toFixed(2)}%</strong></span></div>
           </div>
         </Tabs.Panel>
 
