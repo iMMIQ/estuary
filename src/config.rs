@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
+    path::PathBuf,
     time::Duration,
 };
 
@@ -342,6 +343,7 @@ pub struct ServerConfig {
     pub listen: String,
     pub admin_listen: String,
     pub admin_token: Option<String>,
+    pub admin_freeze_file: Option<PathBuf>,
     pub connect_timeout_ms: u64,
     pub upstream_header_timeout_ms: u64,
     pub stream_idle_timeout_ms: u64,
@@ -364,6 +366,7 @@ impl Default for ServerConfig {
             listen: "0.0.0.0:8080".to_owned(),
             admin_listen: "127.0.0.1:9090".to_owned(),
             admin_token: None,
+            admin_freeze_file: None,
             connect_timeout_ms: 5_000,
             upstream_header_timeout_ms: 120_000,
             stream_idle_timeout_ms: 300_000,

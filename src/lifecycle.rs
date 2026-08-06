@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessState {
+    Starting,
     Serving,
     Quiescing,
     Draining,
@@ -18,19 +19,21 @@ pub enum ProcessState {
 impl ProcessState {
     const fn encode(self) -> u8 {
         match self {
-            Self::Serving => 0,
-            Self::Quiescing => 1,
-            Self::Draining => 2,
-            Self::Drained => 3,
+            Self::Starting => 0,
+            Self::Serving => 1,
+            Self::Quiescing => 2,
+            Self::Draining => 3,
+            Self::Drained => 4,
         }
     }
 
     const fn decode(value: u8) -> Self {
         match value {
-            1 => Self::Quiescing,
-            2 => Self::Draining,
-            3 => Self::Drained,
-            _ => Self::Serving,
+            1 => Self::Serving,
+            2 => Self::Quiescing,
+            3 => Self::Draining,
+            4 => Self::Drained,
+            _ => Self::Starting,
         }
     }
 }
@@ -48,16 +51,26 @@ pub struct ProcessLifecycle {
     shutdown_requested: AtomicBool,
     in_flight_responses: AtomicUsize,
     shutdown_notify: Notify,
+    activation_notify: Notify,
     idle_notify: Notify,
 }
 
 impl ProcessLifecycle {
     pub fn new() -> Arc<Self> {
+        Self::with_state(ProcessState::Serving)
+    }
+
+    pub fn new_paused() -> Arc<Self> {
+        Self::with_state(ProcessState::Starting)
+    }
+
+    fn with_state(state: ProcessState) -> Arc<Self> {
         Arc::new(Self {
-            state: AtomicU8::new(ProcessState::Serving.encode()),
+            state: AtomicU8::new(state.encode()),
             shutdown_requested: AtomicBool::new(false),
             in_flight_responses: AtomicUsize::new(0),
             shutdown_notify: Notify::new(),
+            activation_notify: Notify::new(),
             idle_notify: Notify::new(),
         })
     }
@@ -70,12 +83,44 @@ impl ProcessLifecycle {
         self.state() == ProcessState::Serving
     }
 
+    pub fn activate(&self) -> bool {
+        let activated = self
+            .state
+            .compare_exchange(
+                ProcessState::Starting.encode(),
+                ProcessState::Serving.encode(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if activated {
+            self.activation_notify.notify_waiters();
+        }
+        activated
+    }
+
+    pub async fn activated(&self) {
+        loop {
+            if self.state() != ProcessState::Starting {
+                return;
+            }
+            let notified = self.activation_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.state() != ProcessState::Starting {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub fn request_shutdown(&self) -> bool {
         let first = !self.shutdown_requested.swap(true, Ordering::AcqRel);
         if first {
             self.state
                 .store(ProcessState::Quiescing.encode(), Ordering::Release);
             self.shutdown_notify.notify_waiters();
+            self.activation_notify.notify_waiters();
         }
         first
     }
@@ -181,5 +226,25 @@ mod tests {
         lifecycle.mark_draining();
         lifecycle.mark_drained();
         assert_eq!(lifecycle.state(), ProcessState::Drained);
+    }
+
+    #[tokio::test]
+    async fn paused_lifecycle_activates_once() {
+        let lifecycle = ProcessLifecycle::new_paused();
+        assert_eq!(lifecycle.state(), ProcessState::Starting);
+        assert!(!lifecycle.accepting_traffic());
+        assert!(lifecycle.activate());
+        lifecycle.activated().await;
+        assert!(lifecycle.accepting_traffic());
+        assert!(!lifecycle.activate());
+    }
+
+    #[tokio::test]
+    async fn paused_lifecycle_cannot_activate_after_shutdown() {
+        let lifecycle = ProcessLifecycle::new_paused();
+        assert!(lifecycle.request_shutdown());
+        lifecycle.activated().await;
+        assert!(!lifecycle.accepting_traffic());
+        assert!(!lifecycle.activate());
     }
 }

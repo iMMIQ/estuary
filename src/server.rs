@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{SocketAddr, TcpListener as StdTcpListener},
     path::Path as FsPath,
     sync::{
         Arc,
@@ -85,15 +85,23 @@ impl Gateway {
     pub fn build(settings: Settings) -> Result<Self> {
         let store = NodeStore::memory()?;
         store.seed_if_empty(&settings.nodes)?;
-        Self::build_with_store(settings, store)
+        Self::build_with_store(settings, store, false)
     }
 
     pub fn build_with_database(settings: Settings, path: impl AsRef<FsPath>) -> Result<Self> {
         let store = NodeStore::open(path)?;
-        Self::build_with_store(settings, store)
+        Self::build_with_store(settings, store, false)
     }
 
-    fn build_with_store(settings: Settings, store: Arc<NodeStore>) -> Result<Self> {
+    pub fn build_with_database_paused(
+        settings: Settings,
+        path: impl AsRef<FsPath>,
+    ) -> Result<Self> {
+        let store = NodeStore::open(path)?;
+        Self::build_with_store(settings, store, true)
+    }
+
+    fn build_with_store(settings: Settings, store: Arc<NodeStore>, paused: bool) -> Result<Self> {
         settings.validate()?;
         let stored_nodes = store.list()?;
         let runtime_revisions = stored_nodes
@@ -134,7 +142,11 @@ impl Gateway {
                 settings: Arc::new(settings),
                 vllm,
                 store,
-                process: ProcessLifecycle::new(),
+                process: if paused {
+                    ProcessLifecycle::new_paused()
+                } else {
+                    ProcessLifecycle::new()
+                },
                 response_buffer,
                 runtime_revisions: RwLock::new(runtime_revisions),
                 control_revision: AtomicU64::new(control_revision),
@@ -177,6 +189,7 @@ impl Gateway {
             .route("/admin/nodes", get(nodes))
             .route("/admin/api/status", get(admin_status))
             .route("/admin/api/process", get(process_status))
+            .route("/admin/api/process/activate", put(activate_process))
             .route("/admin/api/process/drain", put(drain_process))
             .route(
                 "/admin/api/nodes/preflight",
@@ -215,10 +228,25 @@ impl Gateway {
 
     pub async fn run(self) -> Result<()> {
         let public_address: SocketAddr = self.state.settings.server.listen.parse()?;
-        let admin_address: SocketAddr = self.state.settings.server.admin_listen.parse()?;
         let public_listener = TcpListener::bind(public_address)
             .await
             .with_context(|| format!("failed to bind public listener on {public_address}"))?;
+        self.run_with_listener(public_listener).await
+    }
+
+    pub async fn run_with_public_listener(self, listener: StdTcpListener) -> Result<()> {
+        listener
+            .set_nonblocking(true)
+            .context("failed to make inherited public listener non-blocking")?;
+        let listener = TcpListener::from_std(listener)
+            .context("failed to register inherited public listener with Tokio")?;
+        self.run_with_listener(listener).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_with_listener(self, public_listener: TcpListener) -> Result<()> {
+        let public_address = public_listener.local_addr()?;
+        let admin_address: SocketAddr = self.state.settings.server.admin_listen.parse()?;
         let admin_listener = TcpListener::bind(admin_address)
             .await
             .with_context(|| format!("failed to bind admin listener on {admin_address}"))?;
@@ -247,7 +275,16 @@ impl Gateway {
         let public_router = self.public_router();
         let admin_router = self.admin_router();
         let public_token = public_cancellation.clone();
+        let public_shutdown = public_cancellation.clone();
+        let public_process = Arc::clone(&self.state.process);
         let mut public_handle: JoinHandle<std::io::Result<()>> = tokio::spawn(async move {
+            tokio::select! {
+                () = public_process.activated() => {}
+                () = public_shutdown.cancelled() => return Ok(()),
+            }
+            if !public_process.accepting_traffic() {
+                return Ok(());
+            }
             axum::serve(public_listener, public_router)
                 .with_graceful_shutdown(public_token.cancelled_owned())
                 .await
@@ -396,28 +433,53 @@ async fn authorize_admin(
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(expected) = state.settings.server.admin_token.as_deref() else {
-        return next.run(request).await;
-    };
-    let candidate = request
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(admin_authorization_token);
-    if candidate
-        .is_some_and(|candidate| constant_time_eq(candidate.as_bytes(), expected.as_bytes()))
-    {
-        return next.run(request).await;
+    if let Some(expected) = state.settings.server.admin_token.as_deref() {
+        let candidate = request
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(admin_authorization_token);
+        if !candidate
+            .is_some_and(|candidate| constant_time_eq(candidate.as_bytes(), expected.as_bytes()))
+        {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(
+                    WWW_AUTHENTICATE,
+                    "Basic realm=\"Estuary Admin\", charset=\"UTF-8\"",
+                )
+                .body(Body::from("authentication required"))
+                .unwrap_or_else(|_| StatusCode::UNAUTHORIZED.into_response());
+        }
     }
 
-    Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .header(
-            WWW_AUTHENTICATE,
-            "Basic realm=\"Estuary Admin\", charset=\"UTF-8\"",
+    let is_process_control = request.uri().path().starts_with("/admin/api/process/");
+    let mutating = matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::DELETE | Method::PATCH
+    );
+    if mutating
+        && !is_process_control
+        && state
+            .settings
+            .server
+            .admin_freeze_file
+            .as_ref()
+            .is_some_and(|path| path.exists())
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": {
+                    "code": "rollout_in_progress",
+                    "message": "Management writes are frozen while a binary rollout is in progress"
+                }
+            })),
         )
-        .body(Body::from("authentication required"))
-        .unwrap_or_else(|_| StatusCode::UNAUTHORIZED.into_response())
+            .into_response();
+    }
+
+    next.run(request).await
 }
 
 fn admin_authorization_token(value: &str) -> Option<String> {
@@ -758,6 +820,7 @@ async fn process_status(State(state): State<Arc<AppState>>) -> Json<serde_json::
     let response_buffer = state.response_buffer.snapshot();
     Json(json!({
         "process": state.process.snapshot(),
+        "runtime_ready": state.scheduler.ready(),
         "queue": {
             "requests": state.scheduler.queue_snapshot().0,
             "bytes": state.scheduler.queue_snapshot().1,
@@ -768,6 +831,19 @@ async fn process_status(State(state): State<Arc<AppState>>) -> Json<serde_json::
             "waiting_responses": response_buffer.waiting_responses,
         },
     }))
+}
+
+async fn activate_process(State(state): State<Arc<AppState>>) -> Response {
+    let activated = state.process.activate();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "activated": activated,
+            "process": state.process.snapshot(),
+            "runtime_ready": state.scheduler.ready(),
+        })),
+    )
+        .into_response()
 }
 
 async fn drain_process(State(state): State<Arc<AppState>>) -> Response {

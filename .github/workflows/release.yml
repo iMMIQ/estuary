@@ -160,7 +160,7 @@ jobs:
             release/*.tar.gz
             release/*.sha256
           body: |
-            Static Linux binaries and zero-downtime systemd/HAProxy deployment assets are attached for `amd64` and `arm64`.
+            Static Linux binaries and zero-downtime built-in supervisor deployment assets are attached for `amd64` and `arm64`.
 
             ```console
             sha256sum --check estuary-${{ github.ref_name }}-linux-amd64.tar.gz.sha256

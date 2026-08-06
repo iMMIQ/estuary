@@ -77,7 +77,7 @@ This limitation applies to the public inference listener. The management listene
 
 `max_concurrency` is a hard limit for each node within one gateway process. Streaming responses use an independent one-chunk bounded pump; non-streaming successes are buffered up to `max_non_streaming_response_bytes` before downstream commit. The permit is released on upstream EOF, error, configured timeout, or client cancellation. A client that stops draining a stream cannot hold a node slot beyond `downstream_stall_timeout_ms`. With `N` active-active gateway replicas, a node can receive up to `N * max_concurrency` requests.
 
-The supported production layout runs two or more fixed process slots on one host. Divide each node's total budget among the serving slots; queues, health, circuits, and prefix state remain process-local. The rolling deployer replaces one slot at a time without overlapping generations in that slot. A distributed lease service is still required for a strict fleet-wide limit across arbitrary replicas.
+The supported production layout runs two fixed worker slots under Estuary's built-in supervisor. The supervisor owns the stable public listener and passes that socket directly to both workers, so there is no proxy in the inference data path. Divide each node's total budget among the serving slots; queues, health, circuits, and prefix state remain process-local. The rolling deployer replaces one slot at a time without overlapping generations in that slot. A distributed lease service is still required for a strict fleet-wide limit across arbitrary replicas.
 
 ### Prefix locality and vLLM
 
@@ -129,7 +129,7 @@ cargo run --release -- \
   --admin-listen 127.0.0.1:9090
 ```
 
-Open `http://127.0.0.1:9090/admin/` and add the first upstream. The process starts normally with an empty database; readiness remains `503` until a routable node exists. CLI options have `ESTUARY_*` environment-variable equivalents. In particular, `ESTUARY_WITHDRAWAL_DELAY_MS` controls load-balancer propagation and `ESTUARY_SHUTDOWN_GRACE_MS` bounds response draining. Logging filters use `RUST_LOG`.
+Open `http://127.0.0.1:9090/admin/` and add the first upstream. The process starts normally with an empty database; readiness remains `503` until a routable node exists. CLI options have `ESTUARY_*` environment-variable equivalents. In standalone mode, `ESTUARY_WITHDRAWAL_DELAY_MS` controls load-balancer propagation; supervised workers stop accepting directly. `ESTUARY_SHUTDOWN_GRACE_MS` bounds response draining. Logging filters use `RUST_LOG`.
 
 Check the model catalog:
 
@@ -291,13 +291,13 @@ Request duration includes the complete buffered body for non-streaming successes
 
 ## Zero-downtime binary deployment
 
-GitHub Releases contain static Linux binaries for `amd64` and `arm64`, together with the files under [`deploy/`](deploy/). The supported deployment uses HAProxy on stable ports and two fixed systemd process slots on one host:
+GitHub Releases contain static Linux binaries for `amd64` and `arm64`, together with the files under [`deploy/`](deploy/). The supported deployment uses the built-in supervisor and two fixed worker slots on one host:
 
 ```console
 sudo ./deploy/install.sh ./estuary
 ```
 
-Review `/etc/estuary/common.env` for gateway settings and any legacy environment-backed credentials. HAProxy exposes the public API on `:8080` and management on loopback `:9090`; slot listeners stay on loopback-only internal ports.
+Review `/etc/estuary/common.env` for gateway settings and any legacy environment-backed credentials. The supervisor owns the public API socket on `:8080`; slot A exposes management on loopback `:9090`, and slot B uses a loopback-only control port.
 
 Roll out a staged binary one slot at a time:
 
@@ -305,7 +305,7 @@ Roll out a staged binary one slot at a time:
 sudo ./deploy/rollout.sh ./estuary
 ```
 
-The script drains slot A and waits for every accepted response before replacing it, verifies readiness, then repeats for slot B. Failed replacements automatically restore the previous binary for that slot. A stream exceeding the configured deploy deadline leaves its old process alive and drained instead of being killed. Full topology, capacity, package, and rollback details are in [`deploy/README.md`](deploy/README.md).
+The script stages the executable and asks the supervisor to drain slot A, wait for every accepted response, verify and activate its replacement, then repeat for slot B. Any failure restores the complete previous release. A stream exceeding the configured deploy deadline leaves its old process alive and drained instead of being killed. Full topology, capacity, recovery, and rollback details are in [`deploy/README.md`](deploy/README.md).
 
 ## Development checks
 

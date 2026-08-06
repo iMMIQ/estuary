@@ -14,6 +14,7 @@ pub mod response_buffer;
 pub mod scheduler;
 pub mod server;
 pub mod store;
+pub mod supervisor;
 pub mod vllm;
 
 pub use config::Settings;

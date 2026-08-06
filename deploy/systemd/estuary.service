@@ -1,5 +1,5 @@
 [Unit]
-Description=Estuary LLM gateway slot %i
+Description=Estuary LLM gateway supervisor
 After=network-online.target
 Wants=network-online.target
 
@@ -8,18 +8,20 @@ Type=simple
 User=estuary
 Group=estuary
 EnvironmentFile=/etc/estuary/common.env
-EnvironmentFile=/etc/estuary/slots/%i.env
-ExecStart=/opt/estuary/slots/%i/current/estuary
-Restart=on-failure
+ExecStart=/opt/estuary/state/current/estuary supervisor
+Restart=always
 RestartSec=2s
 KillSignal=SIGTERM
 TimeoutStopSec=3700s
 LimitNOFILE=65536
+RuntimeDirectory=estuary
+RuntimeDirectoryMode=0750
+UMask=0007
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/estuary
+ReadWritePaths=/var/lib/estuary /opt/estuary/state /run/estuary
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 

@@ -1,8 +1,11 @@
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use anyhow::Result;
-use clap::Parser;
-use estuary::{Gateway, Settings};
+use anyhow::{Context, Result};
+use clap::{Args, Parser, Subcommand};
+use estuary::{
+    Gateway, Settings,
+    supervisor::{self, SupervisorConfig},
+};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -16,6 +19,8 @@ struct Cli {
     admin_listen: Option<String>,
     #[arg(long, env = "ESTUARY_ADMIN_TOKEN")]
     admin_token: Option<String>,
+    #[arg(long, env = "ESTUARY_ADMIN_FREEZE_FILE", hide = true)]
+    admin_freeze_file: Option<PathBuf>,
     #[arg(long, env = "ESTUARY_LOG_JSON", default_value_t = false)]
     log_json: bool,
     #[arg(long, env = "ESTUARY_CONNECT_TIMEOUT_MS")]
@@ -94,6 +99,70 @@ struct Cli {
     retry_max_attempts: Option<usize>,
     #[arg(long, env = "ESTUARY_RETRY_STATUSES", value_delimiter = ',')]
     retry_statuses: Option<Vec<u16>>,
+    #[command(subcommand)]
+    command: Option<CommandMode>,
+}
+
+#[derive(Debug, Subcommand)]
+enum CommandMode {
+    /// Run the built-in A/B worker supervisor.
+    Supervisor(SupervisorArgs),
+    /// Atomically roll a staged binary through both workers.
+    Rollout(RolloutArgs),
+    /// Show the local supervisor and worker state.
+    Status(StatusArgs),
+    #[command(hide = true)]
+    Worker(WorkerArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+struct SupervisorPaths {
+    #[arg(
+        long,
+        env = "ESTUARY_RELEASE_ROOT",
+        default_value = "/opt/estuary/releases"
+    )]
+    release_root: PathBuf,
+    #[arg(long, env = "ESTUARY_STATE_ROOT", default_value = "/opt/estuary/state")]
+    state_root: PathBuf,
+    #[arg(long, env = "ESTUARY_RUNTIME_DIR", default_value = "/run/estuary")]
+    runtime_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct SupervisorArgs {
+    #[command(flatten)]
+    paths: SupervisorPaths,
+    #[arg(
+        long,
+        env = "ESTUARY_SLOT_B_ADMIN_LISTEN",
+        default_value = "127.0.0.1:19092"
+    )]
+    slot_b_admin_listen: SocketAddr,
+    #[arg(long, env = "ESTUARY_START_TIMEOUT_SECONDS", default_value_t = 180)]
+    start_timeout_seconds: u64,
+    #[arg(long, env = "ESTUARY_DRAIN_TIMEOUT_SECONDS", default_value_t = 3700)]
+    drain_timeout_seconds: u64,
+}
+
+#[derive(Debug, Args)]
+struct RolloutArgs {
+    /// New Estuary executable to stage and deploy.
+    binary: PathBuf,
+    #[command(flatten)]
+    paths: SupervisorPaths,
+}
+
+#[derive(Debug, Args)]
+struct StatusArgs {
+    #[arg(long, env = "ESTUARY_RUNTIME_DIR", default_value = "/run/estuary")]
+    runtime_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct WorkerArgs {
+    #[arg(long)]
+    slot: String,
 }
 
 #[tokio::main]
@@ -101,10 +170,70 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut settings = Settings::default();
     apply_cli(&mut settings, &cli);
-    settings.validate()?;
     init_tracing(settings.server.log_json);
-    Gateway::build_with_database(settings, cli.database)?
-        .run()
+    match &cli.command {
+        None => {
+            settings.validate()?;
+            Gateway::build_with_database(settings, &cli.database)?
+                .run()
+                .await
+        }
+        Some(CommandMode::Worker(worker)) => {
+            settings.validate()?;
+            run_worker(settings, &cli.database, worker).await
+        }
+        Some(CommandMode::Supervisor(arguments)) => {
+            settings.validate()?;
+            let slot_a_admin = settings
+                .server
+                .admin_listen
+                .parse()
+                .context("invalid slot A admin listener")?;
+            supervisor::run(SupervisorConfig {
+                settings,
+                database: cli.database.clone(),
+                release_root: arguments.paths.release_root.clone(),
+                state_root: arguments.paths.state_root.clone(),
+                runtime_dir: arguments.paths.runtime_dir.clone(),
+                slot_a_admin,
+                slot_b_admin: arguments.slot_b_admin_listen,
+                start_timeout: Duration::from_secs(arguments.start_timeout_seconds),
+                drain_timeout: Duration::from_secs(arguments.drain_timeout_seconds),
+            })
+            .await
+        }
+        Some(CommandMode::Rollout(arguments)) => {
+            let message = supervisor::request_rollout(
+                &arguments.paths.release_root,
+                &arguments.paths.runtime_dir.join("supervisor.sock"),
+                &arguments.binary,
+            )
+            .await?;
+            println!("{message}");
+            Ok(())
+        }
+        Some(CommandMode::Status(arguments)) => {
+            println!(
+                "{}",
+                supervisor::request_status(&arguments.runtime_dir.join("supervisor.sock")).await?
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn run_worker(settings: Settings, database: &PathBuf, worker: &WorkerArgs) -> Result<()> {
+    if !matches!(worker.slot.as_str(), "a" | "b") {
+        anyhow::bail!("worker slot must be a or b");
+    }
+    let mut inherited = listenfd::ListenFd::from_env();
+    let listener = inherited
+        .take_tcp_listener(0)
+        .context("failed to inspect inherited public listener")?
+        .context("worker requires an inherited public listener")?;
+    tracing::info!(slot = worker.slot, "starting supervised worker");
+    Gateway::build_with_database_paused(settings, database)?
+        .run_with_public_listener(listener)
         .await
 }
 
@@ -121,6 +250,10 @@ fn apply_cli(settings: &mut Settings, cli: &Cli) {
     apply!(settings.server.listen, cli.listen);
     apply!(settings.server.admin_listen, cli.admin_listen);
     settings.server.admin_token.clone_from(&cli.admin_token);
+    settings
+        .server
+        .admin_freeze_file
+        .clone_from(&cli.admin_freeze_file);
     settings.server.log_json = cli.log_json;
     apply!(settings.server.connect_timeout_ms, cli.connect_timeout_ms);
     apply!(

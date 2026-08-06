@@ -19,6 +19,24 @@ Create and update operations build a candidate node and perform its authenticate
 
 The scheduler stores a snapshot-friendly dynamic node registry. Existing requests retain their node and semaphore permit independently of registry changes. The health loop reads a fresh registry snapshot each interval. A vLLM task reconciler starts and cancels version, metrics, tokenization, and KV subscriber state when node identities are added, replaced, or removed.
 
+## Process supervision and binary rollout
+
+The supported single-host production topology uses an Estuary supervisor and two fixed worker slots. The supervisor binds the public TCP listener once and maps that same listener file descriptor into both workers. Workers accept inference connections directly from the shared kernel accept queue; the supervisor is not an HTTP proxy and never handles inference bytes. Each worker has a separate loopback management listener, while SQLite, its WAL, and the management-write freeze file are shared.
+
+A worker starts in `starting` process state. Its management API, SQLite reconciliation, health monitor, and vLLM provider monitor run immediately, but its public Axum server does not begin accepting until the supervisor calls the authenticated process activation endpoint. Once a slot has demonstrated runtime readiness, crash recovery and later replacements require it to become runtime-ready again before activation. An empty initial database is allowed to activate so the first upstream can be configured through the management UI.
+
+Binary rollout is a serialized A/B transaction:
+
+1. The root-side rollout client executes the candidate's `--version`, validates the version component, content-checks any existing immutable release, and fsyncs a new release before contacting the supervisor.
+2. The supervisor persists a rollout journal and freezes mutating management requests across both workers. Read-only management requests and process-control endpoints remain available.
+3. Slot A stops accepting, drains every accepted response, starts from the target release in paused state, warms, and activates. Slot B continues accepting from the shared listener during this step.
+4. Slot B repeats the same transition. If either replacement fails, that slot is restored immediately; a slot-B failure also rolls slot A back, so the completed transaction never intentionally leaves mixed worker versions.
+5. Only after both slots succeed does the supervisor atomically update the stable `current` link, remove the journal, and unfreeze management writes.
+
+The supervisor watches both children and restarts an unexpectedly exited worker from its slot link. Shutdown disables those watchers before both workers receive drain requests, preventing a drained child from being restarted during service termination. If cooperative drain control is unavailable or the service-level drain deadline expires, shutdown terminates the child so it cannot become an orphan; a rollout deadline, by contrast, leaves a long-running drained worker alive and reports failure instead of interrupting inference.
+
+The rollout journal is the crash-recovery boundary. On supervisor startup, equal A/B links are reconciled into `current` and the freeze is removed. Mixed links keep management writes frozen and require a subsequent rollout to converge the slots. The running supervisor itself is not replaced during a worker rollout; `current` selects the new supervisor on the next systemd or host restart, so the local control protocol must remain backward compatible across adjacent releases. A supervisor process crash still relies on systemd restart and is not a zero-downtime operation because listener ownership is process-local.
+
 ## Request flow
 
 ```mermaid
