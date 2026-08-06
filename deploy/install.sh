@@ -9,10 +9,6 @@ if [[ ${EUID} -ne 0 ]]; then
     echo "install.sh must run as root" >&2
     exit 1
 fi
-command -v systemctl >/dev/null || {
-    echo "required command is missing: systemctl" >&2
-    exit 1
-}
 
 binary=$(readlink -f -- "$1")
 if [[ ! -x ${binary} ]]; then
@@ -30,8 +26,12 @@ if ! id estuary >/dev/null 2>&1; then
     useradd --system --home-dir /var/lib/estuary --shell /usr/sbin/nologin estuary
 fi
 install -d -o estuary -g estuary -m 0750 /var/lib/estuary
+install -d -o estuary -g estuary -m 0750 /var/lib/estuary/run
 install -d -o root -g estuary -m 0750 /etc/estuary
-install -d -o root -g root -m 0755 /opt/estuary /opt/estuary/releases
+install -d -o root -g root -m 0755 \
+    /opt/estuary \
+    /opt/estuary/bin \
+    /opt/estuary/releases
 install -d -o estuary -g estuary -m 0755 \
     /opt/estuary/state \
     /opt/estuary/state/slots/a \
@@ -53,10 +53,15 @@ ln -sfn "${release_dir}" /opt/estuary/state/slots/b/current
 if [[ ! -e /etc/estuary/common.env ]]; then
     install -o root -g estuary -m 0640 "${script_dir}/env/common.env.example" /etc/estuary/common.env
 fi
-install -o root -g root -m 0644 "${script_dir}/systemd/estuary.service" /etc/systemd/system/estuary.service
+install -o root -g root -m 0755 "${script_dir}/run.sh" /opt/estuary/bin/run
 
-systemctl disable --now estuary-haproxy.service estuary@a.service estuary@b.service 2>/dev/null || true
-systemctl daemon-reload
-systemctl enable --now estuary.service
+cat <<EOF
+Estuary ${version} is installed but not started.
 
-echo "Estuary ${version} is installed. Public: :8080, admin: 127.0.0.1:9090"
+Review /etc/estuary/common.env, then run the foreground supervisor as the
+estuary user under your process manager:
+
+  sudo -u estuary /opt/estuary/bin/run
+
+Public: :8080, admin: 127.0.0.1:9090
+EOF

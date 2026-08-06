@@ -5,8 +5,10 @@ slots. The supervisor owns the stable public listener and passes the same
 listening file descriptor directly to both workers. Inference bytes do not pass
 through a separate proxy process.
 
-Requirements: Linux with systemd. Both workers use the same SQLite database on
-a local filesystem. Do not place the database or its WAL files on NFS.
+Requirements: Linux and a process manager capable of running a foreground
+process as a dedicated user. Estuary is not coupled to a particular init
+system. Both workers use the same SQLite database on a local filesystem. Do not
+place the database or its WAL files on NFS.
 
 Install the first release:
 
@@ -14,10 +16,29 @@ Install the first release:
 sudo ./deploy/install.sh ./estuary
 ```
 
-Review `/etc/estuary/common.env`, then open `http://127.0.0.1:9090/admin/` and
-configure upstream nodes. Direct upstream keys are stored unencrypted in
-`/var/lib/estuary/estuary.db`; protect that file, its WAL files, snapshots, and
-backups.
+The installer creates the `estuary` user, immutable release and slot links,
+runtime directories, `/etc/estuary/common.env`, and the stable foreground
+launcher at `/opt/estuary/bin/run`. It deliberately does not register or start a
+host service.
+
+Review `/etc/estuary/common.env`, then configure your process manager to:
+
+- run `/opt/estuary/bin/run` as the `estuary` user;
+- keep exactly one supervisor instance running and restart it after failure;
+- pass `SIGTERM` for shutdown and allow up to the configured drain deadline;
+- retain stdout and stderr and set an open-file limit suitable for expected
+  concurrency.
+
+For an interactive first start, the same foreground entrypoint can be run
+directly:
+
+```console
+sudo -u estuary /opt/estuary/bin/run
+```
+
+Open `http://127.0.0.1:9090/admin/` and configure upstream nodes. Direct
+upstream keys are stored unencrypted in `/var/lib/estuary/estuary.db`; protect
+that file, its WAL files, snapshots, and backups.
 
 Roll out another release:
 
@@ -51,10 +72,15 @@ Inspect the local process state:
 /opt/estuary/state/current/estuary status
 ```
 
-The supervisor remains the version that originally started the service while
+The supervisor remains the version that originally started the process while
 workers roll forward. After a successful rollout the stable `current` link is
-updated, so the new supervisor is used on the next service or host restart.
-Worker-control protocol changes must therefore remain backward compatible.
+updated, so the new supervisor is used the next time the process manager starts
+it. Worker-control protocol changes must therefore remain backward compatible.
+
+The built-in supervisor protects worker availability, but it cannot restart
+itself after a supervisor crash or host reboot. That outer lifecycle remains the
+responsibility of the chosen process manager. Restarting the supervisor itself
+is not a zero-downtime operation because it owns the public listener.
 
 Node concurrency remains process-local. With two serving slots, configure each
 node's `max_concurrency` to half of the desired host-wide limit. A rollout never

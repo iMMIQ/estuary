@@ -297,7 +297,13 @@ GitHub Releases contain static Linux binaries for `amd64` and `arm64`, together 
 sudo ./deploy/install.sh ./estuary
 ```
 
-Review `/etc/estuary/common.env` for gateway settings and any legacy environment-backed credentials. The supervisor owns the public API socket on `:8080`; slot A exposes management on loopback `:9090`, and slot B uses a loopback-only control port.
+The installer prepares the dedicated user, configuration, immutable release directories, and stable foreground launcher without registering a host service. Review `/etc/estuary/common.env`, then configure any process manager to run `/opt/estuary/bin/run` as the `estuary` user, restart it after failure, and pass `SIGTERM` with enough time for request draining. The supervisor owns the public API socket on `:8080`; slot A exposes management on loopback `:9090`, and slot B uses a loopback-only control port.
+
+For an interactive first start:
+
+```console
+sudo -u estuary /opt/estuary/bin/run
+```
 
 Roll out a staged binary one slot at a time:
 

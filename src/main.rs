@@ -125,7 +125,11 @@ struct SupervisorPaths {
     release_root: PathBuf,
     #[arg(long, env = "ESTUARY_STATE_ROOT", default_value = "/opt/estuary/state")]
     state_root: PathBuf,
-    #[arg(long, env = "ESTUARY_RUNTIME_DIR", default_value = "/run/estuary")]
+    #[arg(
+        long,
+        env = "ESTUARY_RUNTIME_DIR",
+        default_value = "/var/lib/estuary/run"
+    )]
     runtime_dir: PathBuf,
 }
 
@@ -155,7 +159,11 @@ struct RolloutArgs {
 
 #[derive(Debug, Args)]
 struct StatusArgs {
-    #[arg(long, env = "ESTUARY_RUNTIME_DIR", default_value = "/run/estuary")]
+    #[arg(
+        long,
+        env = "ESTUARY_RUNTIME_DIR",
+        default_value = "/var/lib/estuary/run"
+    )]
     runtime_dir: PathBuf,
 }
 
