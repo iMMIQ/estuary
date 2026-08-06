@@ -207,6 +207,8 @@ The management UI at `/admin/` edits node URLs, model aliases, concurrency, weig
 
 The public and admin listeners are process bootstrap settings because they are needed before SQLite and the UI can be reached. Keep the admin listener on a private network even when authentication is enabled. Global routing, prefix, health, retry, circuit, timeout, request-body, response-body, and shutdown policies can be overridden through CLI flags or their `ESTUARY_*` environment variables; `estuary --help` is the authoritative list. Node-specific configuration remains exclusively in SQLite and the management UI.
 
+`ESTUARY_MAX_NON_STREAMING_RESPONSE_BYTES` limits one upstream response (64 MiB by default). `ESTUARY_MAX_BUFFERED_RESPONSE_BYTES` limits all non-streaming response buffers in the process (256 MiB by default) and must be at least the single-response limit. A response reserves its maximum allowance before reading, then releases unused bytes after EOF. When the global allowance is occupied, upstream body reads wait and apply transport backpressure; Estuary does not synthesize `429`. The remaining reservation follows the downstream response body and is released when delivery finishes or is cancelled.
+
 `ESTUARY_QUEUE_MAX_REQUESTS` and `ESTUARY_QUEUE_MAX_BYTES` are pre-body ingress budgets for inference requests. When either budget is exhausted, new requests remain pending before their body is read, applying transport backpressure without returning `429`. Requests without `Content-Length` conservatively reserve one maximum-sized body. The queue counters in the UI count the admitted requests currently waiting for a node.
 
 Model mappings associate a public model name with a node-specific upstream name. The special upstream value `"*"` preserves the requested public name; a wildcard public key routes unlisted models. Only explicit public names appear in `/v1/models`.
@@ -216,6 +218,8 @@ Model mappings associate a public model name with a node-specific upstream name.
 Declare `provider.type: vllm` on each independently addressable vLLM engine. Estuary checks the origin-root `/version` endpoint and keeps versions below 0.25.0 out of rotation. `/metrics` supplies `vllm:num_requests_running`, `vllm:num_requests_waiting`, and `vllm:kv_cache_usage_perc`; stale telemetry is ignored for scheduling. Fresh waiting depth at or above the routing watermark stops new admission to that node, including cache-affine requests, until a later scrape reports recovery.
 
 The full compatibility contract and failure semantics are in [`docs/vllm.md`](docs/vllm.md).
+
+Gateway overhead can be measured without a GPU using the standalone [performance benchmark](docs/performance.md).
 
 Enable KV events on vLLM with a replay endpoint:
 
@@ -273,8 +277,11 @@ Important metric families include:
 - `estuary_node_kv_cache_usage_ratio`
 - `estuary_node_exact_kv_ready`
 - `estuary_node_exact_kv_blocks`
+- `estuary_node_exact_kv_bytes`
 - `estuary_request_duration_seconds`
 - `estuary_queue_duration_seconds`
+- `estuary_response_buffer_bytes`
+- `estuary_response_buffer_waiters`
 - `estuary_tokenization_outcomes_total`
 - `estuary_tokenization_duration_seconds`
 - `estuary_prefix_match_chars`

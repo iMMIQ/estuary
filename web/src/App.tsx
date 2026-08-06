@@ -9,9 +9,7 @@ import {
 import {
   AlertTriangle,
   BarChart3,
-  Bell,
   Check,
-  ChevronDown,
   Edit3,
   ExternalLink,
   LayoutDashboard,
@@ -55,6 +53,22 @@ function MetricBox({ label, value, accent }: { label: string; value: string | nu
   return <div className="metric-box"><span>{label}</span><strong className={accent ? `metric-${accent}` : ""}>{value}</strong></div>;
 }
 
+function UsageRow({ label, value, total, display, totalDisplay, tone = "blue" }: {
+  label: string;
+  value: number;
+  total: number;
+  display?: string;
+  totalDisplay?: string;
+  tone?: "blue" | "green" | "amber";
+}) {
+  const percent = total > 0 ? Math.min(100, value / total * 100) : 0;
+  return <div className="usage-row">
+    <div><span>{label}</span><strong>{display ?? value.toLocaleString()} <small>/ {totalDisplay ?? total.toLocaleString()}</small></strong></div>
+    <div className="usage-track"><i className={tone} style={{ width: `${percent}%` }} /></div>
+    <em>{Math.round(percent)}%</em>
+  </div>;
+}
+
 function ProgressValue({ value, total, tone = "green" }: { value: number; total: number; tone?: "green" | "amber" | "blue" }) {
   const percent = total > 0 ? Math.min(100, value / total * 100) : 0;
   return <div className="progress-value"><span><strong>{value.toLocaleString()}</strong> / {total.toLocaleString()}</span><div><i className={tone} style={{ width: `${percent}%` }} /></div><small>{Math.round(percent)}%</small></div>;
@@ -87,13 +101,10 @@ function Overview({
   const active = status?.fleet.active_requests ?? 0;
 
   return <div className="page-frame overview-page">
-    <header className="page-title-row">
-      <h1>Overview</h1>
-      <div className="account-actions"><button className="bare-icon" aria-label="Notifications"><Bell size={16} /></button><span className="avatar">AD</span><span>Admin</span><ChevronDown size={13} /></div>
-    </header>
+    <header className="page-title-row"><div><h1>Overview</h1><p>Gateway health, capacity, and admission pressure</p></div></header>
 
     <section className="status-strip">
-      <span>Gateway Status</span>
+      <span>Gateway</span>
       <StatusBadge value={status?.ready ? "ready" : "not_ready"} />
       <i />
       <span>Estuary v{status?.version ?? "--"}</span>
@@ -116,20 +127,19 @@ function Overview({
     <div className="dashboard-two-column">
       <section className="dashboard-panel compact-panel">
         <h2>Capacity</h2>
-        <div className="capacity-grid">
-          <MetricBox label="Total Concurrency" value={totalConcurrency.toLocaleString()} />
-          <div className="metric-box"><span>In Use</span><strong>{active.toLocaleString()}</strong><div className="thin-progress"><i style={{ width: `${totalConcurrency ? active / totalConcurrency * 100 : 0}%` }} /></div></div>
-          <MetricBox label="Available Now" value={(status?.fleet.available_concurrency ?? 0).toLocaleString()} />
-          <MetricBox label="Routable Nodes" value={`${status?.fleet.routable_nodes ?? 0} / ${status?.fleet.total_nodes ?? 0}`} />
+        <div className="usage-list">
+          <UsageRow label="Local concurrency" value={active} total={totalConcurrency} tone="green" />
+          <UsageRow label="Available capacity" value={status?.fleet.available_concurrency ?? 0} total={totalConcurrency} />
+          <div className="panel-stat-row"><span>Routable nodes</span><strong>{status?.fleet.routable_nodes ?? 0} <small>/ {status?.fleet.total_nodes ?? 0}</small></strong></div>
         </div>
       </section>
       <section className="dashboard-panel compact-panel">
-        <h2>Global Queue</h2>
-        <div className="capacity-grid">
-          <MetricBox label="Current Requests" value={status?.queue.requests ?? 0} />
-          <MetricBox label="Request Limit" value={(status?.queue.max_requests ?? 0).toLocaleString()} />
-          <MetricBox label="Request Body Bytes" value={formatBytes(status?.queue.bytes ?? 0)} />
-          <MetricBox label="Bytes Limit" value={formatBytes(status?.queue.max_bytes ?? 0)} />
+        <h2>Queue &amp; Response Memory</h2>
+        <div className="usage-list">
+          <UsageRow label="Queued requests" value={status?.queue.requests ?? 0} total={status?.queue.max_requests ?? 0} tone="amber" />
+          <UsageRow label="Queued request bodies" value={status?.queue.bytes ?? 0} total={status?.queue.max_bytes ?? 0} display={formatBytes(status?.queue.bytes ?? 0)} totalDisplay={formatBytes(status?.queue.max_bytes ?? 0)} tone="amber" />
+          <UsageRow label="Buffered responses" value={status?.response_buffer?.used_bytes ?? 0} total={status?.response_buffer?.max_bytes ?? 0} display={formatBytes(status?.response_buffer?.used_bytes ?? 0)} totalDisplay={formatBytes(status?.response_buffer?.max_bytes ?? 0)} />
+          <div className="panel-stat-row"><span>Waiting for memory</span><strong className={(status?.response_buffer?.waiting_responses ?? 0) > 0 ? "metric-amber" : ""}>{status?.response_buffer?.waiting_responses ?? 0}</strong></div>
         </div>
       </section>
     </div>
@@ -147,7 +157,7 @@ function Overview({
         <h2>Quick Actions</h2>
         <Button fullWidth leftSection={<Plus size={14} />} onClick={onAdd}>Add Upstream Node</Button>
         <Button fullWidth variant="default" onClick={onShowNodes}>View All Nodes</Button>
-        <Button component="a" href="/metrics" target="_blank" fullWidth variant="default" leftSection={<BarChart3 size={14} />}>Raw Metrics</Button>
+        <Button component="a" href="/metrics" target="_blank" rel="noreferrer" fullWidth variant="default" leftSection={<BarChart3 size={14} />}>Raw Metrics</Button>
       </section>
     </div>
   </div>;
@@ -238,7 +248,7 @@ function Upstreams({
               <td data-label="Upstream demand"><strong>{running} / {waiting}</strong><span>Running / Waiting</span></td>
               <td data-label="Local load"><ProgressValue value={node.runtime.active} total={node.runtime.max_concurrency} /></td>
               <td data-label="Latency"><strong>{Math.round(node.runtime.latency_ewma_ms)} ms</strong></td>
-              <td data-label="KV blocks"><strong>{formatCompactNumber(node.exact_kv_blocks)}</strong><span>{node.exact_kv_authoritative ? "Authoritative" : "Approximate"}</span></td>
+              <td data-label="KV blocks"><strong>{formatCompactNumber(node.exact_kv_blocks)}</strong><span>{node.exact_kv_authoritative ? `Authoritative / ${formatBytes(node.exact_kv_bytes)}` : "Approximate"}</span></td>
               <td data-label="Models"><strong>{Object.keys(node.config.models).length}</strong></td>
               <td className="row-menu-cell" onClick={(event) => event.stopPropagation()}>
                 <Menu position="bottom-end" shadow="md" width={170} withinPortal>
@@ -369,8 +379,7 @@ export default function App() {
         <button className={view === "upstreams" || selectedNode || editor ? "active" : ""} onClick={() => changeView("upstreams")}><Server size={16} />Upstreams</button>
         <a href="/metrics" target="_blank" rel="noreferrer"><BarChart3 size={16} />Raw Metrics</a>
       </nav>
-      <div className="system-status"><span>System</span><div><i className={connectionError ? "down" : ""} /><strong>{connectionError ? "Disconnected" : "Connected"}</strong><small>estuary-admin</small></div></div>
-      <button className="collapse-label"><ChevronDown size={13} /> Collapse</button>
+      <div className="system-status"><span>Control plane</span><div><i className={connectionError ? "down" : ""} /><strong>{connectionError ? "Disconnected" : "Connected"}</strong><small>estuary-admin</small></div></div>
     </aside>
 
     <main className="main-content">

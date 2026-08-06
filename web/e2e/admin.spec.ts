@@ -18,6 +18,7 @@ function status(nodeCount: number) {
       available_concurrency: nodeCount * 16,
     },
     queue: { requests: 0, bytes: 0, max_requests: 512, max_bytes: 268435456 },
+    response_buffer: { used_bytes: 0, max_bytes: 268435456, waiting_responses: 0 },
     routing: { prefix_enabled: true },
   };
 }
@@ -95,6 +96,7 @@ function record(config: Record<string, unknown>) {
     },
     exact_kv_authoritative: false,
     exact_kv_blocks: 0,
+    exact_kv_bytes: 0,
   };
 }
 

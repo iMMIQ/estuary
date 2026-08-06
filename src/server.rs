@@ -50,6 +50,7 @@ use crate::{
     metrics::Metrics,
     node::{CircuitState, LifecycleState, Node, NodeSnapshot},
     proxy,
+    response_buffer::ResponseBufferBudget,
     scheduler::Scheduler,
     store::{NodeStore, StoredNode},
     vllm::{VllmManager, preflight_vllm},
@@ -66,6 +67,7 @@ pub struct AppState {
     pub(crate) vllm: Arc<VllmManager>,
     pub(crate) store: Arc<NodeStore>,
     pub(crate) process: Arc<ProcessLifecycle>,
+    pub(crate) response_buffer: Arc<ResponseBufferBudget>,
     runtime_revisions: RwLock<HashMap<String, u64>>,
     control_revision: AtomicU64,
     admin_mutation: AsyncMutex<()>,
@@ -119,15 +121,21 @@ impl Gateway {
             .context("failed to build upstream HTTP client")?;
         let scheduler = Arc::new(Scheduler::new(nodes.clone(), settings.routing.clone()));
         let vllm = VllmManager::new(Arc::clone(&scheduler));
+        let metrics = Metrics::new();
+        let response_buffer = ResponseBufferBudget::new(
+            settings.server.max_buffered_response_bytes,
+            Arc::clone(&metrics),
+        );
         Ok(Self {
             state: Arc::new(AppState {
                 client,
                 scheduler,
-                metrics: Metrics::new(),
+                metrics,
                 settings: Arc::new(settings),
                 vllm,
                 store,
                 process: ProcessLifecycle::new(),
+                response_buffer,
                 runtime_revisions: RwLock::new(runtime_revisions),
                 control_revision: AtomicU64::new(control_revision),
                 admin_mutation: AsyncMutex::new(()),
@@ -747,12 +755,18 @@ async fn ready(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn process_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let response_buffer = state.response_buffer.snapshot();
     Json(json!({
         "process": state.process.snapshot(),
         "queue": {
             "requests": state.scheduler.queue_snapshot().0,
             "bytes": state.scheduler.queue_snapshot().1,
-        }
+        },
+        "response_buffer": {
+            "used_bytes": response_buffer.used_bytes,
+            "max_bytes": response_buffer.max_bytes,
+            "waiting_responses": response_buffer.waiting_responses,
+        },
     }))
 }
 
@@ -796,6 +810,7 @@ async fn nodes(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
                 let cache = state.scheduler.exact_cache_directory().snapshot(node.id());
                 snapshot["exact_kv_authoritative"] = json!(cache.authoritative);
                 snapshot["exact_kv_blocks"] = json!(cache.blocks);
+                snapshot["exact_kv_bytes"] = json!(cache.bytes);
                 snapshot
             })
             .collect::<Vec<_>>()
@@ -895,6 +910,7 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
         }
     }
     let (queued_requests, queued_bytes) = state.scheduler.queue_snapshot();
+    let response_buffer = state.response_buffer.snapshot();
     let ready = state.process.accepting_traffic() && routable_nodes > 0;
 
     Json(json!({
@@ -918,6 +934,11 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
             "bytes": queued_bytes,
             "max_requests": state.settings.routing.queue_max_requests,
             "max_bytes": state.settings.routing.queue_max_bytes,
+        },
+        "response_buffer": {
+            "used_bytes": response_buffer.used_bytes,
+            "max_bytes": response_buffer.max_bytes,
+            "waiting_responses": response_buffer.waiting_responses,
         },
         "routing": {
             "prefix_enabled": state.settings.routing.prefix.enabled,
@@ -967,6 +988,7 @@ fn admin_node_payload(state: &AppState, stored: &StoredNode, node: &Node) -> ser
         "admission": admission,
         "exact_kv_authoritative": cache.authoritative,
         "exact_kv_blocks": cache.blocks,
+        "exact_kv_bytes": cache.bytes,
     })
 }
 

@@ -45,6 +45,10 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+[[bench]]
+name = "performance"
+harness = false
+
 [lints.rust]
 unsafe_code = "forbid"
 

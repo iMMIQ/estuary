@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod node;
 pub mod prefix;
 pub mod proxy;
+pub mod response_buffer;
 pub mod scheduler;
 pub mod server;
 pub mod store;

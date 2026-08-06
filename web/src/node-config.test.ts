@@ -76,6 +76,7 @@ describe("node config mapping", () => {
       topic: "kv-events",
       reconnect_ms: 1000,
       max_blocks: 1000,
+      max_directory_bytes: 1024 * 1024,
       max_event_bytes: 1024,
     };
     expect(draftToConfig(draft).provider.kv_events).toBeNull();

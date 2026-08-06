@@ -87,7 +87,12 @@ impl VllmManager {
             .unwrap_or(1);
         for node in &nodes {
             if let Some(events) = node.provider().kv_events.as_ref() {
-                exact_cache.configure_node_owned(node.id(), events.max_blocks, node.instance_id());
+                exact_cache.configure_node_owned(
+                    node.id(),
+                    events.max_blocks,
+                    events.max_directory_bytes,
+                    node.instance_id(),
+                );
             }
         }
         Arc::new(Self {
@@ -1350,7 +1355,7 @@ vllm:kv_cache_usage_perc{model_name="a"} 0.75
     fn unsynchronized_events_stay_degraded_until_an_explicit_clear() {
         let node = vllm_node("http://127.0.0.1:1");
         let exact = ExactCacheDirectory::default();
-        exact.configure_node_owned(node.id(), 10, node.instance_id());
+        exact.configure_node_owned(node.id(), 10, usize::MAX, node.instance_id());
         let prefix = PrefixDirectory::new(&PrefixConfig::default());
         let config = VllmKvEventsConfig::default();
 
@@ -1407,7 +1412,7 @@ vllm:kv_cache_usage_perc{model_name="a"} 0.75
             .to_string();
         let node = vllm_node("http://127.0.0.1:1");
         let exact = Arc::new(ExactCacheDirectory::default());
-        exact.configure_node_owned(node.id(), 10, node.instance_id());
+        exact.configure_node_owned(node.id(), 10, usize::MAX, node.instance_id());
         let prefix = Arc::new(PrefixDirectory::new(&PrefixConfig::default()));
         let config = VllmKvEventsConfig {
             endpoint,
@@ -1482,9 +1487,12 @@ vllm:kv_cache_usage_perc{model_name="a"} 0.75
             vec![Arc::clone(&node)],
             crate::config::RoutingConfig::default(),
         ));
-        scheduler
-            .exact_cache_directory()
-            .configure_node_owned(node.id(), 10, node.instance_id());
+        scheduler.exact_cache_directory().configure_node_owned(
+            node.id(),
+            10,
+            usize::MAX,
+            node.instance_id(),
+        );
         scheduler
             .exact_cache_directory()
             .apply_owned(
@@ -1530,6 +1538,7 @@ vllm:kv_cache_usage_perc{model_name="a"} 0.75
             scheduler.exact_cache_directory().configure_node_owned(
                 node.id(),
                 10,
+                usize::MAX,
                 node.instance_id(),
             );
             scheduler
@@ -1575,9 +1584,12 @@ vllm:kv_cache_usage_perc{model_name="a"} 0.75
             vec![Arc::clone(&node)],
             crate::config::RoutingConfig::default(),
         ));
-        scheduler
-            .exact_cache_directory()
-            .configure_node_owned(node.id(), 10, node.instance_id());
+        scheduler.exact_cache_directory().configure_node_owned(
+            node.id(),
+            10,
+            usize::MAX,
+            node.instance_id(),
+        );
         scheduler
             .exact_cache_directory()
             .apply_owned(
@@ -1619,9 +1631,12 @@ vllm:kv_cache_usage_perc{model_name="a"} 0.75
             vec![Arc::clone(&node)],
             crate::config::RoutingConfig::default(),
         ));
-        scheduler
-            .exact_cache_directory()
-            .configure_node_owned(node.id(), 10, node.instance_id());
+        scheduler.exact_cache_directory().configure_node_owned(
+            node.id(),
+            10,
+            usize::MAX,
+            node.instance_id(),
+        );
         scheduler
             .exact_cache_directory()
             .apply_owned(

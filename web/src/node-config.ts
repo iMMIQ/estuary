@@ -132,6 +132,12 @@ export function validateDraft(draft: NodeDraft): DraftErrors {
       errors.telemetry_stale_ms = "Must not be shorter than the monitor interval";
     }
     if (draft.provider.waiting_threshold < 1) errors.waiting_threshold = "Must be at least 1";
+    if (draft.provider.kv_events) {
+      if (draft.provider.kv_events.reconnect_ms < 1) errors.kv_reconnect_ms = "Must be at least 1 ms";
+      if (draft.provider.kv_events.max_blocks < 1) errors.kv_max_blocks = "Must be at least 1";
+      if (draft.provider.kv_events.max_directory_bytes < 1) errors.kv_max_directory_bytes = "Must be at least 1 byte";
+      if (draft.provider.kv_events.max_event_bytes < 1) errors.kv_max_event_bytes = "Must be at least 1 byte";
+    }
   }
 
   return errors;

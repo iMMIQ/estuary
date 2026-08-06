@@ -50,6 +50,17 @@ fn node(base_url: &str) -> NodeConfig {
     }
 }
 
+fn assert_empty_gateway_status(status: &Value) {
+    assert_eq!(status["status"], "not_ready");
+    assert_eq!(status["fleet"]["total_nodes"], 0);
+    assert_eq!(status["queue"]["requests"], 0);
+    assert_eq!(status["response_buffer"]["used_bytes"], 0);
+    assert_eq!(
+        status["response_buffer"]["max_bytes"],
+        Settings::default().server.max_buffered_response_bytes
+    );
+}
+
 #[tokio::test]
 async fn creates_updates_and_deletes_a_live_node() {
     let upstream = TestServer::spawn(Router::new().route(
@@ -83,9 +94,7 @@ async fn creates_updates_and_deletes_a_live_node() {
         .unwrap();
     assert_eq!(initial_status.status(), StatusCode::OK);
     let initial_status = initial_status.json::<Value>().await.unwrap();
-    assert_eq!(initial_status["status"], "not_ready");
-    assert_eq!(initial_status["fleet"]["total_nodes"], 0);
-    assert_eq!(initial_status["queue"]["requests"], 0);
+    assert_empty_gateway_status(&initial_status);
 
     let created = timeout(
         IO_TIMEOUT,
@@ -103,6 +112,7 @@ async fn creates_updates_and_deletes_a_live_node() {
     assert_eq!(created["runtime"]["health"], "healthy");
     assert_eq!(created["admission"]["state"], "accepting");
     assert_eq!(created["admission"]["accepting_assignments"], true);
+    assert_eq!(created["exact_kv_bytes"], 0);
 
     let ready_status = client
         .get(admin.url("/admin/api/status"))

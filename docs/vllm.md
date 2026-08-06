@@ -62,10 +62,13 @@ The publisher's `endpoint` and `replay_endpoint` are bind addresses. The corresp
     "topic": "kv-events",
     "reconnect_ms": 1000,
     "max_blocks": 1000000,
+    "max_directory_bytes": 536870912,
     "max_event_bytes": 16777216
   }
 }
 ```
+
+`max_blocks` limits logical cached block hashes. `max_directory_bytes` independently caps accounted routing-directory memory, including block-token edges, block nodes, child references, and hash keys. Crossing either limit rejects the event, clears authority, and forces replay recovery; it never leaves a partially trusted directory active.
 
 Keep both ZMQ ports on a private network. The vLLM KV event transport does not define application-level authentication or encryption.
 

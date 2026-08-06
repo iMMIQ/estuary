@@ -40,6 +40,8 @@ struct Cli {
     max_request_body_bytes: Option<usize>,
     #[arg(long, env = "ESTUARY_MAX_NON_STREAMING_RESPONSE_BYTES")]
     max_non_streaming_response_bytes: Option<usize>,
+    #[arg(long, env = "ESTUARY_MAX_BUFFERED_RESPONSE_BYTES")]
+    max_buffered_response_bytes: Option<usize>,
     #[arg(long, env = "ESTUARY_EXPOSE_NODE_HEADER")]
     expose_node_header: Option<bool>,
     #[arg(long, env = "ESTUARY_QUEUE_MAX_REQUESTS")]
@@ -155,6 +157,10 @@ fn apply_cli(settings: &mut Settings, cli: &Cli) {
         settings.server.max_non_streaming_response_bytes,
         cli.max_non_streaming_response_bytes
     );
+    apply!(
+        settings.server.max_buffered_response_bytes,
+        cli.max_buffered_response_bytes
+    );
     apply!(settings.server.expose_node_header, cli.expose_node_header);
     apply!(settings.routing.queue_max_requests, cli.queue_max_requests);
     apply!(settings.routing.queue_max_bytes, cli.queue_max_bytes);
@@ -252,6 +258,8 @@ mod tests {
             "false",
             "--health-interval-ms",
             "2500",
+            "--max-buffered-response-bytes",
+            "134217728",
         ])
         .unwrap();
         let mut settings = Settings::default();
@@ -261,5 +269,6 @@ mod tests {
         assert_eq!(settings.retry.statuses, vec![429, 503]);
         assert!(!settings.routing.prefix.enabled);
         assert_eq!(settings.health.interval_ms, 2500);
+        assert_eq!(settings.server.max_buffered_response_bytes, 134_217_728);
     }
 }

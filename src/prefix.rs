@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    io::{self, Write},
+    sync::Arc,
+};
 
 use parking_lot::RwLock;
 use serde_json::Value;
@@ -40,6 +44,7 @@ struct RadixNode {
     char_count: usize,
     children: HashMap<char, RadixNode>,
     tenant_last_access: HashMap<String, u64>,
+    tenant_oldest_leaf: HashMap<String, u64>,
 }
 
 impl RadixNode {
@@ -50,6 +55,7 @@ impl RadixNode {
             char_count,
             children: HashMap::new(),
             tenant_last_access: HashMap::from([(tenant.to_owned(), epoch)]),
+            tenant_oldest_leaf: HashMap::from([(tenant.to_owned(), epoch)]),
         }
     }
 }
@@ -73,6 +79,7 @@ impl RadixTree {
             .insert(tenant.to_owned(), epoch);
         let count = self.tenant_char_count.entry(tenant.to_owned()).or_default();
         insert_at(&mut self.root, text, tenant, epoch, count);
+        refresh_oldest_leaf(&mut self.root, tenant);
         self.evict_tenant(tenant, max_chars);
     }
 
@@ -139,6 +146,7 @@ impl RadixTree {
 
 fn clear_tenant_from_node(node: &mut RadixNode, tenant: &str) {
     node.tenant_last_access.remove(tenant);
+    node.tenant_oldest_leaf.remove(tenant);
     node.children.retain(|_, child| {
         clear_tenant_from_node(child, tenant);
         !child.children.is_empty() || !child.tenant_last_access.is_empty()
@@ -148,6 +156,7 @@ fn clear_tenant_from_node(node: &mut RadixNode, tenant: &str) {
 fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, count: &mut usize) {
     if remaining.is_empty() {
         node.tenant_last_access.insert(tenant.to_owned(), epoch);
+        refresh_oldest_leaf(node, tenant);
         return;
     }
 
@@ -159,6 +168,7 @@ fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, co
         let leaf = RadixNode::with_text(remaining.to_owned(), tenant, epoch);
         *count = count.saturating_add(leaf.char_count);
         node.children.insert(first, leaf);
+        refresh_oldest_leaf(node, tenant);
         return;
     };
 
@@ -176,6 +186,7 @@ fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, co
             count,
         );
         node.children.insert(first, child);
+        refresh_oldest_leaf(node, tenant);
         return;
     }
 
@@ -189,12 +200,14 @@ fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, co
         .next()
         .expect("radix suffix is not empty");
     let inherited_tenants = child.tenant_last_access.clone();
+    let inherited_oldest = child.tenant_oldest_leaf.clone();
 
     let mut branch = RadixNode {
         text: take_chars(remaining, shared).to_owned(),
         char_count: shared,
         children: HashMap::from([(child_key, child)]),
         tenant_last_access: inherited_tenants,
+        tenant_oldest_leaf: inherited_oldest,
     };
     if !branch.tenant_last_access.contains_key(tenant) {
         *count = count.saturating_add(shared);
@@ -208,38 +221,41 @@ fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, co
         count,
     );
     node.children.insert(first, branch);
+    refresh_oldest_leaf(node, tenant);
 }
 
 fn oldest_leaf(node: &RadixNode, tenant: &str, path: &mut Vec<char>) -> Option<(u64, Vec<char>)> {
-    let mut best: Option<(u64, Vec<char>)> = None;
-    let mut has_tenant_child = false;
-
-    for (key, child) in &node.children {
-        if !child.tenant_last_access.contains_key(tenant) {
-            continue;
-        }
-        has_tenant_child = true;
+    let epoch = *node.tenant_oldest_leaf.get(tenant)?;
+    let mut current = node;
+    while let Some((key, child)) = current
+        .children
+        .iter()
+        .find(|(_, child)| child.tenant_oldest_leaf.get(tenant).copied() == Some(epoch))
+    {
         path.push(*key);
-        if let Some(candidate) = oldest_leaf(child, tenant, path) {
-            if best.as_ref().is_none_or(|(epoch, _)| candidate.0 < *epoch) {
-                best = Some(candidate);
-            }
-        }
-        path.pop();
+        current = child;
     }
+    (!path.is_empty()).then(|| (epoch, path.clone()))
+}
 
-    if !has_tenant_child && !path.is_empty() {
-        return node
-            .tenant_last_access
-            .get(tenant)
-            .map(|epoch| (*epoch, path.clone()));
+fn refresh_oldest_leaf(node: &mut RadixNode, tenant: &str) {
+    let oldest = node
+        .children
+        .values()
+        .filter_map(|child| child.tenant_oldest_leaf.get(tenant).copied())
+        .min()
+        .or_else(|| node.tenant_last_access.get(tenant).copied());
+    if let Some(epoch) = oldest {
+        node.tenant_oldest_leaf.insert(tenant.to_owned(), epoch);
+    } else {
+        node.tenant_oldest_leaf.remove(tenant);
     }
-    best
 }
 
 fn remove_tenant_at_path(node: &mut RadixNode, tenant: &str, path: &[char], depth: usize) -> usize {
     if depth == path.len() {
         if node.tenant_last_access.remove(tenant).is_some() {
+            node.tenant_oldest_leaf.remove(tenant);
             return node.char_count;
         }
         return 0;
@@ -253,6 +269,7 @@ fn remove_tenant_at_path(node: &mut RadixNode, tenant: &str, path: &[char], dept
     if child.children.is_empty() && child.tenant_last_access.is_empty() {
         node.children.remove(&key);
     }
+    refresh_oldest_leaf(node, tenant);
     removed
 }
 
@@ -314,11 +331,11 @@ pub fn routing_text(
     }
 
     let tree_key = format!("{endpoint}\u{1f}{}", model.unwrap_or("<unspecified>"));
-    let mut text = String::new();
+    let mut canonical = BoundedCanonical::new(config.max_request_chars);
     let Some(body) = body else {
         return PrefixInput {
             tree_key,
-            text,
+            text: String::new(),
             char_count: 0,
             token_ids: None,
         };
@@ -334,7 +351,10 @@ pub fn routing_text(
         "reasoning",
     ] {
         if let Some(value) = body.get(key) {
-            append_segment(&mut text, key, value);
+            canonical.append_segment(key, value);
+            if canonical.is_full() {
+                break;
+            }
         }
     }
 
@@ -343,36 +363,112 @@ pub fn routing_text(
         "completions" => "prompt",
         _ => "input",
     };
-    if let Some(input) = body.get(input_key) {
-        if let Some(items) = input.as_array() {
-            for item in items {
-                append_segment(&mut text, input_key, item);
+    if !canonical.is_full() {
+        if let Some(input) = body.get(input_key) {
+            if let Some(items) = input.as_array() {
+                for item in items {
+                    canonical.append_segment(input_key, item);
+                    if canonical.is_full() {
+                        break;
+                    }
+                }
+            } else {
+                canonical.append_segment(input_key, input);
             }
         } else {
-            append_segment(&mut text, input_key, input);
+            canonical.append_segment("body", body);
         }
-    } else {
-        append_segment(&mut text, "body", body);
     }
 
-    let char_count = text.chars().count();
-    if char_count > config.max_request_chars {
-        text = take_chars(&text, config.max_request_chars).to_owned();
-    }
+    let (text, char_count) = canonical.finish();
     PrefixInput {
         tree_key,
-        char_count: char_count.min(config.max_request_chars),
+        char_count,
         text,
         token_ids: None,
     }
 }
 
-fn append_segment(output: &mut String, name: &str, value: &Value) {
-    output.push('\u{1e}');
-    output.push_str(name);
-    output.push('\u{1f}');
-    if let Ok(encoded) = serde_json::to_string(value) {
-        output.push_str(&encoded);
+struct BoundedCanonical {
+    output: String,
+    max_chars: usize,
+    chars: usize,
+    full: bool,
+}
+
+impl BoundedCanonical {
+    fn new(max_chars: usize) -> Self {
+        Self {
+            output: String::new(),
+            max_chars,
+            chars: 0,
+            full: false,
+        }
+    }
+
+    fn append_segment(&mut self, name: &str, value: &Value) {
+        if self.full {
+            return;
+        }
+        self.push_str("\u{1e}");
+        self.push_str(name);
+        self.push_str("\u{1f}");
+        if self.full {
+            return;
+        }
+        let _ = serde_json::to_writer(self, value);
+    }
+
+    fn push_str(&mut self, value: &str) {
+        if self.full {
+            return;
+        }
+        if value.is_ascii() {
+            let written = value.len().min(self.max_chars.saturating_sub(self.chars));
+            self.output.push_str(&value[..written]);
+            self.chars += written;
+            self.full = self.chars == self.max_chars;
+            return;
+        }
+        for character in value.chars() {
+            if self.chars == self.max_chars {
+                self.full = true;
+                break;
+            }
+            self.output.push(character);
+            self.chars += 1;
+        }
+        self.full = self.chars == self.max_chars;
+    }
+
+    fn is_full(&self) -> bool {
+        self.full
+    }
+
+    fn finish(self) -> (String, usize) {
+        (self.output, self.chars)
+    }
+}
+
+impl Write for BoundedCanonical {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let value = std::str::from_utf8(buffer)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let before = self.output.len();
+        self.push_str(value);
+        let written = self.output.len() - before;
+        if written < buffer.len() {
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "prefix canonicalization limit reached",
+            ))
+        } else {
+            Ok(written)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -532,6 +628,33 @@ mod tests {
                 .unwrap_or_default()
                 <= 24
         );
+    }
+
+    #[test]
+    fn eviction_index_respects_a_refreshed_leaf_epoch() {
+        let mut tree = RadixTree::default();
+        tree.insert("aaaa", "node-a", 8);
+        tree.insert("bbbb", "node-a", 8);
+        tree.insert("aaaa", "node-a", 8);
+        tree.insert("cccc", "node-a", 8);
+
+        assert_eq!(tree.prefix_match("aaaa", 4).node_ids, ["node-a"]);
+        assert!(tree.prefix_match("bbbb", 4).node_ids.is_empty());
+        assert_eq!(tree.prefix_match("cccc", 4).node_ids, ["node-a"]);
+    }
+
+    #[test]
+    fn canonicalization_stops_at_the_configured_character_limit() {
+        let config = PrefixConfig {
+            max_request_chars: 32,
+            ..PrefixConfig::default()
+        };
+        let body = json!({"prompt": "é".repeat(100_000)});
+        let input = routing_text("completions", Some("m"), Some(&body), &config);
+
+        assert_eq!(input.char_count(), 32);
+        assert_eq!(input.text.chars().count(), 32);
+        assert!(input.text.len() <= 64);
     }
 
     #[test]

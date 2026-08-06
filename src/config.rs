@@ -66,6 +66,17 @@ impl Settings {
         if self.server.max_non_streaming_response_bytes == 0 {
             bail!("server.max_non_streaming_response_bytes must be greater than zero");
         }
+        if self.server.max_non_streaming_response_bytes > u32::MAX as usize {
+            bail!("server.max_non_streaming_response_bytes exceeds the supported 4 GiB limit");
+        }
+        if self.server.max_buffered_response_bytes < self.server.max_non_streaming_response_bytes {
+            bail!(
+                "server.max_buffered_response_bytes must cover one maximum-sized non-streaming response"
+            );
+        }
+        if self.server.max_buffered_response_bytes > tokio::sync::Semaphore::MAX_PERMITS {
+            bail!("server.max_buffered_response_bytes exceeds the runtime semaphore limit");
+        }
 
         if self.routing.queue_max_requests == 0 || self.routing.queue_max_bytes < 1024 {
             bail!("routing queue limits must be greater than zero");
@@ -295,7 +306,11 @@ fn validate_provider(node: &NodeConfig, base_url: &Url) -> Result<()> {
         if let Some(endpoint) = &events.replay_endpoint {
             validate_zmq_endpoint(&node.id, "replay_endpoint", endpoint)?;
         }
-        if events.reconnect_ms == 0 || events.max_blocks == 0 || events.max_event_bytes == 0 {
+        if events.reconnect_ms == 0
+            || events.max_blocks == 0
+            || events.max_directory_bytes == 0
+            || events.max_event_bytes == 0
+        {
             bail!("node {} KV event limits must be greater than zero", node.id);
         }
     }
@@ -338,6 +353,7 @@ pub struct ServerConfig {
     pub shutdown_grace_ms: u64,
     pub max_request_body_bytes: usize,
     pub max_non_streaming_response_bytes: usize,
+    pub max_buffered_response_bytes: usize,
     pub expose_node_header: bool,
     pub log_json: bool,
 }
@@ -359,6 +375,7 @@ impl Default for ServerConfig {
             shutdown_grace_ms: 3_660_000,
             max_request_body_bytes: 16 * 1024 * 1024,
             max_non_streaming_response_bytes: 64 * 1024 * 1024,
+            max_buffered_response_bytes: 256 * 1024 * 1024,
             expose_node_header: false,
             log_json: false,
         }
@@ -601,6 +618,7 @@ pub struct VllmKvEventsConfig {
     pub topic: String,
     pub reconnect_ms: u64,
     pub max_blocks: usize,
+    pub max_directory_bytes: usize,
     pub max_event_bytes: usize,
 }
 
@@ -612,6 +630,7 @@ impl Default for VllmKvEventsConfig {
             topic: "kv-events".to_owned(),
             reconnect_ms: 1_000,
             max_blocks: 1_000_000,
+            max_directory_bytes: 512 * 1024 * 1024,
             max_event_bytes: 16 * 1024 * 1024,
         }
     }
@@ -706,6 +725,13 @@ mod tests {
         zero_response_limit.server.downstream_stall_timeout_ms = 1;
         zero_response_limit.server.max_non_streaming_response_bytes = 0;
         assert!(zero_response_limit.validate().is_err());
+
+        let mut undersized_global_limit = Settings::default();
+        undersized_global_limit.server.max_buffered_response_bytes = undersized_global_limit
+            .server
+            .max_non_streaming_response_bytes
+            - 1;
+        assert!(undersized_global_limit.validate().is_err());
     }
 
     #[test]

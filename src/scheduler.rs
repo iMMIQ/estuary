@@ -510,8 +510,12 @@ impl Scheduler {
             )));
         }
         if let Some(events) = node.provider().kv_events.as_ref() {
-            self.exact_cache
-                .configure_node_owned(node.id(), events.max_blocks, node.instance_id());
+            self.exact_cache.configure_node_owned(
+                node.id(),
+                events.max_blocks,
+                events.max_directory_bytes,
+                node.instance_id(),
+            );
         }
         nodes.push(node);
         nodes.sort_by(|left, right| left.id().cmp(right.id()));
@@ -534,8 +538,12 @@ impl Scheduler {
         self.exact_cache
             .remove_node_owned(node.id(), previous.instance_id());
         if let Some(events) = node.provider().kv_events.as_ref() {
-            self.exact_cache
-                .configure_node_owned(node.id(), events.max_blocks, node.instance_id());
+            self.exact_cache.configure_node_owned(
+                node.id(),
+                events.max_blocks,
+                events.max_directory_bytes,
+                node.instance_id(),
+            );
         }
         drop(nodes);
         self.notify.notify_waiters();

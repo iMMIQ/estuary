@@ -29,6 +29,7 @@ use crate::{
     metrics::Metrics,
     node::{Node, NodeLease},
     prefix::{PrefixInput, routing_text},
+    response_buffer::{ResponseBufferBudget, ResponseBufferReservation},
     server::{AppState, RequestId},
 };
 
@@ -907,6 +908,7 @@ async fn proxy_with_retries(
             return proxy_error_response(
                 response,
                 selection.lease,
+                Arc::clone(&state.response_buffer),
                 stream_idle_timeout,
                 upstream_body_timeout,
                 request.client_protocol,
@@ -926,6 +928,7 @@ async fn proxy_with_retries(
                 stream_idle_timeout,
                 upstream_body_timeout,
                 state.settings.server.max_non_streaming_response_bytes,
+                Arc::clone(&state.response_buffer),
                 state.settings.server.expose_node_header,
                 &response_mode,
                 request.public_model.as_deref().unwrap_or_default(),
@@ -1037,6 +1040,7 @@ async fn buffered_success_response(
     stream_idle_timeout: Duration,
     upstream_body_timeout: Duration,
     max_body_bytes: usize,
+    response_buffer: Arc<ResponseBufferBudget>,
     expose_node_header: bool,
     response_mode: &UpstreamResponseMode,
     public_model: &str,
@@ -1045,9 +1049,10 @@ async fn buffered_success_response(
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let upstream_request_id = headers.get("x-request-id").cloned();
-    let body = match read_limited(
+    let buffered = match read_limited(
         upstream,
         max_body_bytes,
+        response_buffer,
         stream_idle_timeout,
         upstream_body_timeout,
     )
@@ -1062,18 +1067,24 @@ async fn buffered_success_response(
             return Err(error);
         }
     };
+    let BufferedUpstreamBody {
+        bytes: upstream_body,
+        mut reservation,
+    } = buffered;
     let body = match response_mode {
-        UpstreamResponseMode::Passthrough => Ok(body),
-        UpstreamResponseMode::Codex { namespaces } => codex::rewrite_response(&body, namespaces),
+        UpstreamResponseMode::Passthrough => Ok(upstream_body.clone()),
+        UpstreamResponseMode::Codex { namespaces } => {
+            codex::rewrite_response(&upstream_body, namespaces)
+        }
         UpstreamResponseMode::ChatToAnthropic { expose_thinking } => {
-            anthropic::convert_response(&body, public_model, *expose_thinking)
+            anthropic::convert_response(&upstream_body, public_model, *expose_thinking)
         }
         UpstreamResponseMode::ResponsesToAnthropic { expose_thinking } => {
-            anthropic_responses::convert_response(&body, public_model, *expose_thinking)
+            anthropic_responses::convert_response(&upstream_body, public_model, *expose_thinking)
         }
         UpstreamResponseMode::NativeAnthropic {
             expose_thinking, ..
-        } => anthropic::rewrite_native_response(&body, public_model, *expose_thinking),
+        } => anthropic::rewrite_native_response(&upstream_body, public_model, *expose_thinking),
     };
     let body = match body {
         Ok(body) => body,
@@ -1085,11 +1096,20 @@ async fn buffered_success_response(
             return Err(error);
         }
     };
+    if body.len() > max_body_bytes {
+        lease.record_failure(
+            "response adapter exceeded the configured non-streaming body limit",
+            health_config,
+        );
+        return Err(GatewayError::InvalidUpstreamResponse);
+    }
+    drop(upstream_body);
+    reservation.shrink_to(body.len());
     lease.record_success(header_latency);
     if record_prefix {
         prefix_directory.record(node.id(), prefix_input);
     }
-    let mut response = Response::new(Body::from(body));
+    let mut response = Response::new(budgeted_body(body, reservation));
     *response.status_mut() = status;
     copy_response_headers(&headers, response.headers_mut());
     if response_mode.rewrites_body() {
@@ -1483,6 +1503,7 @@ impl Drop for BodyGuard {
 async fn proxy_error_response(
     upstream: reqwest::Response,
     _lease: NodeLease,
+    response_buffer: Arc<ResponseBufferBudget>,
     stream_idle_timeout: Duration,
     upstream_body_timeout: Duration,
     client_protocol: ClientProtocol,
@@ -1493,21 +1514,23 @@ async fn proxy_error_response(
     if !status.is_client_error() && !status.is_server_error() {
         return Err(GatewayError::InvalidUpstreamResponse);
     }
-    let body = read_limited(
+    let buffered = read_limited(
         upstream,
         MAX_ERROR_BODY_BYTES,
+        response_buffer,
         stream_idle_timeout,
         upstream_body_timeout,
     )
     .await?;
+    let body = &buffered.bytes;
     if client_protocol == ClientProtocol::Anthropic {
-        let mut response = anthropic::convert_error_response(status, &body, request_id);
+        let mut response = anthropic::convert_error_response(status, body, request_id);
         if let Some(value) = headers.get("retry-after") {
             response.headers_mut().insert("retry-after", value.clone());
         }
-        return Ok(response);
+        return Ok(hold_response_buffer(response, buffered.reservation));
     }
-    let valid_openai_error = serde_json::from_slice::<Value>(&body)
+    let valid_openai_error = serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|value| value.get("error").cloned())
         .is_some_and(|error| error.is_object());
@@ -1518,24 +1541,33 @@ async fn proxy_error_response(
         }
         return Ok(response);
     }
-    let mut response = Response::new(Body::from(body));
+    let mut reservation = buffered.reservation;
+    reservation.shrink_to(body.len());
+    let mut response = Response::new(budgeted_body(body.clone(), reservation));
     *response.status_mut() = status;
     copy_response_headers(&headers, response.headers_mut());
     Ok(response)
 }
 
+struct BufferedUpstreamBody {
+    bytes: Bytes,
+    reservation: ResponseBufferReservation,
+}
+
 async fn read_limited(
     response: reqwest::Response,
     limit: usize,
+    response_buffer: Arc<ResponseBufferBudget>,
     stream_idle_timeout: Duration,
     upstream_body_timeout: Duration,
-) -> Result<Bytes, GatewayError> {
+) -> Result<BufferedUpstreamBody, GatewayError> {
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
         return Err(GatewayError::InvalidUpstreamResponse);
     }
+    let reservation = response_buffer.reserve(limit).await;
     let mut output = BytesMut::new();
     let mut stream = response.bytes_stream();
     let body_deadline = tokio::time::Instant::now() + upstream_body_timeout;
@@ -1557,7 +1589,32 @@ async fn read_limited(
         }
         output.extend_from_slice(&bytes);
     }
-    Ok(output.freeze())
+    Ok(BufferedUpstreamBody {
+        bytes: output.freeze(),
+        reservation,
+    })
+}
+
+fn budgeted_body(body: Bytes, reservation: ResponseBufferReservation) -> Body {
+    Body::from_stream(async_stream::stream! {
+        let _reservation = reservation;
+        yield Ok::<Bytes, io::Error>(body);
+    })
+}
+
+fn hold_response_buffer(
+    mut response: Response,
+    reservation: ResponseBufferReservation,
+) -> Response {
+    let body = std::mem::replace(response.body_mut(), Body::empty());
+    let mut stream = body.into_data_stream();
+    *response.body_mut() = Body::from_stream(async_stream::stream! {
+        let _reservation = reservation;
+        while let Some(item) = stream.next().await {
+            yield item;
+        }
+    });
+    response
 }
 
 fn copy_response_headers(source: &HeaderMap, destination: &mut HeaderMap) {

@@ -155,6 +155,7 @@ export function NodeEditor({
         topic: "kv-events",
         reconnect_ms: 1000,
         max_blocks: 1_000_000,
+        max_directory_bytes: 536_870_912,
         max_event_bytes: 16_777_216,
       },
     },
@@ -255,9 +256,10 @@ export function NodeEditor({
               <TextInput label="Publisher endpoint" value={draft.provider.kv_events.endpoint} onChange={(event) => updateKv("endpoint", event.target.value)} />
               <TextInput label="Replay endpoint" value={draft.provider.kv_events.replay_endpoint ?? ""} onChange={(event) => updateKv("replay_endpoint", event.target.value || null)} />
               <TextInput label="Topic" value={draft.provider.kv_events.topic} onChange={(event) => updateKv("topic", event.target.value)} />
-              <NumberInput label="Reconnect (ms)" min={1} value={draft.provider.kv_events.reconnect_ms} onChange={(value) => updateKv("reconnect_ms", numeric(value))} />
-              <NumberInput label="Max blocks" min={1} value={draft.provider.kv_events.max_blocks} onChange={(value) => updateKv("max_blocks", numeric(value))} />
-              <NumberInput label="Max event bytes" min={1} value={draft.provider.kv_events.max_event_bytes} onChange={(value) => updateKv("max_event_bytes", numeric(value))} />
+              <NumberInput label="Reconnect (ms)" min={1} value={draft.provider.kv_events.reconnect_ms} error={errors.kv_reconnect_ms} onChange={(value) => updateKv("reconnect_ms", numeric(value))} />
+              <NumberInput label="Max blocks" min={1} value={draft.provider.kv_events.max_blocks} error={errors.kv_max_blocks} onChange={(value) => updateKv("max_blocks", numeric(value))} />
+              <NumberInput label="Directory memory bytes" min={1} value={draft.provider.kv_events.max_directory_bytes} error={errors.kv_max_directory_bytes} onChange={(value) => updateKv("max_directory_bytes", numeric(value))} />
+              <NumberInput label="Max event bytes" min={1} value={draft.provider.kv_events.max_event_bytes} error={errors.kv_max_event_bytes} onChange={(value) => updateKv("max_event_bytes", numeric(value))} />
             </div>}
           </section>}
 

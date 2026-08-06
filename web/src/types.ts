@@ -10,6 +10,7 @@ export interface KvEventsConfig {
   topic: string;
   reconnect_ms: number;
   max_blocks: number;
+  max_directory_bytes: number;
   max_event_bytes: number;
 }
 
@@ -101,6 +102,7 @@ export interface NodeRecord {
   admission: AdmissionSnapshot;
   exact_kv_authoritative: boolean;
   exact_kv_blocks: number;
+  exact_kv_bytes: number;
 }
 
 export interface GatewayStatus {
@@ -123,6 +125,11 @@ export interface GatewayStatus {
     bytes: number;
     max_requests: number;
     max_bytes: number;
+  };
+  response_buffer: {
+    used_bytes: number;
+    max_bytes: number;
+    waiting_responses: number;
   };
   routing: {
     prefix_enabled: boolean;

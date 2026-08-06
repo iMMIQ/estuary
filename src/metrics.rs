@@ -58,9 +58,12 @@ pub struct Metrics {
     node_upstream_waiting: Family<NodeLabels, Gauge>,
     node_kv_cache_usage: Family<NodeLabels, Gauge<f64, AtomicU64>>,
     node_exact_kv_blocks: Family<NodeLabels, Gauge>,
+    node_exact_kv_bytes: Family<NodeLabels, Gauge>,
     node_exact_kv_ready: Family<NodeLabels, Gauge>,
     queue_requests: Gauge,
     queue_bytes: Gauge,
+    response_buffer_bytes: Gauge,
+    response_buffer_waiters: Gauge,
     request_duration: Histogram,
     queue_duration: Histogram,
     tokenization_duration: Histogram,
@@ -87,9 +90,12 @@ impl Metrics {
         let node_upstream_waiting = Family::default();
         let node_kv_cache_usage = Family::<NodeLabels, Gauge<f64, AtomicU64>>::default();
         let node_exact_kv_blocks = Family::default();
+        let node_exact_kv_bytes = Family::default();
         let node_exact_kv_ready = Family::default();
         let queue_requests = Gauge::default();
         let queue_bytes = Gauge::default();
+        let response_buffer_bytes = Gauge::default();
+        let response_buffer_waiters = Gauge::default();
         let request_duration = Histogram::new(exponential_buckets(0.005, 2.0, 18));
         let queue_duration = Histogram::new(exponential_buckets(0.001, 2.0, 16));
         let tokenization_duration = Histogram::new(exponential_buckets(0.000_5, 2.0, 18));
@@ -178,6 +184,11 @@ impl Metrics {
             node_exact_kv_blocks.clone(),
         );
         registry.register(
+            "node_exact_kv_bytes",
+            "Accounted bytes held by each node's exact routing directory.",
+            node_exact_kv_bytes.clone(),
+        );
+        registry.register(
             "node_exact_kv_ready",
             "Whether the node's exact vLLM KV event directory is currently usable.",
             node_exact_kv_ready.clone(),
@@ -191,6 +202,16 @@ impl Metrics {
             "queue_bytes",
             "KiB-rounded request-body bytes held by all queued requests.",
             queue_bytes.clone(),
+        );
+        registry.register(
+            "response_buffer_bytes",
+            "Bytes reserved by completed or in-progress non-streaming upstream response buffers.",
+            response_buffer_bytes.clone(),
+        );
+        registry.register(
+            "response_buffer_waiters",
+            "Upstream response bodies waiting for global non-streaming buffer capacity.",
+            response_buffer_waiters.clone(),
         );
         registry.register(
             "request_duration_seconds",
@@ -236,9 +257,12 @@ impl Metrics {
             node_upstream_waiting,
             node_kv_cache_usage,
             node_exact_kv_blocks,
+            node_exact_kv_bytes,
             node_exact_kv_ready,
             queue_requests,
             queue_bytes,
+            response_buffer_bytes,
+            response_buffer_waiters,
             request_duration,
             queue_duration,
             tokenization_duration,
@@ -315,6 +339,16 @@ impl Metrics {
         self.prefix_match_tokens.observe(tokens as f64);
     }
 
+    pub fn response_buffer_bytes(&self, bytes: usize) {
+        self.response_buffer_bytes
+            .set(bytes.try_into().unwrap_or(i64::MAX));
+    }
+
+    pub fn response_buffer_waiters(&self, waiters: usize) {
+        self.response_buffer_waiters
+            .set(waiters.try_into().unwrap_or(i64::MAX));
+    }
+
     pub fn encode(&self, scheduler: &Scheduler) -> Result<String> {
         for node in scheduler.nodes() {
             let labels = NodeLabels {
@@ -375,6 +409,9 @@ impl Metrics {
             self.node_exact_kv_blocks
                 .get_or_create(&labels)
                 .set(cache.blocks.try_into().unwrap_or(i64::MAX));
+            self.node_exact_kv_bytes
+                .get_or_create(&labels)
+                .set(cache.bytes.try_into().unwrap_or(i64::MAX));
             self.node_exact_kv_ready
                 .get_or_create(&labels)
                 .set(i64::from(cache.authoritative));
@@ -413,11 +450,15 @@ mod tests {
         let scheduler = Scheduler::new(vec![node], RoutingConfig::default());
         let metrics = Metrics::new();
         metrics.tokenization("prefix_gate", std::time::Duration::from_millis(2));
+        metrics.response_buffer_bytes(1_024);
+        metrics.response_buffer_waiters(2);
         let output = metrics.encode(&scheduler).unwrap();
         assert!(output.contains("estuary_node_provider_ready"));
         assert!(output.contains("estuary_node_exact_kv_blocks"));
         assert!(output.contains("estuary_node_kv_cache_usage_ratio"));
         assert!(output.contains("estuary_tokenization_outcomes_total{outcome=\"prefix_gate\"} 1"));
         assert!(output.contains("estuary_tokenization_duration_seconds_count 1"));
+        assert!(output.contains("estuary_response_buffer_bytes 1024"));
+        assert!(output.contains("estuary_response_buffer_waiters 2"));
     }
 }
