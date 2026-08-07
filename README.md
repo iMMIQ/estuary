@@ -17,7 +17,8 @@ using concurrency, observed load, latency, errors, and prompt-prefix locality.
   breakers, and bounded retries.
 - Approximate prompt-prefix affinity for generic servers and exact KV-block
   affinity for vLLM 0.25 and newer.
-- SQLite-backed node configuration with an embedded management application.
+- SQLite-backed node configuration with an embedded English and Simplified
+  Chinese management application.
 - Bounded request admission, response buffering, streaming backpressure, and
   graceful shutdown.
 - A built-in two-worker supervisor for zero-downtime binary rollout and rollback.

@@ -85,37 +85,37 @@ export function shouldClearApiKey(draft: NodeDraft): boolean {
 
 export function validateDraft(draft: NodeDraft): DraftErrors {
   const errors: DraftErrors = {};
-  if (!draft.id.trim()) errors.id = "Node ID is required";
+  if (!draft.id.trim()) errors.id = "validation.nodeIdRequired";
 
   try {
     const url = new URL(draft.base_url);
     if (!["http:", "https:"].includes(url.protocol) || !url.hostname) {
-      errors.base_url = "Use an absolute HTTP or HTTPS URL";
+      errors.base_url = "validation.absoluteUrl";
     } else if (url.username || url.password || url.search || url.hash) {
-      errors.base_url = "Credentials, query strings and fragments are not allowed";
+      errors.base_url = "validation.urlParts";
     }
   } catch {
-    errors.base_url = "Use an absolute HTTP or HTTPS URL";
+    errors.base_url = "validation.absoluteUrl";
   }
 
-  if (!draft.health_path.trim()) errors.health_path = "Health path is required";
+  if (!draft.health_path.trim()) errors.health_path = "validation.healthPathRequired";
   if (!Number.isFinite(draft.max_concurrency) || draft.max_concurrency < 1) {
-    errors.max_concurrency = "Max concurrency must be at least 1";
+    errors.max_concurrency = "validation.concurrency";
   }
   if (!Number.isFinite(draft.weight) || draft.weight <= 0) {
-    errors.weight = "Weight must be greater than 0";
+    errors.weight = "validation.weight";
   }
 
   const completeModels = draft.models.filter((row) => row.key.trim() && row.value.trim());
-  if (completeModels.length === 0) errors.models = "Add at least one complete model mapping";
+  if (completeModels.length === 0) errors.models = "validation.modelRequired";
   if (draft.models.some((row) => Boolean(row.key.trim()) !== Boolean(row.value.trim()))) {
-    errors.models = "Complete or remove every model mapping row";
+    errors.models = "validation.modelIncomplete";
   }
   const modelKeys = completeModels.map((row) => row.key.trim());
-  if (new Set(modelKeys).size !== modelKeys.length) errors.models = "Public model names must be unique";
+  if (new Set(modelKeys).size !== modelKeys.length) errors.models = "validation.modelUnique";
 
   if (draft.headers_from_env.some((row) => Boolean(row.key.trim()) !== Boolean(row.value.trim()))) {
-    errors.headers_from_env = "Complete or remove every header row";
+    errors.headers_from_env = "validation.headerIncomplete";
   }
 
   if (draft.provider.type === "vllm") {
@@ -124,25 +124,25 @@ export function validateDraft(draft: NodeDraft): DraftErrors {
       ["metrics_path", draft.provider.metrics_path],
       ["tokenize_path", draft.provider.tokenize_path],
     ] as const) {
-      if (!value.startsWith("/")) errors[key] = "Path must start with /";
+      if (!value.startsWith("/")) errors[key] = "validation.pathSlash";
     }
-    if (draft.provider.monitor_interval_ms < 100) errors.monitor_interval_ms = "Must be at least 100 ms";
-    if (draft.provider.request_timeout_ms < 1) errors.request_timeout_ms = "Must be at least 1 ms";
+    if (draft.provider.monitor_interval_ms < 100) errors.monitor_interval_ms = "validation.min100ms";
+    if (draft.provider.request_timeout_ms < 1) errors.request_timeout_ms = "validation.min1ms";
     if (draft.provider.telemetry_stale_ms < draft.provider.monitor_interval_ms) {
-      errors.telemetry_stale_ms = "Must not be shorter than the monitor interval";
+      errors.telemetry_stale_ms = "validation.telemetryInterval";
     }
-    if (draft.provider.waiting_threshold < 1) errors.waiting_threshold = "Must be at least 1";
+    if (draft.provider.waiting_threshold < 1) errors.waiting_threshold = "validation.min1";
     if (draft.provider.kv_events) {
-      if (draft.provider.kv_events.reconnect_ms < 1) errors.kv_reconnect_ms = "Must be at least 1 ms";
-      if (draft.provider.kv_events.max_blocks < 1) errors.kv_max_blocks = "Must be at least 1";
-      if (draft.provider.kv_events.max_directory_bytes < 1) errors.kv_max_directory_bytes = "Must be at least 1 byte";
-      if (draft.provider.kv_events.max_event_bytes < 1) errors.kv_max_event_bytes = "Must be at least 1 byte";
+      if (draft.provider.kv_events.reconnect_ms < 1) errors.kv_reconnect_ms = "validation.min1ms";
+      if (draft.provider.kv_events.max_blocks < 1) errors.kv_max_blocks = "validation.min1";
+      if (draft.provider.kv_events.max_directory_bytes < 1) errors.kv_max_directory_bytes = "validation.min1byte";
+      if (draft.provider.kv_events.max_event_bytes < 1) errors.kv_max_event_bytes = "validation.min1byte";
     }
   }
 
   return errors;
 }
 
-export function formatCompactNumber(value: number): string {
-  return new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value);
+export function formatCompactNumber(value: number, locale = "en"): string {
+  return new Intl.NumberFormat(locale, { notation: "compact", maximumFractionDigits: 1 }).format(value);
 }

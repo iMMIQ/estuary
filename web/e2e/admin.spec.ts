@@ -193,7 +193,7 @@ test("drains and deletes an existing upstream", async ({ page }) => {
 
   await page.getByLabel("Actions for vllm-a").click();
   await page.getByRole("menuitem", { name: "Drain" }).click();
-  await expect(page.getByText("Node is draining")).toBeVisible();
+  await expect(page.getByRole("alert").getByText("Node is draining")).toBeVisible();
 
   await page.getByLabel("Actions for vllm-a").click();
   await expect(page.getByRole("menuitem", { name: "Resume" })).toBeVisible();
@@ -215,4 +215,55 @@ test("surfaces a revision conflict and refreshes the node", async ({ page }) => 
 
   await expect(page.getByText("The node changed; refresh and retry")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Edit vllm-a" })).toBeVisible();
+});
+
+test("detects Chinese and persists an explicit language choice", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "languages", { configurable: true, value: ["zh-CN", "en-US"] });
+  });
+  await mockControlPlane(page, [record(nodeConfig())]);
+  await page.goto("/admin/");
+
+  await expect(page.getByRole("heading", { name: "总览" })).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
+  await expect(page).toHaveTitle("Estuary 控制台");
+
+  await page.getByRole("button", { name: "语言" }).click();
+  await page.getByRole("menuitem", { name: "English" }).click();
+  await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("lang", "en");
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Language" }).click();
+  await page.getByRole("menuitem", { name: "简体中文" }).click();
+  await page.locator("button:visible").filter({ hasText: /^上游节点$/ }).click();
+  await page.getByRole("button", { name: "添加节点" }).first().click();
+  await page.getByRole("button", { name: "下一步" }).click();
+  await expect(page.getByText("必须填写节点 ID")).toBeVisible();
+});
+
+test("captures the bilingual interface for visual review", async ({ page }, testInfo) => {
+  test.skip(process.env.ESTUARY_I18N_SCREENSHOTS !== "1", "manual screenshot review");
+  await mockControlPlane(page, [record(nodeConfig())]);
+
+  for (const locale of ["en", "zh-CN"] as const) {
+    await page.goto("/admin/");
+    await page.evaluate((value) => localStorage.setItem("estuary.locale", value), locale);
+    await page.reload();
+
+    const capture = async (name: string) => {
+      await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+      await page.screenshot({ path: testInfo.outputPath(`i18n-${locale}-${name}.png`), fullPage: true });
+    };
+
+    await capture("overview");
+    await page.locator("button:visible").filter({ hasText: locale === "en" ? /^Upstreams$/ : /^上游节点$/ }).click();
+    await capture("upstreams");
+    await page.locator(".upstream-table tbody tr").click();
+    await capture("details");
+    await page.getByRole("button", { name: locale === "en" ? "Edit" : "编辑" }).click();
+    await page.getByRole("button", { name: locale === "en" ? "Next" : "下一步" }).click();
+    await capture("editor-advanced");
+  }
 });

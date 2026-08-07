@@ -19,21 +19,12 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import * as api from "./api";
+import type { TranslationKey } from "./i18n";
 import { draftToConfig, shouldClearApiKey, validateDraft } from "./node-config";
 import type { DraftErrors } from "./node-config";
 import type { AnthropicProtocol, KvEventsConfig, NodeDraft, Pair, PreflightResponse, ProviderKind } from "./types";
-
-const anthropicProtocols = [
-  { value: "auto", label: "Automatic" },
-  { value: "native", label: "Native Anthropic Messages" },
-  { value: "responses", label: "OpenAI Responses" },
-  { value: "chat", label: "OpenAI Chat Completions" },
-];
-
-function anthropicProtocolLabel(value: AnthropicProtocol): string {
-  return anthropicProtocols.find((item) => item.value === value)?.label ?? value;
-}
 
 export type EditorState =
   | { mode: "create"; draft: NodeDraft; revision: null }
@@ -56,6 +47,7 @@ function PairEditor({
   keyLabel: string;
   valueLabel: string;
 }) {
+  const { t } = useTranslation();
   const update = (index: number, key: keyof Pair, value: string) => {
     onChange(rows.map((row, rowIndex) => rowIndex === index ? { ...row, [key]: value } : row));
   };
@@ -65,10 +57,10 @@ function PairEditor({
     {rows.map((row, index) => <div className="mapping-row" key={index}>
       <TextInput aria-label={`${keyLabel} ${index + 1}`} value={row.key} error={Boolean(error)} onChange={(event) => update(index, "key", event.target.value)} />
       <TextInput aria-label={`${valueLabel} ${index + 1}`} value={row.value} error={Boolean(error)} onChange={(event) => update(index, "value", event.target.value)} />
-      <Button variant="subtle" color="gray" px={6} aria-label={`Remove mapping ${index + 1}`} onClick={() => onChange(rows.length === 1 ? [{ key: "", value: "" }] : rows.filter((_, rowIndex) => rowIndex !== index))}><Trash2 size={14} /></Button>
+      <Button variant="subtle" color="gray" px={6} aria-label={t("editor.removeMapping", { count: index + 1 })} onClick={() => onChange(rows.length === 1 ? [{ key: "", value: "" }] : rows.filter((_, rowIndex) => rowIndex !== index))}><Trash2 size={14} /></Button>
     </div>)}
-    {error && <span className="form-error" role="alert">{error}</span>}
-    <Button variant="subtle" size="compact-sm" leftSection={<Plus size={14} />} onClick={() => onChange([...rows, { key: "", value: "" }])}>Add mapping</Button>
+    {error && <span className="form-error" role="alert">{t(error as TranslationKey)}</span>}
+    <Button variant="subtle" size="compact-sm" leftSection={<Plus size={14} />} onClick={() => onChange([...rows, { key: "", value: "" }])}>{t("editor.addMapping")}</Button>
   </div>;
 }
 
@@ -87,6 +79,8 @@ export function NodeEditor({
   onClose: () => void;
   onSave: (state: EditorState) => Promise<void>;
 }) {
+  const { t } = useTranslation();
+  const errorText = (key?: string) => key ? t(key as TranslationKey) : undefined;
   const [draft, setDraft] = useState(state.draft);
   const [step, setStep] = useState(0);
   const [errors, setErrors] = useState<DraftErrors>({});
@@ -103,7 +97,7 @@ export function NodeEditor({
   }, []);
 
   const requestClose = () => {
-    if (!dirty || window.confirm("Discard unsaved changes?")) onClose();
+    if (!dirty || window.confirm(t("editor.discard"))) onClose();
   };
 
   const validate = () => {
@@ -131,7 +125,7 @@ export function NodeEditor({
     try {
       setPreflight(await api.preflightNode(draftToConfig(draft), shouldClearApiKey(draft)));
     } catch (error) {
-      setPreflightError(error instanceof Error ? error.message : "Connection test failed");
+      setPreflightError(error instanceof Error ? error.message : t("editor.connectionTestFailed"));
     } finally {
       setChecking(false);
     }
@@ -166,17 +160,20 @@ export function NodeEditor({
     provider: { ...current.provider, kv_events: current.provider.kv_events ? { ...current.provider.kv_events, [key]: value } : null },
   }));
 
+  const anthropicProtocols = (["auto", "native", "responses", "chat"] as AnthropicProtocol[])
+    .map((value) => ({ value, label: t(`protocol.${value}` as TranslationKey) }));
+
   return <div className="editor-page page-frame">
-    <button className="breadcrumb-button" type="button" onClick={requestClose}><ArrowLeft size={15} /> Back to upstreams</button>
-    <header className="editor-header"><h1>{state.mode === "create" ? "Add Upstream Node" : `Edit ${draft.id}`}</h1></header>
+    <button className="breadcrumb-button" type="button" onClick={requestClose}><ArrowLeft size={15} /> {t("editor.back")}</button>
+    <header className="editor-header"><h1>{state.mode === "create" ? t("editor.addTitle") : t("editor.editTitle", { id: draft.id })}</h1></header>
 
     <Stepper active={step} onStepClick={(nextStep) => nextStep < step && setStep(nextStep)} className="node-stepper" size="sm">
-      <Stepper.Step label="Basic" description="Connection and routing" />
-      <Stepper.Step label="Advanced" description="Health and telemetry" />
-      <Stepper.Step label="Review" description="Verify configuration" />
+      <Stepper.Step label={t("editor.stepBasic")} description={t("editor.stepBasicDescription")} />
+      <Stepper.Step label={t("editor.stepAdvanced")} description={t("editor.stepAdvancedDescription")} />
+      <Stepper.Step label={t("editor.stepReview")} description={t("editor.stepReviewDescription")} />
     </Stepper>
 
-    <form className="wizard-form" onSubmit={(event) => {
+    <form className="wizard-form" noValidate onSubmit={(event) => {
       event.preventDefault();
       if (step < 2) next();
       else if (validate()) void onSave({ ...state, draft } as EditorState);
@@ -184,14 +181,14 @@ export function NodeEditor({
       <div className="wizard-content">
         {step === 0 && <>
           <section className="wizard-section">
-            <div className="section-title"><h2>Basic Information</h2><span>Connection identity and provider settings.</span></div>
+            <div className="section-title"><h2>{t("editor.basicInformation")}</h2><span>{t("editor.basicDescription")}</span></div>
             <div className="wizard-grid">
-              <TextInput label="Node ID" description="Unique identifier for this upstream node." required disabled={state.mode === "edit"} value={draft.id} error={errors.id} onChange={(event) => update((current) => ({ ...current, id: event.target.value }))} />
-              <TextInput label="Base URL" description="Include http(s) and port when needed." required value={draft.base_url} error={errors.base_url} onChange={(event) => update((current) => ({ ...current, base_url: event.target.value }))} />
-              <Select label="Provider" required data={[{ value: "vllm", label: "vLLM 0.25+" }, { value: "openai", label: "OpenAI compatible" }]} value={draft.provider.type} onChange={(value) => setProvider(value as ProviderKind | null)} />
+              <TextInput label={t("editor.nodeId")} description={t("editor.nodeIdDescription")} required disabled={state.mode === "edit"} value={draft.id} error={errorText(errors.id)} onChange={(event) => update((current) => ({ ...current, id: event.target.value }))} />
+              <TextInput label={t("editor.baseUrl")} description={t("editor.baseUrlDescription")} required value={draft.base_url} error={errorText(errors.base_url)} onChange={(event) => update((current) => ({ ...current, base_url: event.target.value }))} />
+              <Select label={t("editor.provider")} required data={[{ value: "vllm", label: "vLLM 0.25+" }, { value: "openai", label: t("upstreams.openaiCompatible") }]} value={draft.provider.type} onChange={(value) => setProvider(value as ProviderKind | null)} />
               <Select
-                label="Anthropic upstream protocol"
-                description="Adapter used for public /v1/messages requests."
+                label={t("editor.anthropicProtocol")}
+                description={t("editor.anthropicDescription")}
                 required
                 data={anthropicProtocols}
                 value={draft.provider.anthropic_protocol}
@@ -200,41 +197,41 @@ export function NodeEditor({
                   provider: { ...current.provider, anthropic_protocol: value as AnthropicProtocol },
                 }))}
               />
-              <NumberInput label="Max concurrency" required min={1} value={draft.max_concurrency} error={errors.max_concurrency} onChange={(value) => update((current) => ({ ...current, max_concurrency: numeric(value) }))} />
-              <NumberInput label="Scheduling weight" description="Higher weight receives proportionally more traffic." required min={0.01} step={0.05} value={draft.weight} error={errors.weight} onChange={(value) => update((current) => ({ ...current, weight: numeric(value) }))} />
+              <NumberInput label={t("editor.maxConcurrency")} required min={1} value={draft.max_concurrency} error={errorText(errors.max_concurrency)} onChange={(value) => update((current) => ({ ...current, max_concurrency: numeric(value) }))} />
+              <NumberInput label={t("editor.schedulingWeight")} description={t("editor.weightDescription")} required min={0.01} step={0.05} value={draft.weight} error={errorText(errors.weight)} onChange={(value) => update((current) => ({ ...current, weight: numeric(value) }))} />
             </div>
           </section>
           <section className="wizard-section">
-            <div className="section-title"><h2>Model Mappings</h2><span>{draft.models.filter((row) => row.key && row.value).length} configured</span></div>
-            <PairEditor rows={draft.models} error={errors.models} keyLabel="Public model" valueLabel="Upstream model" onChange={(models) => update((current) => ({ ...current, models }))} />
+            <div className="section-title"><h2>{t("editor.modelMappings")}</h2><span>{t("editor.configuredCount", { count: draft.models.filter((row) => row.key && row.value).length })}</span></div>
+            <PairEditor rows={draft.models} error={errors.models} keyLabel={t("editor.publicModel")} valueLabel={t("editor.upstreamModel")} onChange={(models) => update((current) => ({ ...current, models }))} />
           </section>
         </>}
 
         {step === 1 && <>
           <section className="wizard-section">
-            <div className="section-title"><h2>Health and Telemetry</h2><span>Runtime probing and admission signals.</span></div>
+            <div className="section-title"><h2>{t("editor.healthTelemetry")}</h2><span>{t("editor.healthTelemetryDescription")}</span></div>
             <div className="wizard-grid two-columns">
-              <TextInput label="Health path" value={draft.health_path} error={errors.health_path} onChange={(event) => update((current) => ({ ...current, health_path: event.target.value }))} />
+              <TextInput label={t("editor.healthPath")} value={draft.health_path} error={errorText(errors.health_path)} onChange={(event) => update((current) => ({ ...current, health_path: event.target.value }))} />
               {draft.provider.type === "vllm" && <>
-                <TextInput label="Version path" value={draft.provider.version_path} error={errors.version_path} onChange={(event) => update((current) => ({ ...current, provider: { ...current.provider, version_path: event.target.value } }))} />
-                <TextInput label="Metrics path" value={draft.provider.metrics_path} error={errors.metrics_path} onChange={(event) => update((current) => ({ ...current, provider: { ...current.provider, metrics_path: event.target.value } }))} />
-                <TextInput label="Tokenize path" value={draft.provider.tokenize_path} error={errors.tokenize_path} onChange={(event) => update((current) => ({ ...current, provider: { ...current.provider, tokenize_path: event.target.value } }))} />
-                <NumberInput label="Monitor interval (ms)" min={100} value={draft.provider.monitor_interval_ms} error={errors.monitor_interval_ms} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, monitor_interval_ms: numeric(value) } }))} />
-                <NumberInput label="Request timeout (ms)" min={1} value={draft.provider.request_timeout_ms} error={errors.request_timeout_ms} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, request_timeout_ms: numeric(value) } }))} />
-                <NumberInput label="Telemetry stale (ms)" min={1} value={draft.provider.telemetry_stale_ms} error={errors.telemetry_stale_ms} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, telemetry_stale_ms: numeric(value) } }))} />
-                <NumberInput label="Waiting watermark" min={1} value={draft.provider.waiting_threshold} error={errors.waiting_threshold} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, waiting_threshold: numeric(value) } }))} />
-                <NumberInput label="Tokenize cache entries" min={1} value={draft.provider.tokenize_cache_entries} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, tokenize_cache_entries: numeric(value) } }))} />
+                <TextInput label={t("editor.versionPath")} value={draft.provider.version_path} error={errorText(errors.version_path)} onChange={(event) => update((current) => ({ ...current, provider: { ...current.provider, version_path: event.target.value } }))} />
+                <TextInput label={t("editor.metricsPath")} value={draft.provider.metrics_path} error={errorText(errors.metrics_path)} onChange={(event) => update((current) => ({ ...current, provider: { ...current.provider, metrics_path: event.target.value } }))} />
+                <TextInput label={t("editor.tokenizePath")} value={draft.provider.tokenize_path} error={errorText(errors.tokenize_path)} onChange={(event) => update((current) => ({ ...current, provider: { ...current.provider, tokenize_path: event.target.value } }))} />
+                <NumberInput label={t("editor.monitorInterval")} min={100} value={draft.provider.monitor_interval_ms} error={errorText(errors.monitor_interval_ms)} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, monitor_interval_ms: numeric(value) } }))} />
+                <NumberInput label={t("editor.requestTimeout")} min={1} value={draft.provider.request_timeout_ms} error={errorText(errors.request_timeout_ms)} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, request_timeout_ms: numeric(value) } }))} />
+                <NumberInput label={t("editor.telemetryStale")} min={1} value={draft.provider.telemetry_stale_ms} error={errorText(errors.telemetry_stale_ms)} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, telemetry_stale_ms: numeric(value) } }))} />
+                <NumberInput label={t("editor.waitingWatermark")} min={1} value={draft.provider.waiting_threshold} error={errorText(errors.waiting_threshold)} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, waiting_threshold: numeric(value) } }))} />
+                <NumberInput label={t("editor.tokenizeEntries")} min={1} value={draft.provider.tokenize_cache_entries} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, tokenize_cache_entries: numeric(value) } }))} />
               </>}
             </div>
           </section>
 
           <section className="wizard-section">
-            <div className="section-title"><h2>Credentials</h2><span>{draft.api_key.trim() || draft.preserve_api_key ? "Database key configured" : draft.api_key_env ? "Environment key configured" : "No Bearer key"}</span></div>
+            <div className="section-title"><h2>{t("editor.credentials")}</h2><span>{draft.api_key.trim() || draft.preserve_api_key ? t("editor.databaseKey") : draft.api_key_env ? t("editor.environmentKey") : t("editor.noBearerKey")}</span></div>
             <div className="credential-editor">
               <PasswordInput
-                label="Bearer API key"
+                label={t("editor.bearerKey")}
                 autoComplete="new-password"
-                placeholder={draft.preserve_api_key ? "Stored key unchanged" : "Optional"}
+                placeholder={draft.preserve_api_key ? t("editor.storedKey") : t("common.optional")}
                 value={draft.api_key}
                 onChange={(event) => {
                   const value = event.currentTarget.value;
@@ -245,56 +242,56 @@ export function NodeEditor({
                   }));
                 }}
               />
-              {draft.preserve_api_key && <Button variant="default" color="red" leftSection={<Trash2 size={14} />} onClick={() => update((current) => ({ ...current, api_key: "", preserve_api_key: false }))}>Remove key</Button>}
-              {draft.api_key_env && <div className="legacy-credential"><span>Environment fallback</span><strong>{draft.api_key_env}</strong><Button variant="subtle" color="gray" px={6} aria-label="Remove environment fallback" onClick={() => update((current) => ({ ...current, api_key_env: null }))}><Trash2 size={14} /></Button></div>}
+              {draft.preserve_api_key && <Button variant="default" color="red" leftSection={<Trash2 size={14} />} onClick={() => update((current) => ({ ...current, api_key: "", preserve_api_key: false }))}>{t("editor.removeKey")}</Button>}
+              {draft.api_key_env && <div className="legacy-credential"><span>{t("editor.environmentFallback")}</span><strong>{draft.api_key_env}</strong><Button variant="subtle" color="gray" px={6} aria-label={t("editor.removeEnvironment")} onClick={() => update((current) => ({ ...current, api_key_env: null }))}><Trash2 size={14} /></Button></div>}
             </div>
           </section>
 
           {draft.provider.type === "vllm" && <section className="wizard-section">
-            <div className="switch-heading"><div><h2>KV Events</h2><span>Exact prefix-cache synchronization.</span></div><Switch aria-label="Enable KV events" checked={draft.provider.kv_events !== null} onChange={toggleKv} /></div>
+            <div className="switch-heading"><div><h2>{t("editor.kvEvents")}</h2><span>{t("editor.kvDescription")}</span></div><Switch aria-label={t("editor.enableKv")} checked={draft.provider.kv_events !== null} onChange={toggleKv} /></div>
             {draft.provider.kv_events && <div className="wizard-grid two-columns">
-              <TextInput label="Publisher endpoint" value={draft.provider.kv_events.endpoint} onChange={(event) => updateKv("endpoint", event.target.value)} />
-              <TextInput label="Replay endpoint" value={draft.provider.kv_events.replay_endpoint ?? ""} onChange={(event) => updateKv("replay_endpoint", event.target.value || null)} />
-              <TextInput label="Topic" value={draft.provider.kv_events.topic} onChange={(event) => updateKv("topic", event.target.value)} />
-              <NumberInput label="Reconnect (ms)" min={1} value={draft.provider.kv_events.reconnect_ms} error={errors.kv_reconnect_ms} onChange={(value) => updateKv("reconnect_ms", numeric(value))} />
-              <NumberInput label="Max blocks" min={1} value={draft.provider.kv_events.max_blocks} error={errors.kv_max_blocks} onChange={(value) => updateKv("max_blocks", numeric(value))} />
-              <NumberInput label="Directory memory bytes" min={1} value={draft.provider.kv_events.max_directory_bytes} error={errors.kv_max_directory_bytes} onChange={(value) => updateKv("max_directory_bytes", numeric(value))} />
-              <NumberInput label="Max event bytes" min={1} value={draft.provider.kv_events.max_event_bytes} error={errors.kv_max_event_bytes} onChange={(value) => updateKv("max_event_bytes", numeric(value))} />
+              <TextInput label={t("editor.publisherEndpoint")} value={draft.provider.kv_events.endpoint} onChange={(event) => updateKv("endpoint", event.target.value)} />
+              <TextInput label={t("editor.replayEndpoint")} value={draft.provider.kv_events.replay_endpoint ?? ""} onChange={(event) => updateKv("replay_endpoint", event.target.value || null)} />
+              <TextInput label={t("editor.topic")} value={draft.provider.kv_events.topic} onChange={(event) => updateKv("topic", event.target.value)} />
+              <NumberInput label={t("editor.reconnect")} min={1} value={draft.provider.kv_events.reconnect_ms} error={errorText(errors.kv_reconnect_ms)} onChange={(value) => updateKv("reconnect_ms", numeric(value))} />
+              <NumberInput label={t("editor.maxBlocks")} min={1} value={draft.provider.kv_events.max_blocks} error={errorText(errors.kv_max_blocks)} onChange={(value) => updateKv("max_blocks", numeric(value))} />
+              <NumberInput label={t("editor.directoryBytes")} min={1} value={draft.provider.kv_events.max_directory_bytes} error={errorText(errors.kv_max_directory_bytes)} onChange={(value) => updateKv("max_directory_bytes", numeric(value))} />
+              <NumberInput label={t("editor.maxEventBytes")} min={1} value={draft.provider.kv_events.max_event_bytes} error={errorText(errors.kv_max_event_bytes)} onChange={(value) => updateKv("max_event_bytes", numeric(value))} />
             </div>}
           </section>}
 
           <section className="wizard-section compact-section">
-            <div className="switch-heading"><div><h2>Start Draining</h2><span>Persist without assigning new requests.</span></div><Switch aria-label="Start node draining" checked={draft.draining} onChange={(event) => update((current) => ({ ...current, draining: event.currentTarget.checked }))} /></div>
+            <div className="switch-heading"><div><h2>{t("editor.startDraining")}</h2><span>{t("editor.startDrainingDescription")}</span></div><Switch aria-label={t("editor.startDrainingLabel")} checked={draft.draining} onChange={(event) => update((current) => ({ ...current, draining: event.currentTarget.checked }))} /></div>
           </section>
         </>}
 
         {step === 2 && <section className="wizard-section review-section">
-          <div className="section-title"><h2>Review Configuration</h2><span>Confirm the node before applying it to the runtime registry.</span></div>
+          <div className="section-title"><h2>{t("editor.reviewConfiguration")}</h2><span>{t("editor.reviewDescription")}</span></div>
           <div className="review-grid">
-            <ReviewRow label="Node ID" value={draft.id} />
-            <ReviewRow label="Base URL" value={draft.base_url} />
-            <ReviewRow label="Provider" value={draft.provider.type === "vllm" ? "vLLM 0.25+" : "OpenAI compatible"} />
-            <ReviewRow label="Anthropic protocol" value={anthropicProtocolLabel(draft.provider.anthropic_protocol)} />
-            <ReviewRow label="Max concurrency" value={draft.max_concurrency} />
-            <ReviewRow label="Scheduling weight" value={draft.weight} />
-            <ReviewRow label="Model mappings" value={draft.models.filter((row) => row.key && row.value).length} />
-            <ReviewRow label="Health path" value={draft.health_path} />
-            <ReviewRow label="Bearer credential" value={draft.api_key.trim() || draft.preserve_api_key || draft.api_key_env ? "Configured" : "Not configured"} />
-            <ReviewRow label="Lifecycle" value={draft.draining ? "Draining" : "Serving"} />
+            <ReviewRow label={t("editor.nodeId")} value={draft.id} />
+            <ReviewRow label={t("editor.baseUrl")} value={draft.base_url} />
+            <ReviewRow label={t("editor.provider")} value={draft.provider.type === "vllm" ? "vLLM 0.25+" : t("upstreams.openaiCompatible")} />
+            <ReviewRow label={t("details.anthropicProtocol")} value={t(`protocol.${draft.provider.anthropic_protocol}` as TranslationKey)} />
+            <ReviewRow label={t("editor.maxConcurrency")} value={draft.max_concurrency} />
+            <ReviewRow label={t("editor.schedulingWeight")} value={draft.weight} />
+            <ReviewRow label={t("editor.modelMappings")} value={draft.models.filter((row) => row.key && row.value).length} />
+            <ReviewRow label={t("editor.healthPath")} value={draft.health_path} />
+            <ReviewRow label={t("editor.bearerCredential")} value={draft.api_key.trim() || draft.preserve_api_key || draft.api_key_env ? t("common.configured") : t("common.notConfigured")} />
+            <ReviewRow label={t("editor.lifecycle")} value={draft.draining ? t("overview.draining") : t("editor.serving")} />
           </div>
-          <Alert icon={<Info size={16} />} color="indigo" title="Connection verification recommended">Run Test Connection before applying this configuration to verify compatibility and health.</Alert>
+          <Alert icon={<Info size={16} />} color="indigo" title={t("editor.connectionRecommended")}>{t("editor.connectionRecommendation")}</Alert>
         </section>}
 
-        {(preflight || preflightError) && <Alert className="preflight-alert" icon={preflight ? <Check size={16} /> : <X size={16} />} color={preflight ? "green" : "red"} title={preflight ? "Connection verified" : "Connection failed"}>
-          {preflight ? `${preflight.runtime.provider === "vllm" ? "vLLM" : "OpenAI-compatible"} provider passed configuration, compatibility and health checks.` : preflightError}
+        {(preflight || preflightError) && <Alert className="preflight-alert" icon={preflight ? <Check size={16} /> : <X size={16} />} color={preflight ? "green" : "red"} title={preflight ? t("editor.connectionVerified") : t("editor.connectionFailed")}>
+          {preflight ? t("editor.connectionPassed", { provider: preflight.runtime.provider === "vllm" ? "vLLM" : "OpenAI-compatible" }) : preflightError}
         </Alert>}
       </div>
 
       <footer className="wizard-footer">
-        <Button variant="default" leftSection={checking ? <LoaderCircle className="spin" size={15} /> : <FlaskConical size={15} />} disabled={busy || checking} onClick={() => void testConnection()}>Test Connection</Button>
+        <Button variant="default" leftSection={checking ? <LoaderCircle className="spin" size={15} /> : <FlaskConical size={15} />} disabled={busy || checking} onClick={() => void testConnection()}>{t("editor.testConnection")}</Button>
         <span className="footer-spacer" />
-        <Button variant="default" disabled={busy || checking} onClick={step === 0 ? requestClose : () => setStep((current) => current - 1)}>{step === 0 ? "Cancel" : "Back"}</Button>
-        <Button type="submit" disabled={busy || checking} leftSection={busy ? <LoaderCircle className="spin" size={15} /> : step === 2 ? <Check size={15} /> : undefined}>{step === 2 ? state.mode === "create" ? "Add Node" : "Save Changes" : "Next"}</Button>
+        <Button variant="default" disabled={busy || checking} onClick={step === 0 ? requestClose : () => setStep((current) => current - 1)}>{step === 0 ? t("common.cancel") : t("common.back")}</Button>
+        <Button type="submit" disabled={busy || checking} leftSection={busy ? <LoaderCircle className="spin" size={15} /> : step === 2 ? <Check size={15} /> : undefined}>{step === 2 ? state.mode === "create" ? t("upstreams.addNode") : t("editor.saveChanges") : t("common.next")}</Button>
       </footer>
     </form>
   </div>;

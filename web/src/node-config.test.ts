@@ -87,23 +87,23 @@ describe("node config mapping", () => {
     draft.id = "node-a";
     draft.models = [{ key: "chat", value: "model" }];
     draft.base_url = "localhost:8000/v1";
-    expect(validateDraft(draft).base_url).toBe("Use an absolute HTTP or HTTPS URL");
+    expect(validateDraft(draft).base_url).toBe("validation.absoluteUrl");
 
     draft.base_url = "ftp://models.example/v1";
-    expect(validateDraft(draft).base_url).toBe("Use an absolute HTTP or HTTPS URL");
+    expect(validateDraft(draft).base_url).toBe("validation.absoluteUrl");
   });
 
   test("rejects incomplete and duplicate public model mappings", () => {
     const draft = createDraft();
     draft.id = "node-a";
     draft.models = [{ key: "chat", value: "" }];
-    expect(validateDraft(draft).models).toBe("Complete or remove every model mapping row");
+    expect(validateDraft(draft).models).toBe("validation.modelIncomplete");
 
     draft.models = [
       { key: "chat", value: "model-a" },
       { key: " chat ", value: "model-b" },
     ];
-    expect(validateDraft(draft).models).toBe("Public model names must be unique");
+    expect(validateDraft(draft).models).toBe("validation.modelUnique");
   });
 
   test("requires telemetry freshness to cover at least one monitor interval", () => {
@@ -112,9 +112,7 @@ describe("node config mapping", () => {
     draft.models = [{ key: "chat", value: "model" }];
     draft.provider.monitor_interval_ms = 5000;
     draft.provider.telemetry_stale_ms = 4999;
-    expect(validateDraft(draft).telemetry_stale_ms).toBe(
-      "Must not be shorter than the monitor interval",
-    );
+    expect(validateDraft(draft).telemetry_stale_ms).toBe("validation.telemetryInterval");
   });
 
   test("accepts a complete default vLLM draft", () => {

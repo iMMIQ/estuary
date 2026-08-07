@@ -12,6 +12,7 @@ import {
   Edit3,
   ExternalLink,
   LayoutDashboard,
+  Languages,
   LoaderCircle,
   MoreHorizontal,
   PauseCircle,
@@ -25,7 +26,10 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { TFunction } from "i18next";
+import { useTranslation } from "react-i18next";
 import * as api from "./api";
+import { localeStorageKey, type Locale } from "./i18n";
 import { NodeDetails } from "./NodeDetails";
 import { NodeEditor, type EditorState } from "./NodeEditor";
 import { createDraft, draftToConfig, formatCompactNumber, recordToDraft, shouldClearApiKey } from "./node-config";
@@ -40,20 +44,20 @@ interface ToastState {
   message: string;
 }
 
-function relativeSync(value: number | null): string {
-  if (!value) return "Never synced";
+function relativeSync(value: number | null, t: TFunction): string {
+  if (!value) return t("sync.never");
   const seconds = Math.max(0, Math.floor((Date.now() - value) / 1000));
-  if (seconds < 5) return "Synced just now";
-  if (seconds < 60) return `Synced ${seconds}s ago`;
-  return `Synced ${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 5) return t("sync.now");
+  if (seconds < 60) return t("sync.seconds", { count: seconds });
+  return t("sync.minutes", { count: Math.floor(seconds / 60) });
 }
 
 function MetricBox({ label, value, accent }: { label: string; value: string | number; accent?: "green" | "amber" | "red" }) {
   return <div className="metric-box"><span>{label}</span><strong className={accent ? `metric-${accent}` : ""}>{value}</strong></div>;
 }
 
-function formatRate(value: number | null | undefined): string {
-  return value == null || !Number.isFinite(value) ? "--" : formatCompactNumber(Math.max(0, value));
+function formatRate(value: number | null | undefined, locale: string): string {
+  return value == null || !Number.isFinite(value) ? "--" : formatCompactNumber(Math.max(0, value), locale);
 }
 
 function formatRatio(value: number | null | undefined): string {
@@ -88,16 +92,18 @@ function summarizeVllm(nodes: NodeRecord[]) {
 }
 
 function VllmRuntimePanel({ nodes, compact = false }: { nodes: NodeRecord[]; compact?: boolean }) {
+  const { t, i18n } = useTranslation();
+  const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
   const runtime = summarizeVllm(nodes);
   return <section className={`dashboard-panel vllm-runtime-panel ${compact ? "compact" : ""}`}>
-    <div className="panel-heading"><h2>vLLM Runtime</h2><span>{runtime.fresh} / {runtime.nodes} nodes reporting fresh telemetry</span></div>
+    <div className="panel-heading"><h2>{t("vllm.runtime")}</h2><span>{t("vllm.reporting", { fresh: runtime.fresh, total: runtime.nodes })}</span></div>
     <div className="vllm-runtime-grid">
-      <MetricBox label="Prompt throughput" value={`${formatRate(runtime.promptRate)} tok/s`} />
-      <MetricBox label="Generation throughput" value={`${formatRate(runtime.generationRate)} tok/s`} />
-      <MetricBox label="Completed requests" value={`${formatRate(runtime.requestRate)} req/s`} />
-      <MetricBox label="Engine demand" value={`${runtime.running} / ${runtime.waiting}`} accent={runtime.waiting > 0 ? "amber" : undefined} />
-      <MetricBox label="Peak GPU KV usage" value={formatRatio(runtime.maxKvUsage)} accent={(runtime.maxKvUsage ?? 0) >= 0.9 ? "amber" : undefined} />
-      <MetricBox label="Prefix cache hit" value={formatRatio(runtime.prefixHitRate)} />
+      <MetricBox label={t("vllm.promptThroughput")} value={`${formatRate(runtime.promptRate, locale)} tok/s`} />
+      <MetricBox label={t("vllm.generationThroughput")} value={`${formatRate(runtime.generationRate, locale)} tok/s`} />
+      <MetricBox label={t("vllm.completedRequests")} value={`${formatRate(runtime.requestRate, locale)} req/s`} />
+      <MetricBox label={t("vllm.engineDemand")} value={`${runtime.running} / ${runtime.waiting}`} accent={runtime.waiting > 0 ? "amber" : undefined} />
+      <MetricBox label={t("vllm.peakKv")} value={formatRatio(runtime.maxKvUsage)} accent={(runtime.maxKvUsage ?? 0) >= 0.9 ? "amber" : undefined} />
+      <MetricBox label={t("vllm.prefixHit")} value={formatRatio(runtime.prefixHitRate)} />
     </div>
   </section>;
 }
@@ -110,17 +116,39 @@ function UsageRow({ label, value, total, display, totalDisplay, tone = "blue" }:
   totalDisplay?: string;
   tone?: "blue" | "green" | "amber";
 }) {
+  const { i18n } = useTranslation();
+  const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
   const percent = total > 0 ? Math.min(100, value / total * 100) : 0;
   return <div className="usage-row">
-    <div><span>{label}</span><strong>{display ?? value.toLocaleString()} <small>/ {totalDisplay ?? total.toLocaleString()}</small></strong></div>
+    <div><span>{label}</span><strong>{display ?? value.toLocaleString(locale)} <small>/ {totalDisplay ?? total.toLocaleString(locale)}</small></strong></div>
     <div className="usage-track"><i className={tone} style={{ width: `${percent}%` }} /></div>
     <em>{Math.round(percent)}%</em>
   </div>;
 }
 
 function ProgressValue({ value, total, tone = "green" }: { value: number; total: number; tone?: "green" | "amber" | "blue" }) {
+  const { i18n } = useTranslation();
+  const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
   const percent = total > 0 ? Math.min(100, value / total * 100) : 0;
-  return <div className="progress-value"><span><strong>{value.toLocaleString()}</strong> / {total.toLocaleString()}</span><div><i className={tone} style={{ width: `${percent}%` }} /></div><small>{Math.round(percent)}%</small></div>;
+  return <div className="progress-value"><span><strong>{value.toLocaleString(locale)}</strong> / {total.toLocaleString(locale)}</span><div><i className={tone} style={{ width: `${percent}%` }} /></div><small>{Math.round(percent)}%</small></div>;
+}
+
+function LanguageSwitch() {
+  const { t, i18n } = useTranslation();
+  const locale: Locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
+  const select = (next: Locale) => {
+    window.localStorage.setItem(localeStorageKey, next);
+    void i18n.changeLanguage(next);
+  };
+  return <Menu position="bottom-end" shadow="md" width={160} withinPortal>
+    <Menu.Target>
+      <button className="language-trigger" aria-label={t("language.label")} title={t("language.label")}><Languages size={15} /><span>{locale === "zh-CN" ? "中文" : "EN"}</span></button>
+    </Menu.Target>
+    <Menu.Dropdown>
+      <Menu.Item rightSection={locale === "en" ? <Check size={13} /> : null} onClick={() => select("en")}>{t("language.english")}</Menu.Item>
+      <Menu.Item rightSection={locale === "zh-CN" ? <Check size={13} /> : null} onClick={() => select("zh-CN")}>{t("language.chinese")}</Menu.Item>
+    </Menu.Dropdown>
+  </Menu>;
 }
 
 function Overview({
@@ -142,6 +170,8 @@ function Overview({
   onShowNodes: () => void;
   onSelectNode: (node: NodeRecord) => void;
 }) {
+  const { t, i18n } = useTranslation();
+  const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
   const draining = nodes.filter((node) => node.runtime.lifecycle === "draining").length;
   const notReady = nodes.filter((node) => !node.admission.routable && node.runtime.lifecycle !== "draining").length;
   const connectionLost = nodes.filter((node) => node.runtime.health === "unhealthy" && Boolean(node.runtime.provider_last_error)).length;
@@ -151,26 +181,26 @@ function Overview({
   const vllm = summarizeVllm(nodes);
 
   return <div className="page-frame overview-page">
-    <header className="page-title-row"><div><h1>Overview</h1><p>Gateway health, capacity, and admission pressure</p></div></header>
+    <header className="page-title-row"><div><h1>{t("nav.overview")}</h1><p>{t("overview.subtitle")}</p></div></header>
 
     <section className="status-strip">
-      <span>Gateway</span>
+      <span>{t("overview.gateway")}</span>
       <StatusBadge value={status?.ready ? "ready" : "not_ready"} />
       <i />
       <span>Estuary v{status?.version ?? "--"}</span>
       <i />
-      <span>{relativeSync(lastSync)}</span>
-      <Button variant="default" size="compact-sm" leftSection={<RefreshCw className={refreshing ? "spin" : ""} size={13} />} disabled={refreshing} onClick={onRefresh}>Refresh</Button>
+      <span>{relativeSync(lastSync, t)}</span>
+      <Button variant="default" size="compact-sm" leftSection={<RefreshCw className={refreshing ? "spin" : ""} size={13} />} disabled={refreshing} onClick={onRefresh}>{t("common.refresh")}</Button>
     </section>
 
     <section className="dashboard-panel fleet-summary-panel">
-      <h2>Fleet Summary</h2>
+      <h2>{t("overview.fleetSummary")}</h2>
       <div className="fleet-summary-grid">
-        <MetricBox label="Total Nodes" value={status?.fleet.total_nodes ?? 0} />
-        <MetricBox label="Ready / Accepting" value={status?.fleet.accepting_nodes ?? 0} accent="green" />
-        <MetricBox label="Draining" value={draining} accent="amber" />
-        <MetricBox label="Not Ready" value={notReady} accent="red" />
-        <MetricBox label="Connection Lost" value={connectionLost} />
+        <MetricBox label={t("overview.totalNodes")} value={status?.fleet.total_nodes ?? 0} />
+        <MetricBox label={t("overview.readyAccepting")} value={status?.fleet.accepting_nodes ?? 0} accent="green" />
+        <MetricBox label={t("overview.draining")} value={draining} accent="amber" />
+        <MetricBox label={t("overview.notReady")} value={notReady} accent="red" />
+        <MetricBox label={t("overview.connectionLost")} value={connectionLost} />
       </div>
     </section>
 
@@ -178,43 +208,43 @@ function Overview({
 
     <div className="dashboard-two-column">
       <section className="dashboard-panel compact-panel">
-        <h2>Capacity</h2>
+        <h2>{t("overview.capacity")}</h2>
         <div className="usage-list">
-          <UsageRow label="Local concurrency" value={active} total={totalConcurrency} tone="green" />
-          <UsageRow label="Available capacity" value={status?.fleet.available_concurrency ?? 0} total={totalConcurrency} />
-          <UsageRow label="Public connections" value={status?.connections?.public ?? 0} total={status?.connections?.max_public ?? 0} />
-          <div className="panel-stat-row"><span>Routable nodes</span><strong>{status?.fleet.routable_nodes ?? 0} <small>/ {status?.fleet.total_nodes ?? 0}</small></strong></div>
+          <UsageRow label={t("overview.localConcurrency")} value={active} total={totalConcurrency} tone="green" />
+          <UsageRow label={t("overview.availableCapacity")} value={status?.fleet.available_concurrency ?? 0} total={totalConcurrency} />
+          <UsageRow label={t("overview.publicConnections")} value={status?.connections?.public ?? 0} total={status?.connections?.max_public ?? 0} />
+          <div className="panel-stat-row"><span>{t("overview.routableNodes")}</span><strong>{status?.fleet.routable_nodes ?? 0} <small>/ {status?.fleet.total_nodes ?? 0}</small></strong></div>
         </div>
       </section>
       <section className="dashboard-panel compact-panel">
-        <h2>Queue &amp; Response Memory</h2>
+        <h2>{t("overview.queueMemory")}</h2>
         <div className="usage-list">
-          <UsageRow label="Queued requests" value={status?.queue.requests ?? 0} total={status?.queue.max_requests ?? 0} tone="amber" />
-          <div className="panel-stat-row"><span>Waiting for admission</span><strong className={(status?.queue.admission_waiters ?? 0) > 0 ? "metric-amber" : ""}>{status?.queue.admission_waiters ?? 0}</strong></div>
-          <UsageRow label="Queued request bodies" value={status?.queue.bytes ?? 0} total={status?.queue.max_bytes ?? 0} display={formatBytes(status?.queue.bytes ?? 0)} totalDisplay={formatBytes(status?.queue.max_bytes ?? 0)} tone="amber" />
-          <UsageRow label="Buffered responses" value={status?.response_buffer?.used_bytes ?? 0} total={status?.response_buffer?.max_bytes ?? 0} display={formatBytes(status?.response_buffer?.used_bytes ?? 0)} totalDisplay={formatBytes(status?.response_buffer?.max_bytes ?? 0)} />
-          <div className="panel-stat-row"><span>Waiting for memory</span><strong className={(status?.response_buffer?.waiting_responses ?? 0) > 0 ? "metric-amber" : ""}>{status?.response_buffer?.waiting_responses ?? 0}</strong></div>
+          <UsageRow label={t("overview.queuedRequests")} value={status?.queue.requests ?? 0} total={status?.queue.max_requests ?? 0} tone="amber" />
+          <div className="panel-stat-row"><span>{t("overview.waitingAdmission")}</span><strong className={(status?.queue.admission_waiters ?? 0) > 0 ? "metric-amber" : ""}>{status?.queue.admission_waiters ?? 0}</strong></div>
+          <UsageRow label={t("overview.queuedBodies")} value={status?.queue.bytes ?? 0} total={status?.queue.max_bytes ?? 0} display={formatBytes(status?.queue.bytes ?? 0)} totalDisplay={formatBytes(status?.queue.max_bytes ?? 0)} tone="amber" />
+          <UsageRow label={t("overview.bufferedResponses")} value={status?.response_buffer?.used_bytes ?? 0} total={status?.response_buffer?.max_bytes ?? 0} display={formatBytes(status?.response_buffer?.used_bytes ?? 0)} totalDisplay={formatBytes(status?.response_buffer?.max_bytes ?? 0)} />
+          <div className="panel-stat-row"><span>{t("overview.waitingMemory")}</span><strong className={(status?.response_buffer?.waiting_responses ?? 0) > 0 ? "metric-amber" : ""}>{status?.response_buffer?.waiting_responses ?? 0}</strong></div>
         </div>
       </section>
     </div>
 
     <div className="attention-actions-grid">
       <section className="dashboard-panel attention-panel-dark">
-        <h2>Attention Required</h2>
-        {attention.length === 0 ? <div className="all-clear"><Check size={16} /><span><strong>All systems nominal</strong>No nodes currently require operator attention.</span></div> : <div className="attention-rows">
+        <h2>{t("overview.attention")}</h2>
+        {attention.length === 0 ? <div className="all-clear"><Check size={16} /><span><strong>{t("overview.nominal")}</strong>{t("overview.noAttention")}</span></div> : <div className="attention-rows">
           {attention.slice(0, 5).map((node) => <button key={node.config.id} onClick={() => onSelectNode(node)}>
-            <AlertTriangle size={15} /><strong>{node.config.id}</strong><StatusBadge value={node.admission.state} /><span>{node.admission.reason}</span><small>{node.runtime.active} active</small><em>View</em>
+            <AlertTriangle size={15} /><strong>{node.config.id}</strong><StatusBadge value={node.admission.state} /><span>{t(`admission.${node.admission.state}`, { defaultValue: node.admission.reason })}</span><small>{t("overview.active", { count: node.runtime.active })}</small><em>{t("common.view")}</em>
           </button>)}
         </div>}
       </section>
       <section className="dashboard-panel quick-actions">
-        <h2>Routing Signals</h2>
-        <div className="routing-signal"><span>Exact KV directories</span><strong>{vllm.exactReady} / {vllm.nodes}</strong></div>
-        <div className="routing-signal"><span>Waiting watermark</span><strong className={vllm.waitingBlocked ? "metric-amber" : ""}>{vllm.waitingBlocked}</strong></div>
-        <div className="routing-signal"><span>KV pressure ≥ 90%</span><strong className={vllm.kvPressure ? "metric-amber" : ""}>{vllm.kvPressure}</strong></div>
-        <div className="routing-signal"><span>Preemptions since restart</span><strong>{vllm.preemptions === null ? "--" : formatCompactNumber(vllm.preemptions)}</strong></div>
-        <Button fullWidth leftSection={<Plus size={14} />} onClick={onAdd}>Add Upstream Node</Button>
-        <Button fullWidth variant="default" onClick={onShowNodes}>View All Nodes</Button>
+        <h2>{t("overview.routingSignals")}</h2>
+        <div className="routing-signal"><span>{t("overview.exactDirectories")}</span><strong>{vllm.exactReady} / {vllm.nodes}</strong></div>
+        <div className="routing-signal"><span>{t("overview.waitingWatermark")}</span><strong className={vllm.waitingBlocked ? "metric-amber" : ""}>{vllm.waitingBlocked}</strong></div>
+        <div className="routing-signal"><span>{t("overview.kvPressure")}</span><strong className={vllm.kvPressure ? "metric-amber" : ""}>{vllm.kvPressure}</strong></div>
+        <div className="routing-signal"><span>{t("overview.preemptions")}</span><strong>{vllm.preemptions === null ? "--" : formatCompactNumber(vllm.preemptions, locale)}</strong></div>
+        <Button fullWidth leftSection={<Plus size={14} />} onClick={onAdd}>{t("overview.addUpstream")}</Button>
+        <Button fullWidth variant="default" onClick={onShowNodes}>{t("overview.viewAll")}</Button>
       </section>
     </div>
   </div>;
@@ -251,6 +281,8 @@ function Upstreams({
   onDelete: (node: NodeRecord) => void;
   onAdd: () => void;
 }) {
+  const { t, i18n } = useTranslation();
+  const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
   const [page, setPage] = useState(1);
   const pageSize = 8;
   const filtered = useMemo(() => {
@@ -280,44 +312,44 @@ function Upstreams({
 
   return <div className="page-frame upstreams-page">
     <header className="page-title-row upstream-title">
-      <div><h1>Upstreams</h1><span>{nodes.length} nodes <i /> {relativeSync(lastSync)}</span></div>
-      <div className="heading-actions"><Button variant="default" leftSection={<RefreshCw className={refreshing ? "spin" : ""} size={14} />} disabled={refreshing} onClick={onRefresh}>Refresh</Button><Button leftSection={<Plus size={14} />} onClick={onAdd}>Add Node</Button></div>
+      <div><h1>{t("nav.upstreams")}</h1><span>{t("upstreams.summary", { count: nodes.length, sync: relativeSync(lastSync, t) })}</span></div>
+      <div className="heading-actions"><Button variant="default" leftSection={<RefreshCw className={refreshing ? "spin" : ""} size={14} />} disabled={refreshing} onClick={onRefresh}>{t("common.refresh")}</Button><Button leftSection={<Plus size={14} />} onClick={onAdd}>{t("upstreams.addNode")}</Button></div>
     </header>
 
     <VllmRuntimePanel nodes={nodes} compact />
 
-    <TextInput className="node-search" leftSection={<Search size={14} />} placeholder="Search by Node ID, URL, public model, or upstream model..." aria-label="Search nodes" value={query} onChange={(event) => { setPage(1); onQuery(event.target.value); }} />
-    <div className="filter-row" aria-label="Filter nodes">
+    <TextInput className="node-search" leftSection={<Search size={14} />} placeholder={t("upstreams.searchPlaceholder")} aria-label={t("upstreams.searchLabel")} value={query} onChange={(event) => { setPage(1); onQuery(event.target.value); }} />
+    <div className="filter-row" aria-label={t("upstreams.filterLabel")}>
       {(["all", "accepting", "attention", "draining", "not_ready"] as NodeFilter[]).map((value) => <button key={value} className={filter === value ? `active ${value}` : ""} onClick={() => changeFilter(value)}>
-        {value === "all" ? "All" : value === "not_ready" ? "Not Ready" : value.charAt(0).toUpperCase() + value.slice(1)} ({counts[value]})
+        {t(`filter.${value}`)} ({counts[value]})
       </button>)}
     </div>
 
     <section className="upstream-table-shell">
-      {loading ? <div className="empty-state"><LoaderCircle className="spin" size={20} />Loading nodes</div> : visible.length === 0 ? <div className="empty-state"><Server size={22} /><strong>{query || filter !== "all" ? "No matching nodes" : "No upstream nodes"}</strong>{!query && filter === "all" && <Button leftSection={<Plus size={14} />} onClick={onAdd}>Add Node</Button>}</div> : <div className="table-scroll">
+      {loading ? <div className="empty-state"><LoaderCircle className="spin" size={20} />{t("upstreams.loading")}</div> : visible.length === 0 ? <div className="empty-state"><Server size={22} /><strong>{query || filter !== "all" ? t("upstreams.noMatch") : t("upstreams.empty")}</strong>{!query && filter === "all" && <Button leftSection={<Plus size={14} />} onClick={onAdd}>{t("upstreams.addNode")}</Button>}</div> : <div className="table-scroll">
         <table className="upstream-table">
-          <thead><tr><th>Node ID / Base URL</th><th>Status / Admission</th><th>Provider / Telemetry</th><th>Engine</th><th>Token Rate</th><th>Active / Limit</th><th>KV Cache</th><th>Latency</th><th /></tr></thead>
+          <thead><tr><th>{t("upstreams.nodeUrl")}</th><th>{t("upstreams.statusAdmission")}</th><th>{t("upstreams.providerTelemetry")}</th><th>{t("upstreams.engine")}</th><th>{t("upstreams.tokenRate")}</th><th>{t("upstreams.activeLimit")}</th><th>{t("upstreams.kvCache")}</th><th>{t("upstreams.latency")}</th><th /></tr></thead>
           <tbody>{visible.map((node) => {
             const running = node.runtime.upstream_running ?? node.runtime.active;
             const waiting = node.runtime.upstream_waiting ?? 0;
             return <tr key={node.config.id} tabIndex={0} onClick={() => onSelect(node)} onKeyDown={(event) => { if (event.key === "Enter") onSelect(node); }}>
-              <td data-label="Node"><strong>{node.config.id}</strong><span>{node.config.base_url}</span></td>
-              <td data-label="Admission"><StatusBadge value={node.admission.state} /><span>{node.admission.reason}</span></td>
-              <td data-label="Provider"><strong>{node.config.provider.type === "vllm" ? `vLLM ${node.runtime.provider_version ?? "checking"}` : "OpenAI compatible"}</strong><span>{node.config.provider.type === "vllm" ? node.admission.telemetry_fresh ? "Telemetry fresh" : "Telemetry stale" : "Generic provider"}</span></td>
-              <td data-label="Engine"><strong>{running} / {waiting}</strong><span>Running / Waiting</span></td>
-              <td data-label="Token rate"><strong>{formatRate(node.runtime.prompt_tokens_per_second)} / {formatRate(node.runtime.generation_tokens_per_second)}</strong><span>Prompt / Generation tok/s</span></td>
-              <td data-label="Local load"><ProgressValue value={node.runtime.active} total={node.runtime.max_concurrency} /></td>
-              <td data-label="KV cache"><strong>{node.config.provider.type === "vllm" ? `${formatRatio(node.runtime.kv_cache_usage)} used` : "--"}</strong><span>{node.config.provider.type === "vllm" ? `${formatRatio(node.runtime.prefix_cache_hit_rate)} hit · ${formatCompactNumber(node.exact_kv_blocks)} blocks ${node.exact_kv_authoritative ? "synced" : "fallback"}` : "No vLLM telemetry"}</span></td>
-              <td data-label="Latency"><strong>{Math.round(node.runtime.latency_ewma_ms)} ms</strong><span>Header EWMA</span></td>
+              <td data-label={t("upstreams.node")}><strong>{node.config.id}</strong><span>{node.config.base_url}</span></td>
+              <td data-label={t("upstreams.admission")}><StatusBadge value={node.admission.state} /><span>{t(`admission.${node.admission.state}`, { defaultValue: node.admission.reason })}</span></td>
+              <td data-label={t("upstreams.provider")}><strong>{node.config.provider.type === "vllm" ? `vLLM ${node.runtime.provider_version ?? t("upstreams.checking")}` : t("upstreams.openaiCompatible")}</strong><span>{node.config.provider.type === "vllm" ? node.admission.telemetry_fresh ? t("upstreams.telemetryFresh") : t("upstreams.telemetryStale") : t("upstreams.genericProvider")}</span></td>
+              <td data-label={t("upstreams.engine")}><strong>{running} / {waiting}</strong><span>{t("upstreams.runningWaiting")}</span></td>
+              <td data-label={t("upstreams.tokenRateShort")}><strong>{formatRate(node.runtime.prompt_tokens_per_second, locale)} / {formatRate(node.runtime.generation_tokens_per_second, locale)}</strong><span>{t("upstreams.promptGeneration")}</span></td>
+              <td data-label={t("upstreams.localLoad")}><ProgressValue value={node.runtime.active} total={node.runtime.max_concurrency} /></td>
+              <td data-label={t("upstreams.kvCacheShort")}><strong>{node.config.provider.type === "vllm" ? t("upstreams.used", { value: formatRatio(node.runtime.kv_cache_usage) }) : "--"}</strong><span>{node.config.provider.type === "vllm" ? t("upstreams.kvDetail", { hit: formatRatio(node.runtime.prefix_cache_hit_rate), blocks: formatCompactNumber(node.exact_kv_blocks, locale), mode: node.exact_kv_authoritative ? t("upstreams.synced") : t("upstreams.fallback") }) : t("upstreams.noTelemetry")}</span></td>
+              <td data-label={t("upstreams.latency")}><strong>{Math.round(node.runtime.latency_ewma_ms)} ms</strong><span>{t("upstreams.headerEwma")}</span></td>
               <td className="row-menu-cell" onClick={(event) => event.stopPropagation()}>
                 <Menu position="bottom-end" shadow="md" width={170} withinPortal>
-                  <Menu.Target><button className="bare-icon" aria-label={`Actions for ${node.config.id}`}><MoreHorizontal size={16} /></button></Menu.Target>
+                  <Menu.Target><button className="bare-icon" aria-label={t("upstreams.actionsFor", { id: node.config.id })}><MoreHorizontal size={16} /></button></Menu.Target>
                   <Menu.Dropdown>
-                    <Menu.Item leftSection={<ExternalLink size={13} />} onClick={() => onSelect(node)}>View Details</Menu.Item>
-                    <Menu.Item leftSection={<Edit3 size={13} />} onClick={() => onEdit(node)}>Edit</Menu.Item>
-                    <Menu.Item leftSection={node.runtime.lifecycle === "serving" ? <PauseCircle size={13} /> : <Play size={13} />} onClick={() => onToggleDrain(node)}>{node.runtime.lifecycle === "serving" ? "Drain" : "Resume"}</Menu.Item>
+                    <Menu.Item leftSection={<ExternalLink size={13} />} onClick={() => onSelect(node)}>{t("upstreams.viewDetails")}</Menu.Item>
+                    <Menu.Item leftSection={<Edit3 size={13} />} onClick={() => onEdit(node)}>{t("common.edit")}</Menu.Item>
+                    <Menu.Item leftSection={node.runtime.lifecycle === "serving" ? <PauseCircle size={13} /> : <Play size={13} />} onClick={() => onToggleDrain(node)}>{node.runtime.lifecycle === "serving" ? t("upstreams.drain") : t("upstreams.resume")}</Menu.Item>
                     <Menu.Divider />
-                    <Menu.Item color="red" leftSection={<Trash2 size={13} />} onClick={() => onDelete(node)}>Delete</Menu.Item>
+                    <Menu.Item color="red" leftSection={<Trash2 size={13} />} onClick={() => onDelete(node)}>{t("common.delete")}</Menu.Item>
                   </Menu.Dropdown>
                 </Menu>
               </td>
@@ -326,11 +358,12 @@ function Upstreams({
         </table>
       </div>}
     </section>
-    <footer className="table-footer"><span>Showing {visible.length ? (safePage - 1) * pageSize + 1 : 0} to {Math.min(safePage * pageSize, filtered.length)} of {filtered.length} nodes</span>{pages > 1 && <Pagination total={pages} value={safePage} onChange={setPage} size="xs" />}</footer>
+    <footer className="table-footer"><span>{t("upstreams.showing", { from: visible.length ? (safePage - 1) * pageSize + 1 : 0, to: Math.min(safePage * pageSize, filtered.length), total: filtered.length })}</span>{pages > 1 && <Pagination total={pages} value={safePage} onChange={setPage} size="xs" />}</footer>
   </div>;
 }
 
 export default function App() {
+  const { t, i18n } = useTranslation();
   const [view, setView] = useState<View>("overview");
   const [nodes, setNodes] = useState<NodeRecord[]>([]);
   const [status, setStatus] = useState<GatewayStatus | null>(null);
@@ -347,6 +380,12 @@ export default function App() {
   const [filter, setFilter] = useState<NodeFilter>("all");
   const refreshSequence = useRef(0);
 
+  useEffect(() => {
+    const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
+    document.documentElement.lang = locale;
+    document.title = t("app.title");
+  }, [i18n.resolvedLanguage, t]);
+
   const refresh = useCallback(async (quiet = false) => {
     const sequence = ++refreshSequence.current;
     if (!quiet) setRefreshing(true);
@@ -355,11 +394,11 @@ export default function App() {
     if (nodeResult.status === "fulfilled") setNodes(nodeResult.value);
     if (statusResult.status === "fulfilled") setStatus(statusResult.value);
     const failure = nodeResult.status === "rejected" ? nodeResult.reason : statusResult.status === "rejected" ? statusResult.reason : null;
-    setConnectionError(failure instanceof Error ? failure.message : failure ? "Control plane unavailable" : null);
+    setConnectionError(failure instanceof Error ? failure.message : failure ? t("controlPlane.unavailable") : null);
     if (!failure) setLastSync(Date.now());
     setLoading(false);
     setRefreshing(false);
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     void refresh(true);
@@ -390,10 +429,10 @@ export default function App() {
       else await api.updateNode(config, state.revision, shouldClearApiKey(state.draft));
       setEditor(null);
       setView("upstreams");
-      setToast({ tone: "success", message: state.mode === "create" ? "Node added" : "Node updated" });
+      setToast({ tone: "success", message: state.mode === "create" ? t("toast.nodeAdded") : t("toast.nodeUpdated") });
       await refresh(true);
     } catch (error) {
-      setToast({ tone: "error", message: error instanceof Error ? error.message : "Node operation failed" });
+      setToast({ tone: "error", message: error instanceof Error ? error.message : t("toast.operationFailed") });
       if (error instanceof api.ApiError && error.code === "revision_conflict") await refresh(true);
     } finally {
       setBusy(false);
@@ -404,10 +443,10 @@ export default function App() {
     setBusy(true);
     try {
       await api.setDraining(node.config.id, node.runtime.lifecycle === "serving");
-      setToast({ tone: "success", message: node.runtime.lifecycle === "serving" ? "Node is draining" : "Node resumed" });
+      setToast({ tone: "success", message: node.runtime.lifecycle === "serving" ? t("toast.nodeDraining") : t("toast.nodeResumed") });
       await refresh(true);
     } catch (error) {
-      setToast({ tone: "error", message: error instanceof Error ? error.message : "Lifecycle update failed" });
+      setToast({ tone: "error", message: error instanceof Error ? error.message : t("toast.lifecycleFailed") });
     } finally {
       setBusy(false);
     }
@@ -418,13 +457,13 @@ export default function App() {
     setBusy(true);
     try {
       await api.deleteNode(confirmDelete.config.id, confirmDelete.revision);
-      setToast({ tone: "success", message: "Node deleted" });
+      setToast({ tone: "success", message: t("toast.nodeDeleted") });
       setConfirmDelete(null);
       setSelectedNodeId(null);
       setView("upstreams");
       await refresh(true);
     } catch (error) {
-      setToast({ tone: "error", message: error instanceof Error ? error.message : "Delete failed" });
+      setToast({ tone: "error", message: error instanceof Error ? error.message : t("toast.deleteFailed") });
     } finally {
       setBusy(false);
     }
@@ -433,29 +472,31 @@ export default function App() {
   return <div className="app-shell">
     <aside className="desktop-sidebar">
       <div className="brand"><Waves size={25} /><strong>Estuary</strong></div>
-      <nav aria-label="Control plane navigation">
-        <button className={view === "overview" && !selectedNode && !editor ? "active" : ""} onClick={() => changeView("overview")}><LayoutDashboard size={16} />Overview</button>
-        <button className={view === "upstreams" || selectedNode || editor ? "active" : ""} onClick={() => changeView("upstreams")}><Server size={16} />Upstreams</button>
+      <nav aria-label={t("nav.label")}>
+        <button className={view === "overview" && !selectedNode && !editor ? "active" : ""} onClick={() => changeView("overview")}><LayoutDashboard size={16} />{t("nav.overview")}</button>
+        <button className={view === "upstreams" || selectedNode || editor ? "active" : ""} onClick={() => changeView("upstreams")}><Server size={16} />{t("nav.upstreams")}</button>
       </nav>
-      <div className="system-status"><span>Control plane</span><div><i className={connectionError ? "down" : ""} /><strong>{connectionError ? "Disconnected" : "Connected"}</strong><small>estuary-admin</small></div></div>
+      <div className="sidebar-footer"><LanguageSwitch /><div className="system-status"><span>{t("controlPlane.label")}</span><div><i className={connectionError ? "down" : ""} /><strong>{connectionError ? t("controlPlane.disconnected") : t("controlPlane.connected")}</strong><small>estuary-admin</small></div></div></div>
     </aside>
 
+    <div className="mobile-toolbar"><div className="brand"><Waves size={21} /><strong>Estuary</strong></div><LanguageSwitch /></div>
+
     <main className="main-content">
-      {connectionError && <div className="connection-banner" role="alert"><AlertTriangle size={16} /><span><strong>Control plane unavailable</strong>{connectionError}. Loaded values may be stale.</span><Button variant="default" size="compact-sm" onClick={() => void refresh()}>Retry</Button></div>}
+      {connectionError && <div className="connection-banner" role="alert"><AlertTriangle size={16} /><span><strong>{t("controlPlane.unavailable")}</strong>{t("controlPlane.stale", { error: connectionError })}</span><Button variant="default" size="compact-sm" onClick={() => void refresh()}>{t("common.retry")}</Button></div>}
       {editor ? <NodeEditor state={editor} busy={busy} onClose={() => setEditor(null)} onSave={save} />
         : selectedNode ? <NodeDetails node={selectedNode} busy={busy} onClose={() => setSelectedNodeId(null)} onEdit={() => openEdit(selectedNode)} onToggleDrain={() => void toggleDrain(selectedNode)} onDelete={() => setConfirmDelete(selectedNode)} />
           : view === "overview" ? <Overview status={status} nodes={nodes} lastSync={lastSync} refreshing={refreshing} onRefresh={() => void refresh()} onAdd={openAdd} onShowNodes={() => changeView("upstreams")} onSelectNode={(node) => setSelectedNodeId(node.config.id)} />
             : <Upstreams nodes={nodes} loading={loading} query={query} filter={filter} lastSync={lastSync} refreshing={refreshing} onQuery={setQuery} onFilter={setFilter} onRefresh={() => void refresh()} onSelect={(node) => setSelectedNodeId(node.config.id)} onEdit={openEdit} onToggleDrain={(node) => void toggleDrain(node)} onDelete={setConfirmDelete} onAdd={openAdd} />}
     </main>
 
-    {!editor && !selectedNode && <nav className="mobile-bottom-nav" aria-label="Mobile navigation">
-      <button className={view === "overview" ? "active" : ""} onClick={() => changeView("overview")}><LayoutDashboard size={16} />Overview</button>
-      <button className={view === "upstreams" ? "active" : ""} onClick={() => changeView("upstreams")}><Server size={16} />Upstreams</button>
-      <button onClick={openAdd}><Plus size={16} />Add</button>
+    {!editor && !selectedNode && <nav className="mobile-bottom-nav" aria-label={t("nav.label")}>
+      <button className={view === "overview" ? "active" : ""} onClick={() => changeView("overview")}><LayoutDashboard size={16} />{t("nav.overview")}</button>
+      <button className={view === "upstreams" ? "active" : ""} onClick={() => changeView("upstreams")}><Server size={16} />{t("nav.upstreams")}</button>
+      <button onClick={openAdd}><Plus size={16} />{t("nav.add")}</button>
     </nav>}
 
-    <Modal opened={Boolean(confirmDelete)} onClose={() => !busy && setConfirmDelete(null)} title={`Delete ${confirmDelete?.config.id ?? "node"}?`} centered>
-      <div className="delete-dialog"><div className="delete-icon"><Trash2 size={18} /></div><p>The node will drain first. Active requests must finish before its persisted configuration is removed.</p><div><Button variant="default" disabled={busy} onClick={() => setConfirmDelete(null)}>Cancel</Button><Button color="red" disabled={busy} leftSection={busy ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />} onClick={() => void remove()}>Delete Node</Button></div></div>
+    <Modal opened={Boolean(confirmDelete)} onClose={() => !busy && setConfirmDelete(null)} title={t("delete.title", { id: confirmDelete?.config.id ?? "node" })} centered>
+      <div className="delete-dialog"><div className="delete-icon"><Trash2 size={18} /></div><p>{t("delete.description")}</p><div><Button variant="default" disabled={busy} onClick={() => setConfirmDelete(null)}>{t("common.cancel")}</Button><Button color="red" disabled={busy} leftSection={busy ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />} onClick={() => void remove()}>{t("delete.node")}</Button></div></div>
     </Modal>
 
     {toast && <Notification className="app-notification" color={toast.tone === "success" ? "green" : "red"} icon={toast.tone === "success" ? <Check size={15} /> : <X size={15} />} withCloseButton onClose={() => setToast(null)}>{toast.message}</Notification>}
