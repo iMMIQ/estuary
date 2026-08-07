@@ -70,6 +70,75 @@ fn routing(queue_max_requests: usize) -> RoutingConfig {
 }
 
 #[tokio::test]
+async fn equal_score_low_overlap_traffic_rotates_between_nodes() {
+    let first = healthy_node("first", 4);
+    let second = healthy_node("second", 4);
+    for node in [&first, &second] {
+        node.record_request_success(Duration::from_millis(100));
+    }
+    let scheduler = Scheduler::new(vec![first, second], RoutingConfig::default());
+    let mut counts = HashMap::new();
+
+    for _ in 0..1_000 {
+        let selection = scheduler
+            .acquire(
+                Some("model"),
+                prefix::PrefixInput::default(),
+                &HashSet::new(),
+                128,
+            )
+            .await
+            .unwrap();
+        *counts.entry(selection.node.id().to_owned()).or_insert(0) += 1;
+        selection.lease.record_success(Duration::from_millis(100));
+    }
+
+    assert_eq!(counts.get("first"), Some(&500));
+    assert_eq!(counts.get("second"), Some(&500));
+}
+
+#[tokio::test]
+async fn stale_request_stats_receive_a_real_exploration_request() {
+    let stale = healthy_node("stale", 4);
+    let fresh = healthy_node("fresh", 4);
+    stale.record_request_success(Duration::from_secs(2));
+    stale.record_overload();
+    fresh.record_request_success(Duration::from_millis(10));
+    let scheduler = Scheduler::new(
+        vec![Arc::clone(&stale), Arc::clone(&fresh)],
+        RoutingConfig {
+            request_stats_stale_ms: 10,
+            ..RoutingConfig::default()
+        },
+    );
+
+    let selected = scheduler
+        .acquire(
+            Some("model"),
+            prefix::PrefixInput::default(),
+            &HashSet::new(),
+            128,
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.node.id(), "fresh");
+    drop(selected);
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    fresh.record_request_success(Duration::from_millis(10));
+    let selected = scheduler
+        .acquire(
+            Some("model"),
+            prefix::PrefixInput::default(),
+            &HashSet::new(),
+            128,
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.node.id(), "stale");
+}
+
+#[tokio::test]
 async fn queue_waits_until_capacity_is_released() {
     let node = healthy_node("only", 1);
     let scheduler = Scheduler::new(vec![node], routing(1));

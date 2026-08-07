@@ -62,6 +62,7 @@ pub struct Scheduler {
     queued_requests: Arc<AtomicUsize>,
     queued_bytes: Arc<AtomicUsize>,
     admission_waiters: Arc<AtomicUsize>,
+    tie_breaker: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -133,6 +134,7 @@ impl Scheduler {
             queued_requests: Arc::new(AtomicUsize::new(0)),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             admission_waiters: Arc::new(AtomicUsize::new(0)),
+            tie_breaker: AtomicUsize::new(0),
         }
     }
 
@@ -314,12 +316,14 @@ impl Scheduler {
             let active = node.scheduling_load() as f64;
             let capacity = node.max_concurrency() as f64;
             let load = ((active + 1.0) / capacity) / node.weight();
-            let (latency_ms, error_ewma) = node.score_stats();
-            let normalized_latency = if latency_ms == 0.0 {
-                1.0
-            } else {
-                latency_ms / self.config.target_latency_ms
-            };
+            let request_stats =
+                node.score_stats(Duration::from_millis(self.config.request_stats_stale_ms));
+            let normalized_latency = request_stats
+                .map(|(latency_ms, _)| latency_ms / self.config.target_latency_ms)
+                .unwrap_or_default();
+            let error_ewma = request_stats
+                .map(|(_, error_ewma)| error_ewma)
+                .unwrap_or_default();
             let health_penalty = match health {
                 HealthState::Healthy => 0.0,
                 HealthState::Degraded => 0.35,
@@ -365,6 +369,11 @@ impl Scheduler {
             load_imbalanced,
         );
 
+        candidates.sort_by(|left, right| left.node.id().cmp(right.node.id()));
+        if !candidates.is_empty() {
+            let offset = self.tie_breaker.fetch_add(1, AtomicOrdering::Relaxed) % candidates.len();
+            candidates.rotate_left(offset);
+        }
         candidates.sort_by(|left, right| {
             right
                 .cache_preferred
@@ -374,7 +383,6 @@ impl Scheduler {
                         .partial_cmp(&right.score)
                         .unwrap_or(Ordering::Equal)
                 })
-                .then_with(|| left.node.id().cmp(right.node.id()))
         });
         Ok(candidates)
     }

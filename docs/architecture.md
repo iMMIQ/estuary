@@ -79,16 +79,21 @@ Nodes are first filtered by retry exclusion, public-model mapping, and `Node::is
 observed_load = max(local_active_requests, fresh_vllm_running + fresh_vllm_waiting)
 load = ((observed_load + 1) / max_concurrency) / node_weight
 
-latency = 1                                      if no EWMA sample exists
+latency = 0                                      if the request stats are missing or stale
           response_header_latency_ewma_ms
           / target_latency_ms                    otherwise
+
+error = 0                                        if the request stats are missing or stale
+        error_ewma                               otherwise
 
 health_penalty = 0.00 healthy, 0.35 degraded, 0.15 starting
 
 base = load_weight * load
      + latency_weight * latency
-     + error_weight * (error_ewma + health_penalty)
+     + error_weight * (error + health_penalty)
 ```
+
+Latency and error stats expire after `request_stats_stale_ms`, which defaults to 60 seconds. Missing or stale stats receive no score penalty so an otherwise eligible node can obtain a real inference request and refresh them; health probes do not stand in for inference latency. Candidates with equal cache preference and score rotate instead of falling back to a fixed node-ID order.
 
 Starting nodes are present only when `route_while_starting` is enabled. Draining nodes and nodes with an open circuit are excluded; half-open circuits admit only their configured number of real inference probes. A native vLLM node is additionally excluded until `/version` proves it is vLLM 0.25.0 or newer. Fresh `num_requests_waiting >= provider.waiting_threshold` temporarily removes the node from admission, so cache affinity spills to another candidate or waits at the gateway. Metrics failures do not exclude an already verified node; after `telemetry_stale_ms`, both the watermark and upstream load are ignored and scheduling returns to process-local active requests.
 

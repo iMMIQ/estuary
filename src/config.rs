@@ -117,6 +117,9 @@ impl Settings {
         if !self.routing.target_latency_ms.is_finite() || self.routing.target_latency_ms <= 0.0 {
             bail!("routing.target_latency_ms must be finite and greater than zero");
         }
+        if self.routing.request_stats_stale_ms == 0 {
+            bail!("routing.request_stats_stale_ms must be greater than zero");
+        }
         if self.routing.prefix.enabled {
             if !self.routing.prefix.cache_threshold.is_finite()
                 || !(0.0..=1.0).contains(&self.routing.prefix.cache_threshold)
@@ -418,6 +421,7 @@ pub struct RoutingConfig {
     pub latency_weight: f64,
     pub error_weight: f64,
     pub target_latency_ms: f64,
+    pub request_stats_stale_ms: u64,
     pub prefix: PrefixConfig,
 }
 
@@ -430,6 +434,7 @@ impl Default for RoutingConfig {
             latency_weight: 0.20,
             error_weight: 1.0,
             target_latency_ms: 1_000.0,
+            request_stats_stale_ms: 60_000,
             prefix: PrefixConfig::default(),
         }
     }
@@ -777,6 +782,10 @@ mod tests {
 
         let mut settings = Settings::default();
         settings.routing.prefix.max_directory_chars = 0;
+        assert!(settings.validate().is_err());
+
+        let mut settings = Settings::default();
+        settings.routing.request_stats_stale_ms = 0;
         assert!(settings.validate().is_err());
     }
 

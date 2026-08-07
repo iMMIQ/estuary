@@ -158,6 +158,7 @@ impl HealthState {
 struct RuntimeStats {
     latency_ewma_ms: f64,
     error_ewma: f64,
+    request_stats_updated_at: Option<Instant>,
     consecutive_active_failures: u32,
     consecutive_passive_failures: u32,
     consecutive_probe_successes: u32,
@@ -170,6 +171,7 @@ impl Default for RuntimeStats {
         Self {
             latency_ewma_ms: 0.0,
             error_ewma: 0.0,
+            request_stats_updated_at: None,
             consecutive_active_failures: 0,
             consecutive_passive_failures: 0,
             consecutive_probe_successes: 0,
@@ -790,9 +792,12 @@ impl Node {
         NodeReservation { node: self, permit }
     }
 
-    pub fn score_stats(&self) -> (f64, f64) {
+    pub fn score_stats(&self, stale_after: Duration) -> Option<(f64, f64)> {
         let stats = self.stats.lock();
-        (stats.latency_ewma_ms, stats.error_ewma)
+        stats
+            .request_stats_updated_at
+            .filter(|updated| updated.elapsed() <= stale_after)
+            .map(|_| (stats.latency_ewma_ms, stats.error_ewma))
     }
 
     pub fn record_request_success(&self, latency: Duration) {
@@ -803,6 +808,7 @@ impl Node {
         let mut stats = self.stats.lock();
         update_ewma(&mut stats.latency_ewma_ms, latency.as_secs_f64() * 1_000.0);
         stats.error_ewma *= 1.0 - EWMA_ALPHA;
+        stats.request_stats_updated_at = Some(Instant::now());
         stats.consecutive_passive_failures = 0;
         drop(stats);
         self.record_circuit_success(ticket);
@@ -811,6 +817,7 @@ impl Node {
     pub fn record_overload(&self) {
         let mut stats = self.stats.lock();
         stats.error_ewma = ewma(stats.error_ewma, 0.5);
+        stats.request_stats_updated_at = Some(Instant::now());
     }
 
     pub fn record_passive_failure(&self, message: impl Into<String>, health: &HealthConfig) {
@@ -825,6 +832,7 @@ impl Node {
     ) {
         let mut stats = self.stats.lock();
         stats.error_ewma = ewma(stats.error_ewma, 1.0);
+        stats.request_stats_updated_at = Some(Instant::now());
         stats.consecutive_probe_successes = 0;
         stats.consecutive_passive_failures = stats.consecutive_passive_failures.saturating_add(1);
         stats.last_error = Some(message.into());

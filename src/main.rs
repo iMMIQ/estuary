@@ -102,6 +102,8 @@ struct RoutingOverrides {
     error_weight: Option<f64>,
     #[arg(long, env = "ESTUARY_TARGET_LATENCY_MS")]
     target_latency_ms: Option<f64>,
+    #[arg(long, env = "ESTUARY_REQUEST_STATS_STALE_MS")]
+    request_stats_stale_ms: Option<u64>,
     #[command(flatten)]
     prefix: PrefixOverrides,
 }
@@ -406,6 +408,8 @@ mod tests {
             "estuary",
             "--queue-max-requests",
             "42",
+            "--request-stats-stale-ms",
+            "30000",
             "--retry-max-attempts",
             "2",
             "--retry-statuses",
@@ -420,6 +424,7 @@ mod tests {
         .unwrap();
         let settings = settings_from_overrides(&cli.runtime).unwrap();
         assert_eq!(settings.routing.queue_max_requests, 42);
+        assert_eq!(settings.routing.request_stats_stale_ms, 30_000);
         assert_eq!(settings.retry.max_attempts, 2);
         assert_eq!(settings.retry.statuses, vec![429, 503]);
         assert!(!settings.routing.prefix.enabled);
