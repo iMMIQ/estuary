@@ -1,0 +1,27 @@
+services:
+  estuary:
+    image: "${ESTUARY_IMAGE:-estuary:local}"
+    container_name: estuary
+    restart: unless-stopped
+    environment:
+      ESTUARY_ADMIN_TOKEN: "${ESTUARY_ADMIN_TOKEN:?set ESTUARY_ADMIN_TOKEN}"
+      RUST_LOG: "${RUST_LOG:-estuary=info}"
+    ports:
+      - "8080:8080"
+      - "127.0.0.1:9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - estuary_releases:/opt/estuary
+      - estuary_data:/var/lib/estuary
+    stop_grace_period: 62m
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+volumes:
+  estuary_releases:
+  estuary_data:

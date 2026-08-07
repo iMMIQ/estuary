@@ -86,3 +86,43 @@ Node concurrency remains process-local. With two serving slots, configure each
 node's `max_concurrency` to half of the desired host-wide limit. A rollout never
 overlaps two generations in one slot, so it cannot temporarily exceed that
 budget; capacity is reduced while one slot drains.
+
+## Docker
+
+The repository image runs the same supervisor and persists its releases, slot
+links, SQLite database, and rollout journal in named volumes. Set a management
+token and start it with Compose:
+
+```console
+export ESTUARY_ADMIN_TOKEN="$(openssl rand -hex 32)"
+./deploy/docker-build.sh
+docker compose up -d
+```
+
+`docker-build.sh` probes the official and mainland Docker, Alpine, Cargo, and
+npm endpoints in parallel, then builds `estuary:local` with the fastest usable
+source. A plain `docker build -t estuary:local .` keeps the Dockerfile's official
+defaults and is suitable for GitHub-hosted CI. Build and runtime are separate:
+`compose.yaml` only runs `ESTUARY_IMAGE` (default `estuary:local`) and never
+builds source code.
+
+The public API listens on `:8080`. The management UI is published only on
+`http://127.0.0.1:9090/admin/`. From a node configured in the UI,
+`host.docker.internal` resolves to the Docker host on Linux.
+
+Use an official static binary for the container architecture to update workers
+without replacing the container:
+
+```console
+docker cp ./estuary estuary:/tmp/estuary.new
+docker exec --user root estuary \
+  /opt/estuary/state/current/estuary rollout /tmp/estuary.new
+docker exec estuary /opt/estuary/state/current/estuary status
+docker exec --user root estuary rm /tmp/estuary.new
+```
+
+The release volume is root-owned so a compromised gateway worker cannot replace
+its own executable. Recreating the only container still interrupts the public
+listener; the rollout command above is the zero-downtime application update
+path. Keep the named volumes on a local filesystem and do not use an empty bind
+mount for `/opt/estuary`, because it would hide the image's initial release.
