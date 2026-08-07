@@ -1,119 +1,160 @@
-# Binary rolling deployment
+# Deployment
 
-The production layout uses Estuary's built-in supervisor and two fixed worker
-slots. The supervisor owns the stable public listener and passes the same
-listening file descriptor directly to both workers. Inference bytes do not pass
-through a separate proxy process.
+[Documentation index](../docs/README.md) | [Architecture](../docs/architecture.md) |
+[Configuration and operations](../docs/operations.md)
 
-Requirements: Linux and a process manager capable of running a foreground
-process as a dedicated user. Estuary is not coupled to a particular init
-system. Both workers use the same SQLite database on a local filesystem. Do not
-place the database or its WAL files on NFS.
+Estuary's production process model is one supervisor with two fixed worker
+slots. The supervisor owns the stable public socket and passes it directly to
+both workers. A rollout drains and replaces one worker at a time while the other
+continues to accept from the kernel queue.
 
-Install the first release:
+The database, release state, and runtime files must be on a local Linux
+filesystem. Do not use NFS for SQLite or its WAL files.
 
-```console
+## Static Binary Deployment
+
+GitHub Releases provide static Linux binaries for `amd64` and `arm64`. Install
+the first release as root:
+
+```bash
 sudo ./deploy/install.sh ./estuary
 ```
 
-The installer creates the `estuary` user, immutable release and slot links,
-runtime directories, `/etc/estuary/common.env`, and the stable foreground
-launcher at `/opt/estuary/bin/run`. It deliberately does not register or start a
+The installer creates:
+
+| Path | Contents |
+| --- | --- |
+| `/opt/estuary/releases` | Immutable versioned binaries. |
+| `/opt/estuary/state` | Stable current and A/B slot links plus rollout journal. |
+| `/opt/estuary/bin/run` | Foreground supervisor launcher. |
+| `/var/lib/estuary` | SQLite database and runtime directory. |
+| `/etc/estuary/common.env` | Process configuration. |
+
+It also creates the unprivileged `estuary` user. It does not register or start a
 host service.
 
-Review `/etc/estuary/common.env`, then configure your process manager to:
+Review `/etc/estuary/common.env`, then configure the host process manager to:
 
-- run `/opt/estuary/bin/run` as the `estuary` user;
-- keep exactly one supervisor instance running and restart it after failure;
-- pass `SIGTERM` for shutdown and allow up to the configured drain deadline;
-- retain stdout and stderr and set an open-file limit suitable for expected
-  concurrency.
+- run `/opt/estuary/bin/run` as `estuary`;
+- keep exactly one supervisor running and restart it after failure;
+- forward SIGTERM and allow at least the configured shutdown/drain deadline;
+- retain stdout/stderr and set a suitable open-file limit.
 
-For an interactive first start, the same foreground entrypoint can be run
-directly:
+For an interactive start:
 
-```console
+```bash
 sudo -u estuary /opt/estuary/bin/run
 ```
 
-Open `http://127.0.0.1:9090/admin/` and configure upstream nodes. Direct
-upstream keys are stored unencrypted in `/var/lib/estuary/estuary.db`; protect
-that file, its WAL files, snapshots, and backups.
+The public listener defaults to `:8080`; the slot-A management listener defaults
+to `127.0.0.1:9090`. Configure the first upstream at
+`http://127.0.0.1:9090/admin/`.
 
-Roll out another release:
+## Binary Rollout
 
-```console
+Deploy a new static binary without restarting the supervisor:
+
+```bash
 sudo ./deploy/rollout.sh ./estuary
 ```
 
-The Rust rollout client validates and stages the executable in an immutable
-version directory, then asks the running supervisor to update slot A followed by
-slot B. Each old worker stops accepting connections and drains every accepted
-response before its replacement starts. The other slot keeps accepting from the
-shared kernel queue. A stream exceeding the deployment deadline is left alive
-and drained; it is never forcefully killed by the rollout.
+The rollout client validates `--version`, content-checks an existing version,
+stages and fsyncs the candidate, and requests a serialized A/B rollout:
 
-The replacement starts paused, loads SQLite, and starts health and provider
-monitors. Once a slot has reached runtime readiness, every replacement must
-reach it again before the supervisor activates its inherited public listener. A
-failed replacement is immediately restored to the previous binary. If slot B
-fails after slot A was updated, slot A is also rolled back, preserving a single
-worker version.
+1. Management writes are frozen and a rollout journal is persisted.
+2. Slot A stops accepting and drains every accepted response.
+3. Its replacement starts paused, initializes, passes the readiness requirement,
+   and activates the inherited public listener.
+4. Slot B repeats the same transition.
+5. The stable `current` link is updated and management writes resume.
 
-Management writes are frozen through a shared file for the entire transaction.
-The freeze survives a supervisor failure. On restart, matching slot releases are
-reconciled only after both workers start successfully; mixed releases keep
-writes frozen until another rollout converges both slots. Read-only management
-views remain available from slot A.
+If a replacement fails, its previous binary is restored. If slot B fails after
+slot A succeeded, slot A is also rolled back. A worker exceeding the rollout
+drain deadline is left alive and drained; it is not killed to complete a deploy.
 
-Inspect the local process state:
+Inspect supervisor and worker state:
 
-```console
+```bash
 /opt/estuary/state/current/estuary status
 ```
 
-The supervisor remains the version that originally started the process while
-workers roll forward. After a successful rollout the stable `current` link is
-updated, so the new supervisor is used the next time the process manager starts
-it. Worker-control protocol changes must therefore remain backward compatible.
+If the supervisor restarts during rollout, equal slot links are reconciled and
+the transaction is finalized. Mixed links keep management writes frozen until a
+later rollout converges both slots.
 
-The built-in supervisor protects worker availability, but it cannot restart
-itself after a supervisor crash or host reboot. That outer lifecycle remains the
-responsibility of the chosen process manager. Restarting the supervisor itself
-is not a zero-downtime operation because it owns the public listener.
+The running supervisor itself is not replaced during worker rollout. The new
+`current` binary becomes supervisor on the next process-manager restart.
+Restarting the only supervisor closes its public socket and is not a
+zero-downtime operation.
 
-Node concurrency remains process-local. With two serving slots, configure each
-node's `max_concurrency` to half of the desired host-wide limit. A rollout never
-overlaps two generations in one slot, so it cannot temporarily exceed that
-budget; capacity is reduced while one slot drains.
+## Docker Image Build
 
-## Docker
+Build and runtime are intentionally separate. A normal Docker build uses only
+the official Docker, Alpine, Cargo, and npm sources:
 
-The repository image runs the same supervisor and persists its releases, slot
-links, SQLite database, and rollout journal in named volumes. Set a management
-token and start it with Compose:
+```bash
+docker build -t estuary:local .
+```
 
-```console
-export ESTUARY_ADMIN_TOKEN="$(openssl rand -hex 32)"
+For local builds where mainland mirrors may be faster, run the provided build
+wrapper:
+
+```bash
 ./deploy/docker-build.sh
+```
+
+The wrapper probes official and mainland endpoints in parallel, verifies all
+three base-image manifests plus the required Alpine repositories, then passes
+the fastest available Docker Registry, Alpine APK, Cargo sparse registry, and
+npm registry to `docker build`. It produces `estuary:local` by default; override
+the tag with `ESTUARY_IMAGE`:
+
+```bash
+ESTUARY_IMAGE=registry.example.com/estuary:0.3.1 \
+./deploy/docker-build.sh
+```
+
+The Dockerfile is multi-stage. Bun and Rust toolchains remain in build stages;
+the final Alpine image contains only CA certificates, the Estuary binary, and
+the initialized release layout.
+
+## Docker Runtime
+
+`compose.yaml` consumes an image and never builds source code. Set a management
+token and optionally select an image:
+
+```bash
+export ESTUARY_ADMIN_TOKEN="$(openssl rand -hex 32)"
+export ESTUARY_IMAGE=estuary:local
 docker compose up -d
 ```
 
-`docker-build.sh` probes the official and mainland Docker, Alpine, Cargo, and
-npm endpoints in parallel, then builds `estuary:local` with the fastest usable
-source. A plain `docker build -t estuary:local .` keeps the Dockerfile's official
-defaults and is suitable for GitHub-hosted CI. Build and runtime are separate:
-`compose.yaml` only runs `ESTUARY_IMAGE` (default `estuary:local`) and never
-builds source code.
+Compose publishes:
 
-The public API listens on `:8080`. The management UI is published only on
-`http://127.0.0.1:9090/admin/`. From a node configured in the UI,
-`host.docker.internal` resolves to the Docker host on Linux.
+- public API: `0.0.0.0:8080`;
+- management application: `127.0.0.1:9090`.
 
-Use an official static binary for the container architecture to update workers
-without replacing the container:
+Inside the Docker bridge, `host.docker.internal` resolves to the Linux host and
+can be used for model servers running directly on that host.
 
-```console
+Two named volumes are required:
+
+| Volume | Mount | Contents |
+| --- | --- | --- |
+| `estuary_releases` | `/opt/estuary` | Versioned binaries, slot links, and rollout journal. |
+| `estuary_data` | `/var/lib/estuary` | SQLite, WAL, and runtime socket. |
+
+Do not replace `/opt/estuary` with an empty bind mount: it hides the initial
+release included in the image. Compose grants a 62-minute stop grace so the
+supervisor can drain long-running responses.
+
+## Docker Binary Rollout
+
+Updating the single container replaces its supervisor and interrupts the owned
+public listener. For a zero-downtime application update, keep the container
+running and use the built-in binary rollout:
+
+```bash
 docker cp ./estuary estuary:/tmp/estuary.new
 docker exec --user root estuary \
   /opt/estuary/state/current/estuary rollout /tmp/estuary.new
@@ -121,8 +162,21 @@ docker exec estuary /opt/estuary/state/current/estuary status
 docker exec --user root estuary rm /tmp/estuary.new
 ```
 
-The release volume is root-owned so a compromised gateway worker cannot replace
-its own executable. Recreating the only container still interrupts the public
-listener; the rollout command above is the zero-downtime application update
-path. Keep the named volumes on a local filesystem and do not use an empty bind
-mount for `/opt/estuary`, because it would hide the image's initial release.
+Use the official static binary matching the container architecture. The release
+volume is root-owned, so only an operator with Docker-level privilege can stage
+a new executable; workers continue to run as the unprivileged `estuary` user.
+
+## Capacity and Security
+
+- Both workers have process-local node semaphores. Set a node's
+  `max_concurrency` to half of its intended host-wide concurrency.
+- Capacity is reduced while one worker drains; old and new generations never
+  overlap in the same slot.
+- Protect `/var/lib/estuary`: upstream keys and custom header values are stored
+  as plaintext in SQLite.
+- Keep the management listener private and use `ESTUARY_ADMIN_TOKEN` whenever it
+  is not loopback-only.
+- The public listener has no inbound authentication and should be restricted or
+  placed behind an authenticating proxy.
+- Container or host failure is outside the two-worker rollout boundary; the
+  external process manager or Docker restart policy restores the supervisor.

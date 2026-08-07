@@ -1,21 +1,35 @@
-# Performance benchmark
+# Performance Benchmark
 
-The standalone benchmark starts an in-process mock vLLM-compatible HTTP server and an Estuary public listener. It does not require GPUs or a deployed vLLM cluster.
+[Documentation index](README.md) | [Architecture](architecture.md)
+
+The standalone benchmark measures gateway overhead against an in-process mock
+model server. It does not require a GPU or deployed vLLM instance.
 
 ```bash
-ESTUARY_RUN_BENCHMARK=1 ESTUARY_BENCH_REQUESTS=100 cargo bench --bench performance
+ESTUARY_RUN_BENCHMARK=1 \
+ESTUARY_BENCH_REQUESTS=100 \
+cargo bench --bench performance
 ```
 
-The matrix covers:
+`ESTUARY_BENCH_REQUESTS` controls the iterations per scenario and defaults to
+`100`. Without `ESTUARY_RUN_BENCHMARK=1`, the executable exits immediately.
 
-- OpenAI Chat Completions, Anthropic Messages through the Chat adapter, and Codex Responses;
+The benchmark runs:
+
+- OpenAI Chat Completions, Anthropic Messages through the Chat adapter, and
+  Codex Responses;
 - 2 KiB, 128 KiB, and 1 MiB prompts;
 - 1, 8, and 32 configured nodes;
-- concurrency at four times aggregate node capacity, exercising the single saturated queue;
-- bounded prefix preprocessing;
-- remote and cache-hit `/tokenize` routing paths;
-- approximate and exact KV-aware scheduler selection.
+- concurrency at four times aggregate node capacity;
+- approximate and exact scheduler selection;
+- prefix preprocessing;
+- remote and LRU-hit tokenization paths.
 
-The report includes requests per second, end-to-end p50/p99 latency, mean preprocessing and scheduling time, and Linux process RSS where `/proc/self/status` is available. The mock returns immediately, so this suite measures gateway overhead and queue behavior rather than model inference. Run it on an otherwise idle host, pin CPU frequency when comparing commits, and use the same Rust toolchain and build profile.
+Output includes throughput, end-to-end p50/p99 latency, Linux process RSS,
+prefix preprocessing time, scheduler time, and tokenization time. The mock
+upstream responds immediately, so results measure gateway and queue behavior,
+not model inference.
 
-The suite is intentionally excluded from normal CI because its full matrix moves large request bodies and latency comparisons are host-sensitive. Without `ESTUARY_RUN_BENCHMARK=1`, the bench executable exits immediately; this also keeps `cargo test --all-targets` fast.
+Run comparisons on the same idle host with the same Rust toolchain and release
+profile. The benchmark is not part of normal CI because its large-body matrix
+and latency results are host-sensitive.
