@@ -541,8 +541,10 @@ fn replace_unsupported_images(body: &mut Value, model: &str) -> usize {
                     return 1;
                 }
                 object
-                    .get_mut("content")
-                    .map_or(0, |content| visit_content(content, model))
+                    .iter_mut()
+                    .filter(|(key, _)| key.as_str() != "type")
+                    .map(|(_, value)| visit_content(value, model))
+                    .sum()
             }
             _ => 0,
         }
@@ -2084,6 +2086,32 @@ mod tests {
         let before = body.clone();
         assert_eq!(replace_unsupported_images(&mut body, "text-only"), 0);
         assert_eq!(body, before);
+    }
+
+    #[test]
+    fn replaces_images_nested_in_responses_tool_outputs() {
+        let mut body = json!({
+            "model": "text-only",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "view-image-call",
+                "output": [{
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,secret"
+                }]
+            }]
+        });
+
+        assert_eq!(replace_unsupported_images(&mut body, "text-only"), 1);
+        let serialized = body.to_string();
+        assert!(!serialized.contains("secret"));
+        assert_eq!(body["input"][0]["output"][0]["type"], "input_text");
+        assert!(
+            body["input"][0]["output"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("text-only")
+        );
     }
 
     #[test]
