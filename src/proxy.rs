@@ -209,10 +209,10 @@ async fn proxy_inner(
     if is_inference_json && public_model.is_none() {
         return Err(GatewayError::MissingModel);
     }
-    if let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_mut())
-        && !state.scheduler.model_supports_multimodal(model)
-    {
-        body_changed |= replace_unsupported_images(parsed, model) > 0;
+    if let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_mut()) {
+        if !state.scheduler.model_supports_multimodal(model) {
+            body_changed |= replace_unsupported_images(parsed, model) > 0;
+        }
     }
 
     let original_body = if body_changed {

@@ -110,7 +110,7 @@ npm registry to `docker build`. It produces `estuary:local` by default; override
 the tag with `ESTUARY_IMAGE`:
 
 ```bash
-ESTUARY_IMAGE=registry.example.com/estuary:0.3.1 \
+ESTUARY_IMAGE=registry.example.com/estuary:0.3.3 \
 ./deploy/docker-build.sh
 ```
 

@@ -271,6 +271,7 @@ impl Node {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn from_config_with_policies(
         config: &NodeConfig,
         route_while_starting: bool,

@@ -1,6 +1,6 @@
 [package]
 name = "estuary"
-version = "0.3.1"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.85"
 description = "A prefix-aware, load-sensitive gateway for OpenAI-compatible LLM APIs"
