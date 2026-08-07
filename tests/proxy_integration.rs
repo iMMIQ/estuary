@@ -21,7 +21,7 @@ use axum::{
 use bytes::Bytes;
 use estuary::{
     Gateway, Settings,
-    config::{AnthropicProtocol, NodeConfig, ProviderKind, RetryConfig},
+    config::{AnthropicProtocol, ModelCapabilityConfig, NodeConfig, ProviderKind, RetryConfig},
 };
 use futures_util::stream;
 use serde_json::{Value, json};
@@ -330,6 +330,56 @@ async fn maps_model_preserves_unknown_fields_and_replaces_credentials() {
     assert_eq!(
         upstream_body["vendor_extension"],
         request["vendor_extension"]
+    );
+}
+
+#[tokio::test]
+async fn text_only_model_omits_openai_images_before_forwarding() {
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/chat/completions", post(capture_request))
+            .with_state(sender),
+    )
+    .await;
+    let mut upstream_node = node(
+        "text-only-node",
+        &upstream,
+        [("text-model", "internal-model")],
+    );
+    upstream_node.model_capabilities.insert(
+        "text-model".to_owned(),
+        ModelCapabilityConfig { multimodal: false },
+    );
+    let gateway = spawn_gateway(vec![upstream_node]).await;
+
+    let response = test_client()
+        .post(gateway.url("/v1/chat/completions"))
+        .json(&json!({
+            "model": "text-model",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,private-image"}}
+            ]}]
+        }))
+        .send()
+        .await
+        .expect("gateway response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let captured = timeout(IO_TIMEOUT, receiver.recv())
+        .await
+        .expect("upstream request timeout")
+        .expect("upstream request missing");
+    let body: Value = serde_json::from_slice(&captured.body).expect("upstream JSON");
+    let serialized = body.to_string();
+    assert!(!serialized.contains("private-image"));
+    assert_eq!(body["messages"][0]["content"][1]["type"], "text");
+    assert!(
+        body["messages"][0]["content"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("text-model")
     );
 }
 

@@ -200,13 +200,6 @@ async fn proxy_inner(
     body_changed |= parsed
         .as_mut()
         .is_some_and(strip_claude_code_billing_blocks);
-    let original_body = if body_changed {
-        sonic_rs::to_vec(parsed.as_ref().expect("parsed body exists"))
-            .map(Bytes::from)
-            .map_err(|_| GatewayError::Internal)?
-    } else {
-        body
-    };
 
     let public_model = parsed
         .as_ref()
@@ -216,6 +209,19 @@ async fn proxy_inner(
     if is_inference_json && public_model.is_none() {
         return Err(GatewayError::MissingModel);
     }
+    if let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_mut())
+        && !state.scheduler.model_supports_multimodal(model)
+    {
+        body_changed |= replace_unsupported_images(parsed, model) > 0;
+    }
+
+    let original_body = if body_changed {
+        sonic_rs::to_vec(parsed.as_ref().expect("parsed body exists"))
+            .map(Bytes::from)
+            .map_err(|_| GatewayError::Internal)?
+    } else {
+        body
+    };
 
     let mut anthropic_payloads = None;
     let (protocol, record_prefix) = if endpoint == "messages" {
@@ -506,6 +512,52 @@ fn strip_claude_code_billing_blocks(body: &mut Value) -> bool {
     }
 
     changed
+}
+
+fn replace_unsupported_images(body: &mut Value, model: &str) -> usize {
+    fn visit_content(value: &mut Value, model: &str) -> usize {
+        match value {
+            Value::Array(items) => items
+                .iter_mut()
+                .map(|item| visit_content(item, model))
+                .sum(),
+            Value::Object(object) => {
+                let replacement_type =
+                    object
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .and_then(|kind| match kind {
+                            "image" | "image_url" => Some("text"),
+                            "input_image" => Some("input_text"),
+                            _ => None,
+                        });
+                if let Some(replacement_type) = replacement_type {
+                    *value = serde_json::json!({
+                        "type": replacement_type,
+                        "text": format!(
+                            "[Estuary gateway notice: this image was omitted because model {model:?} does not support image input. Do not claim to have inspected it; ask the user for a text description or suggest a multimodal model.]"
+                        )
+                    });
+                    return 1;
+                }
+                object
+                    .get_mut("content")
+                    .map_or(0, |content| visit_content(content, model))
+            }
+            _ => 0,
+        }
+    }
+
+    let Some(object) = body.as_object_mut() else {
+        return 0;
+    };
+    let mut replaced = 0;
+    for field in ["messages", "input", "system"] {
+        if let Some(content) = object.get_mut(field) {
+            replaced += visit_content(content, model);
+        }
+    }
+    replaced
 }
 
 fn is_claude_code_billing_block(value: &Value) -> bool {
@@ -1990,6 +2042,48 @@ mod tests {
                 .unwrap()
                 .contains("device-hash")
         );
+    }
+
+    #[test]
+    fn replaces_image_parts_with_protocol_specific_text_parts() {
+        let mut body = json!({
+            "model": "text-only",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,secret"}},
+                    {"type": "image", "source": {"type": "url", "url": "https://example.test/a.png"}}
+                ]
+            }],
+            "input": [{"type": "message", "content": [{"type": "input_image", "image_url": "https://example.test/b.png"}]}]
+            ,"tools": [{"type":"function","function":{"parameters":{"type":"image"}}}]
+        });
+
+        assert_eq!(replace_unsupported_images(&mut body, "text-only"), 3);
+        let serialized = body.to_string();
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("example.test"));
+        assert_eq!(body["messages"][0]["content"][1]["type"], "text");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["tools"][0]["function"]["parameters"]["type"], "image");
+        assert!(
+            body["messages"][0]["content"][1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("text-only")
+        );
+    }
+
+    #[test]
+    fn leaves_requests_without_images_unchanged() {
+        let mut body = json!({
+            "model": "text-only",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let before = body.clone();
+        assert_eq!(replace_unsupported_images(&mut body, "text-only"), 0);
+        assert_eq!(body, before);
     }
 
     #[test]

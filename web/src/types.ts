@@ -28,12 +28,17 @@ export interface ProviderConfig {
   kv_events: KvEventsConfig | null;
 }
 
+export interface ModelCapabilityConfig {
+  multimodal: boolean;
+}
+
 export interface NodeConfig {
   id: string;
   base_url: string;
   api_key: string | null;
   api_key_env: string | null;
   models: Record<string, string>;
+  model_capabilities: Record<string, ModelCapabilityConfig>;
   max_concurrency: number;
   weight: number;
   draining: boolean;
@@ -162,9 +167,10 @@ export interface PreflightResponse {
 export interface Pair {
   key: string;
   value: string;
+  multimodal?: boolean;
 }
 
-export interface NodeDraft extends Omit<NodeConfig, "api_key" | "models" | "headers_from_env"> {
+export interface NodeDraft extends Omit<NodeConfig, "api_key" | "models" | "model_capabilities" | "headers_from_env"> {
   api_key: string;
   preserve_api_key: boolean;
   models: Pair[];

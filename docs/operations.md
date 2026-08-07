@@ -49,6 +49,7 @@ Each node contains:
 | `id` | Unique stable identifier. |
 | `base_url` | Absolute HTTP(S) OpenAI-compatible base URL. Credentials, query strings, and fragments are rejected. |
 | `models` | Public-to-upstream model mappings. A value of `*` preserves the requested model; a public key of `*` matches unlisted models. |
+| `model_capabilities` | Optional per-public-model capabilities. Set `multimodal: false` for a text-only model; omitted entries retain the legacy text-and-image behavior. |
 | `max_concurrency` | Hard in-flight limit in this gateway process. |
 | `weight` | Positive scheduling weight. |
 | `health_path` | Authenticated active-probe path, default `/v1/models`. |
@@ -66,6 +67,30 @@ revision; stale updates return a conflict rather than overwriting newer data.
 SQLite uses WAL mode and transactional migrations. Workers sharing a local
 database poll its control revision and reconcile node changes into their own
 schedulers. The database and WAL files must remain on a local filesystem.
+
+### Text-only models
+
+When a configured model is marked `multimodal: false`, Estuary removes image
+content blocks before routing and replaces each one with a text notice that
+names the model and tells the agent it cannot inspect the image. The image URL
+or base64 data is not sent to the upstream. This applies to OpenAI Chat,
+Responses, and Anthropic Messages request shapes, including nested tool
+results. Models without a capability entry remain unchanged for compatibility.
+
+Example node fragment:
+
+```json
+{
+  "models": {
+    "claude-text": "claude-3-5-sonnet-text"
+  },
+  "model_capabilities": {
+    "claude-text": {
+      "multimodal": false
+    }
+  }
+}
+```
 
 ## Management Listener
 

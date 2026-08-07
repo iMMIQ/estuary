@@ -48,19 +48,20 @@ function PairEditor({
   valueLabel: string;
 }) {
   const { t } = useTranslation();
-  const update = (index: number, key: keyof Pair, value: string) => {
+  const update = (index: number, key: keyof Pair, value: string | boolean) => {
     onChange(rows.map((row, rowIndex) => rowIndex === index ? { ...row, [key]: value } : row));
   };
 
   return <div className="mapping-editor">
-    <div className="mapping-head"><span>{keyLabel}</span><span>{valueLabel}</span><span /></div>
+    <div className="mapping-head"><span>{keyLabel}</span><span>{valueLabel}</span><span>{t("editor.multimodal")}</span><span /></div>
     {rows.map((row, index) => <div className="mapping-row" key={index}>
       <TextInput aria-label={`${keyLabel} ${index + 1}`} value={row.key} error={Boolean(error)} onChange={(event) => update(index, "key", event.target.value)} />
       <TextInput aria-label={`${valueLabel} ${index + 1}`} value={row.value} error={Boolean(error)} onChange={(event) => update(index, "value", event.target.value)} />
+      <Switch size="sm" aria-label={`${t("editor.multimodal")} ${index + 1}`} checked={row.multimodal !== false} onChange={(event) => update(index, "multimodal", event.currentTarget.checked)} />
       <Button variant="subtle" color="gray" px={6} aria-label={t("editor.removeMapping", { count: index + 1 })} onClick={() => onChange(rows.length === 1 ? [{ key: "", value: "" }] : rows.filter((_, rowIndex) => rowIndex !== index))}><Trash2 size={14} /></Button>
     </div>)}
     {error && <span className="form-error" role="alert">{t(error as TranslationKey)}</span>}
-    <Button variant="subtle" size="compact-sm" leftSection={<Plus size={14} />} onClick={() => onChange([...rows, { key: "", value: "" }])}>{t("editor.addMapping")}</Button>
+    <Button variant="subtle" size="compact-sm" leftSection={<Plus size={14} />} onClick={() => onChange([...rows, { key: "", value: "", multimodal: true }])}>{t("editor.addMapping")}</Button>
   </div>;
 }
 

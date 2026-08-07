@@ -153,8 +153,8 @@ export function NodeDetails({
         <Tabs.Panel value="models" pt="md">
           <section className="models-panel">
             <div className="section-title"><h2>{t("details.modelCount", { count: Object.keys(node.config.models).length })}</h2><span>{t("details.modelMappings")}</span></div>
-            <table className="models-table"><thead><tr><th>{t("details.publicModel")}</th><th>{t("details.upstreamModel")}</th></tr></thead><tbody>
-              {Object.entries(node.config.models).map(([publicModel, upstreamModel]) => <tr key={publicModel}><td>{publicModel}</td><td>{upstreamModel}</td></tr>)}
+            <table className="models-table"><thead><tr><th>{t("details.publicModel")}</th><th>{t("details.upstreamModel")}</th><th>{t("details.multimodal")}</th></tr></thead><tbody>
+              {Object.entries(node.config.models).map(([publicModel, upstreamModel]) => <tr key={publicModel}><td>{publicModel}</td><td>{upstreamModel}</td><td>{node.config.model_capabilities?.[publicModel]?.multimodal ?? true ? t("common.enabled") : t("common.disabled")}</td></tr>)}
             </tbody></table>
           </section>
         </Tabs.Panel>

@@ -34,6 +34,15 @@ describe("node config mapping", () => {
     expect(draftToConfig(draft).provider.anthropic_protocol).toBe("responses");
   });
 
+  test("serializes per-model image capability", () => {
+    const draft = createDraft("openai");
+    draft.id = "node-a";
+    draft.models = [{ key: "text", value: "internal-text", multimodal: false }];
+    expect(draftToConfig(draft).model_capabilities).toEqual({
+      text: { multimodal: false },
+    });
+  });
+
   test("defaults legacy node records to automatic Anthropic routing", () => {
     const config = draftToConfig(createDraft("openai"));
     const legacyProvider = { ...config.provider } as Partial<typeof config.provider>;

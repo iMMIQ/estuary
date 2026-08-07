@@ -224,7 +224,7 @@ h3 { font-size: 13px; font-weight: 640; }
 .wizard-grid.two-columns { grid-template-columns: 1fr 1fr; }
 .wizard-grid:not(.two-columns) > *:nth-child(4), .wizard-grid:not(.two-columns) > *:nth-child(5) { display: inline-block; width: calc(50% - 8px); }
 .mapping-editor { display: grid; gap: 8px; }
-.mapping-head, .mapping-row { display: grid; grid-template-columns: 1fr 1fr 34px; gap: 8px; }
+.mapping-head, .mapping-row { display: grid; grid-template-columns: 1fr 1fr 86px 34px; gap: 8px; }
 .mapping-head { color: #9da5b0; font-size: 11px; }
 .mapping-row .mantine-Button-root { min-width: 34px; padding: 0; }
 .form-error { color: #ff7777; font-size: 11px; }
@@ -377,9 +377,10 @@ h3 { font-size: 13px; font-weight: 640; }
   .wizard-grid.two-columns { grid-template-columns: 1fr; }
   .wizard-grid:not(.two-columns) > *:nth-child(4), .wizard-grid:not(.two-columns) > *:nth-child(5) { width: 100%; }
   .mapping-head { display: none; }
-  .mapping-row { grid-template-columns: 1fr 32px; }
+  .mapping-row { grid-template-columns: 1fr 32px 32px; }
   .mapping-row > *:nth-child(2) { grid-row: 2; }
   .mapping-row > *:nth-child(3) { grid-column: 2; grid-row: 1 / 3; }
+  .mapping-row > *:nth-child(4) { grid-column: 3; grid-row: 1 / 3; }
   .credential-editor { grid-template-columns: 1fr; }
   .legacy-credential { grid-column: auto; }
   .review-grid { grid-template-columns: 1fr; }

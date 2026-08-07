@@ -232,6 +232,18 @@ impl Settings {
                     bail!("node {} has an empty model mapping", node.id);
                 }
             }
+            for public in node.model_capabilities.keys() {
+                if public.trim().is_empty()
+                    || (public != "*"
+                        && !node.models.contains_key(public)
+                        && !node.models.contains_key("*"))
+                {
+                    bail!(
+                        "node {} has capabilities for an unmapped model {public:?}",
+                        node.id
+                    );
+                }
+            }
             for name in node.headers.keys().chain(node.headers_from_env.keys()) {
                 http::HeaderName::from_bytes(name.as_bytes()).with_context(|| {
                     format!("node {} has invalid header name {name:?}", node.id)
@@ -554,6 +566,7 @@ pub struct NodeConfig {
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
     pub models: HashMap<String, String>,
+    pub model_capabilities: HashMap<String, ModelCapabilityConfig>,
     pub max_concurrency: usize,
     pub weight: f64,
     pub draining: bool,
@@ -571,6 +584,7 @@ impl Default for NodeConfig {
             api_key: None,
             api_key_env: None,
             models: HashMap::new(),
+            model_capabilities: HashMap::new(),
             max_concurrency: 1,
             weight: 1.0,
             draining: false,
@@ -579,6 +593,18 @@ impl Default for NodeConfig {
             headers_from_env: HashMap::new(),
             provider: ProviderConfig::default(),
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelCapabilityConfig {
+    pub multimodal: bool,
+}
+
+impl Default for ModelCapabilityConfig {
+    fn default() -> Self {
+        Self { multimodal: true }
     }
 }
 

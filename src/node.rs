@@ -237,6 +237,7 @@ pub struct Node {
     base_url: Url,
     health_url: Url,
     models: HashMap<String, String>,
+    model_capabilities: HashMap<String, crate::config::ModelCapabilityConfig>,
     max_concurrency: usize,
     weight: f64,
     headers: HeaderMap,
@@ -348,6 +349,7 @@ impl Node {
             base_url,
             health_url,
             models: config.models.clone(),
+            model_capabilities: config.model_capabilities.clone(),
             max_concurrency: config.max_concurrency,
             weight: config.weight,
             headers,
@@ -631,6 +633,13 @@ impl Node {
                 upstream.clone()
             })
         })
+    }
+
+    pub fn supports_multimodal(&self, public_model: &str) -> bool {
+        self.model_capabilities
+            .get(public_model)
+            .or_else(|| self.model_capabilities.get("*"))
+            .is_none_or(|capability| capability.multimodal)
     }
 
     pub fn explicit_models(&self) -> impl Iterator<Item = (&str, &str)> {

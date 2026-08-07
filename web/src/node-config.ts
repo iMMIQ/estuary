@@ -15,6 +15,15 @@ export function recordToPairs(record: Record<string, string>): Pair[] {
   return pairs.length > 0 ? pairs : [{ key: "", value: "" }];
 }
 
+function modelPairs(node: NodeRecord): Pair[] {
+  const pairs = Object.entries(node.config.models).map(([key, value]) => ({
+    key,
+    value,
+    multimodal: node.config.model_capabilities?.[key]?.multimodal ?? true,
+  }));
+  return pairs.length > 0 ? pairs : [{ key: "", value: "", multimodal: true }];
+}
+
 export function createDraft(kind: ProviderKind = "vllm"): NodeDraft {
   return {
     id: "",
@@ -54,7 +63,7 @@ export function recordToDraft(node: NodeRecord): NodeDraft {
     },
     api_key: "",
     preserve_api_key: node.credentials.api_key_source === "database",
-    models: recordToPairs(node.config.models),
+    models: modelPairs(node),
     headers_from_env: recordToPairs(node.config.headers_from_env),
   };
 }
@@ -70,6 +79,11 @@ export function draftToConfig(draft: NodeDraft): NodeConfig {
     api_key_env: apiKey ? null : draft.api_key_env?.trim() || null,
     health_path: draft.health_path.trim(),
     models: pairsToRecord(draft.models),
+    model_capabilities: Object.fromEntries(
+      draft.models
+        .map((row) => [row.key.trim(), { multimodal: row.multimodal !== false }] as const)
+        .filter(([key]) => key.length > 0),
+    ),
     headers_from_env: pairsToRecord(draft.headers_from_env),
     provider: {
       ...draft.provider,

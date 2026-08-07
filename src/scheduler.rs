@@ -468,6 +468,15 @@ impl Scheduler {
         models
     }
 
+    pub fn model_supports_multimodal(&self, model: &str) -> bool {
+        let matching = self
+            .nodes()
+            .into_iter()
+            .filter(|node| node.upstream_model(Some(model)).is_some())
+            .collect::<Vec<_>>();
+        matching.is_empty() || matching.iter().all(|node| node.supports_multimodal(model))
+    }
+
     pub fn ready(&self) -> bool {
         self.nodes().iter().any(|node| node.is_routable())
     }
