@@ -98,6 +98,17 @@ h3 { font-size: 13px; font-weight: 640; }
 .vllm-runtime-panel.compact { margin-bottom: 13px; }
 .vllm-runtime-panel.compact .metric-box { min-height: 62px; }
 .vllm-runtime-panel.compact .metric-box > strong { font-size: 17px; }
+.ip-connections-panel { margin-bottom: 16px; overflow: hidden; }
+.ip-connections-grid { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(420px, 1.5fr); gap: 14px 20px; padding: 14px 16px; }
+.ip-ranking p { margin: 10px 0; color: var(--muted); font-size: 12px; }
+.ip-ranking > div, .ip-limits > div { display: grid; min-height: 36px; align-items: center; gap: 10px; border-bottom: 1px solid var(--border-soft); }
+.ip-ranking > div { grid-template-columns: 28px 1fr auto; }
+.ip-ranking span, .ip-limits span { color: var(--muted); font-size: 11px; }
+.ip-ranking code, .ip-limits code { overflow: hidden; color: #e3e7ec; font-size: 12px; text-overflow: ellipsis; }
+.ip-ranking strong { color: var(--green); font-size: 14px; }
+.ip-limit-form { display: grid; grid-template-columns: minmax(160px, 1fr) 130px auto; align-items: end; gap: 8px; }
+.ip-limits { grid-column: 1 / -1; }
+.ip-limits > div { grid-template-columns: minmax(180px, 1fr) auto 32px; }
 .compact-panel { min-height: 244px; padding-bottom: 10px; }
 .usage-list { padding: 10px 16px 4px; }
 .usage-row { display: grid; min-height: 50px; grid-template-columns: minmax(180px, 1fr) minmax(90px, 0.9fr) 38px; align-items: center; gap: 12px; border-bottom: 1px solid var(--border-soft); }
@@ -315,6 +326,10 @@ h3 { font-size: 13px; font-weight: 640; }
   .vllm-runtime-grid .metric-box:nth-child(-n + 2) { border-top: 0; }
   .vllm-runtime-grid .metric-box:nth-child(2n) { border-right: 0; }
   .dashboard-two-column { grid-template-columns: 1fr; gap: 10px; margin-bottom: 10px; }
+  .ip-connections-grid { grid-template-columns: 1fr; padding: 12px; }
+  .ip-limit-form { grid-template-columns: 1fr 100px; }
+  .ip-limit-form .mantine-Button-root { grid-column: 1 / -1; }
+  .ip-limits { grid-column: auto; }
   .compact-panel { min-height: auto; }
   .usage-list { padding: 8px 12px 4px; }
   .usage-row { min-height: 46px; grid-template-columns: 1fr 82px 34px; gap: 8px; }

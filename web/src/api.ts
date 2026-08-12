@@ -45,6 +45,17 @@ export function getStatus(): Promise<GatewayStatus> {
   return request("/admin/api/status");
 }
 
+export function setIpLimit(ip: string, limit: number): Promise<unknown> {
+  return request(`/admin/api/ip-limits/${encodeURIComponent(ip)}`, {
+    method: "PUT",
+    body: JSON.stringify({ limit }),
+  });
+}
+
+export function deleteIpLimit(ip: string): Promise<unknown> {
+  return request(`/admin/api/ip-limits/${encodeURIComponent(ip)}`, { method: "DELETE" });
+}
+
 export function preflightNode(config: NodeConfig, clearApiKey = false): Promise<PreflightResponse> {
   const query = clearApiKey ? "?clear_api_key=true" : "";
   return request(`/admin/api/nodes/preflight${query}`, {

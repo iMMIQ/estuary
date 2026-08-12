@@ -18,6 +18,16 @@ function status(nodeCount: number) {
       available_concurrency: nodeCount * 16,
     },
     queue: { requests: 0, bytes: 0, max_requests: 512, max_bytes: 268435456 },
+    connections: {
+      public: 6,
+      max_public: 2048,
+      top_ips: [
+        { ip: "192.0.2.10", active: 3 },
+        { ip: "192.0.2.20", active: 2 },
+        { ip: "2001:db8::1", active: 1 },
+      ],
+      ip_limits: [],
+    },
     response_buffer: { used_bytes: 0, max_bytes: 268435456, waiting_responses: 0 },
     routing: { prefix_enabled: true },
   };
@@ -113,9 +123,16 @@ async function mockControlPlane(
   revisionConflict = false,
 ) {
   const nodes = [...initial];
+  const limits = new Map<string, number>();
   await page.route("**/admin/api/status", (route) =>
-    route.fulfill({ json: status(nodes.length) }),
+    route.fulfill({ json: { ...status(nodes.length), connections: { ...status(nodes.length).connections, ip_limits: [...limits].map(([ip, limit]) => ({ ip, limit })) } } }),
   );
+  await page.route("**/admin/api/ip-limits/**", (route) => {
+    const ip = decodeURIComponent(new URL(route.request().url()).pathname.split("/").at(-1) ?? "");
+    if (route.request().method() === "PUT") limits.set(ip, route.request().postDataJSON().limit);
+    else limits.delete(ip);
+    return route.fulfill({ json: { ip, limit: limits.get(ip), deleted: !limits.has(ip) } });
+  });
   await page.route("**/admin/api/nodes", async (route) => {
     if (route.request().method() === "POST") {
       const created = record(route.request().postDataJSON());
@@ -184,6 +201,19 @@ test("creates an upstream through the management workflow", async ({ page }) => 
 
   await expect(page.getByText("vllm-a").first()).toBeVisible();
   await expect(page.getByText("Node added")).toBeVisible();
+});
+
+test("shows top IPs and manages a connection limit", async ({ page }) => {
+  await mockControlPlane(page);
+  await page.goto("/admin/");
+
+  await expect(page.getByText("192.0.2.10")).toBeVisible();
+  await page.getByLabel("IP address").fill("192.0.2.10");
+  await page.getByLabel("Connection limit").fill("2");
+  await page.getByRole("button", { name: "Apply limit" }).click();
+  await expect(page.getByText("Limit: 2")).toBeVisible();
+  await page.getByRole("button", { name: "Remove limit for 192.0.2.10" }).click();
+  await expect(page.getByText("Limit: 2")).toHaveCount(0);
 });
 
 test("drains and deletes an existing upstream", async ({ page }) => {

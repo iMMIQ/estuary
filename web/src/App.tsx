@@ -21,6 +21,7 @@ import {
   RefreshCw,
   Search,
   Server,
+  ShieldCheck,
   Trash2,
   Waves,
   X,
@@ -160,6 +161,8 @@ function Overview({
   onAdd,
   onShowNodes,
   onSelectNode,
+  onSetIpLimit,
+  onDeleteIpLimit,
 }: {
   status: GatewayStatus | null;
   nodes: NodeRecord[];
@@ -169,6 +172,8 @@ function Overview({
   onAdd: () => void;
   onShowNodes: () => void;
   onSelectNode: (node: NodeRecord) => void;
+  onSetIpLimit: (ip: string, limit: number) => Promise<void>;
+  onDeleteIpLimit: (ip: string) => Promise<void>;
 }) {
   const { t, i18n } = useTranslation();
   const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
@@ -179,6 +184,8 @@ function Overview({
   const totalConcurrency = status?.fleet.total_concurrency ?? 0;
   const active = status?.fleet.active_requests ?? 0;
   const vllm = summarizeVllm(nodes);
+  const [ip, setIp] = useState("");
+  const [limit, setLimit] = useState("1");
 
   return <div className="page-frame overview-page">
     <header className="page-title-row"><div><h1>{t("nav.overview")}</h1><p>{t("overview.subtitle")}</p></div></header>
@@ -205,6 +212,28 @@ function Overview({
     </section>
 
     <VllmRuntimePanel nodes={nodes} />
+
+    <section className="dashboard-panel ip-connections-panel">
+      <div className="panel-heading"><h2>{t("overview.ipConnections")}</h2><span>{t("overview.currentConnections")}</span></div>
+      <div className="ip-connections-grid">
+        <div className="ip-ranking">
+          {(status?.connections.top_ips ?? []).length === 0 ? <p>{t("overview.noConnections")}</p> : status?.connections.top_ips.map((item, index) =>
+            <div key={item.ip}><span>#{index + 1}</span><code>{item.ip}</code><strong>{item.active}</strong></div>
+          )}
+        </div>
+        <form className="ip-limit-form" onSubmit={(event) => {
+          event.preventDefault();
+          void onSetIpLimit(ip.trim(), Number(limit)).then(() => setIp(""));
+        }}>
+          <TextInput aria-label={t("overview.ipAddress")} placeholder={t("overview.ipAddress")} value={ip} onChange={(event) => setIp(event.currentTarget.value)} required />
+          <TextInput aria-label={t("overview.connectionLimit")} type="number" min={1} value={limit} onChange={(event) => setLimit(event.currentTarget.value)} required />
+          <Button type="submit" size="compact-sm" leftSection={<ShieldCheck size={14} />}>{t("overview.applyLimit")}</Button>
+        </form>
+        {(status?.connections.ip_limits ?? []).length > 0 && <div className="ip-limits">
+          {status?.connections.ip_limits.map((item) => <div key={item.ip}><code>{item.ip}</code><span>{t("overview.limitValue", { count: item.limit })}</span><button className="bare-icon" title={t("overview.removeLimit")} aria-label={t("overview.removeLimitFor", { ip: item.ip })} onClick={() => void onDeleteIpLimit(item.ip)}><Trash2 size={14} /></button></div>)}
+        </div>}
+      </div>
+    </section>
 
     <div className="dashboard-two-column">
       <section className="dashboard-panel compact-panel">
@@ -469,6 +498,25 @@ export default function App() {
     }
   };
 
+  const setIpLimit = async (ip: string, limit: number) => {
+    try {
+      await api.setIpLimit(ip, limit);
+      setToast({ tone: "success", message: t("toast.ipLimitSaved") });
+      await refresh(true);
+    } catch (error) {
+      setToast({ tone: "error", message: error instanceof Error ? error.message : t("toast.ipLimitFailed") });
+    }
+  };
+
+  const deleteIpLimit = async (ip: string) => {
+    try {
+      await api.deleteIpLimit(ip);
+      await refresh(true);
+    } catch (error) {
+      setToast({ tone: "error", message: error instanceof Error ? error.message : t("toast.ipLimitFailed") });
+    }
+  };
+
   return <div className="app-shell">
     <aside className="desktop-sidebar">
       <div className="brand"><Waves size={25} /><strong>Estuary</strong></div>
@@ -485,7 +533,7 @@ export default function App() {
       {connectionError && <div className="connection-banner" role="alert"><AlertTriangle size={16} /><span><strong>{t("controlPlane.unavailable")}</strong>{t("controlPlane.stale", { error: connectionError })}</span><Button variant="default" size="compact-sm" onClick={() => void refresh()}>{t("common.retry")}</Button></div>}
       {editor ? <NodeEditor state={editor} busy={busy} onClose={() => setEditor(null)} onSave={save} />
         : selectedNode ? <NodeDetails node={selectedNode} busy={busy} onClose={() => setSelectedNodeId(null)} onEdit={() => openEdit(selectedNode)} onToggleDrain={() => void toggleDrain(selectedNode)} onDelete={() => setConfirmDelete(selectedNode)} />
-          : view === "overview" ? <Overview status={status} nodes={nodes} lastSync={lastSync} refreshing={refreshing} onRefresh={() => void refresh()} onAdd={openAdd} onShowNodes={() => changeView("upstreams")} onSelectNode={(node) => setSelectedNodeId(node.config.id)} />
+          : view === "overview" ? <Overview status={status} nodes={nodes} lastSync={lastSync} refreshing={refreshing} onRefresh={() => void refresh()} onAdd={openAdd} onShowNodes={() => changeView("upstreams")} onSelectNode={(node) => setSelectedNodeId(node.config.id)} onSetIpLimit={setIpLimit} onDeleteIpLimit={deleteIpLimit} />
             : <Upstreams nodes={nodes} loading={loading} query={query} filter={filter} lastSync={lastSync} refreshing={refreshing} onQuery={setQuery} onFilter={setFilter} onRefresh={() => void refresh()} onSelect={(node) => setSelectedNodeId(node.config.id)} onEdit={openEdit} onToggleDrain={(node) => void toggleDrain(node)} onDelete={setConfirmDelete} onAdd={openAdd} />}
     </main>
 

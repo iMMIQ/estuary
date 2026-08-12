@@ -502,3 +502,52 @@ async fn serves_the_embedded_admin_application_with_security_headers() {
             .contains("Estuary Control Plane")
     );
 }
+
+#[tokio::test]
+async fn validates_and_manages_ip_connection_limits() {
+    let gateway = Gateway::build(Settings::default()).unwrap();
+    let admin = TestServer::spawn(gateway.admin_router()).await;
+    let client = client();
+
+    assert_eq!(
+        client
+            .put(admin.url("/admin/api/ip-limits/not-an-ip"))
+            .json(&json!({"limit": 1}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        client
+            .put(admin.url("/admin/api/ip-limits/192.0.2.10"))
+            .json(&json!({"limit": 2}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let status = client
+        .get(admin.url("/admin/api/status"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        status["connections"]["ip_limits"],
+        json!([{"ip": "192.0.2.10", "limit": 2}])
+    );
+    assert_eq!(
+        client
+            .delete(admin.url("/admin/api/ip-limits/192.0.2.10"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}

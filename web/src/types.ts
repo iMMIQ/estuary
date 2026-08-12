@@ -142,6 +142,8 @@ export interface GatewayStatus {
   connections: {
     public: number;
     max_public: number;
+    top_ips: { ip: string; active: number }[];
+    ip_limits: { ip: string; limit: number }[];
   };
   response_buffer: {
     used_bytes: number;

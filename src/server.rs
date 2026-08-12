@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io,
-    net::{SocketAddr, TcpListener as StdTcpListener},
+    net::{IpAddr, SocketAddr, TcpListener as StdTcpListener},
     path::Path as FsPath,
     pin::Pin,
     sync::{
@@ -74,6 +74,7 @@ pub struct AppState {
     pub(crate) store: Arc<NodeStore>,
     pub(crate) process: Arc<ProcessLifecycle>,
     pub(crate) response_buffer: Arc<ResponseBufferBudget>,
+    connections: Arc<ConnectionTracker>,
     runtime_revisions: RwLock<HashMap<String, u64>>,
     control_revision: AtomicU64,
     admin_mutation: AsyncMutex<()>,
@@ -92,6 +93,7 @@ struct BoundedTcpListener {
     inner: TcpListener,
     permits: Arc<Semaphore>,
     metrics: Arc<Metrics>,
+    connections: Arc<ConnectionTracker>,
     track_public: bool,
     accept_cancellation: CancellationToken,
 }
@@ -101,6 +103,7 @@ impl BoundedTcpListener {
         inner: TcpListener,
         max_connections: usize,
         metrics: Arc<Metrics>,
+        connections: Arc<ConnectionTracker>,
         track_public: bool,
         accept_cancellation: CancellationToken,
     ) -> Self {
@@ -108,6 +111,7 @@ impl BoundedTcpListener {
             inner,
             permits: Arc::new(Semaphore::new(max_connections)),
             metrics,
+            connections,
             track_public,
             accept_cancellation,
         }
@@ -134,6 +138,10 @@ impl Listener for BoundedTcpListener {
             };
             match accepted {
                 Ok((stream, address)) => {
+                    let ip = address.ip();
+                    if self.track_public && !self.connections.open(ip) {
+                        continue;
+                    }
                     if self.track_public {
                         self.metrics.public_connection_opened();
                     }
@@ -142,6 +150,8 @@ impl Listener for BoundedTcpListener {
                             inner: stream,
                             _permit: permit,
                             metrics: Arc::clone(&self.metrics),
+                            connections: Arc::clone(&self.connections),
+                            ip,
                             track_public: self.track_public,
                         },
                         address,
@@ -165,6 +175,8 @@ struct BoundedTcpStream {
     inner: tokio::net::TcpStream,
     _permit: OwnedSemaphorePermit,
     metrics: Arc<Metrics>,
+    connections: Arc<ConnectionTracker>,
+    ip: IpAddr,
     track_public: bool,
 }
 
@@ -203,7 +215,69 @@ impl Drop for BoundedTcpStream {
     fn drop(&mut self) {
         if self.track_public {
             self.metrics.public_connection_closed();
+            self.connections.close(self.ip);
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ConnectionTracker {
+    state: parking_lot::Mutex<ConnectionState>,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionState {
+    active: HashMap<IpAddr, usize>,
+    limits: HashMap<IpAddr, usize>,
+}
+
+type IpCounts = Vec<(IpAddr, usize)>;
+
+impl ConnectionTracker {
+    fn open(&self, ip: IpAddr) -> bool {
+        let mut state = self.state.lock();
+        let active = state.active.get(&ip).copied().unwrap_or(0);
+        if state.limits.get(&ip).is_some_and(|limit| active >= *limit) {
+            return false;
+        }
+        state.active.insert(ip, active + 1);
+        true
+    }
+
+    fn close(&self, ip: IpAddr) {
+        let mut state = self.state.lock();
+        if let Some(active) = state.active.get_mut(&ip) {
+            *active -= 1;
+            if *active == 0 {
+                state.active.remove(&ip);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> (IpCounts, IpCounts) {
+        let state = self.state.lock();
+        let mut active: Vec<_> = state
+            .active
+            .iter()
+            .map(|(&ip, &count)| (ip, count))
+            .collect();
+        let mut limits: Vec<_> = state
+            .limits
+            .iter()
+            .map(|(&ip, &limit)| (ip, limit))
+            .collect();
+        active.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        limits.sort_unstable_by_key(|(ip, _)| *ip);
+        active.truncate(3);
+        (active, limits)
+    }
+
+    fn set_limit(&self, ip: IpAddr, limit: usize) {
+        self.state.lock().limits.insert(ip, limit);
+    }
+
+    fn remove_limit(&self, ip: IpAddr) -> bool {
+        self.state.lock().limits.remove(&ip).is_some()
     }
 }
 
@@ -260,6 +334,7 @@ impl Gateway {
             settings.server.max_buffered_response_bytes,
             Arc::clone(&metrics),
         );
+        let connections = Arc::new(ConnectionTracker::default());
         Ok(Self {
             state: Arc::new(AppState {
                 client,
@@ -274,6 +349,7 @@ impl Gateway {
                     ProcessLifecycle::new()
                 },
                 response_buffer,
+                connections,
                 runtime_revisions: RwLock::new(runtime_revisions),
                 control_revision: AtomicU64::new(control_revision),
                 admin_mutation: AsyncMutex::new(()),
@@ -314,6 +390,10 @@ impl Gateway {
             .route("/metrics", get(metrics))
             .route("/admin/nodes", get(nodes))
             .route("/admin/api/status", get(admin_status))
+            .route(
+                "/admin/api/ip-limits/{ip}",
+                put(set_ip_limit).delete(delete_ip_limit),
+            )
             .route("/admin/api/process", get(process_status))
             .route("/admin/api/process/activate", put(activate_process))
             .route("/admin/api/process/drain", put(drain_process))
@@ -407,6 +487,7 @@ impl Gateway {
             public_listener,
             self.state.settings.server.max_connections,
             Arc::clone(&self.state.metrics),
+            Arc::clone(&self.state.connections),
             true,
             public_accept_cancellation.clone(),
         );
@@ -414,6 +495,7 @@ impl Gateway {
             admin_listener,
             self.state.settings.server.max_admin_connections,
             Arc::clone(&self.state.metrics),
+            Arc::clone(&self.state.connections),
             false,
             admin_cancellation.clone(),
         );
@@ -1185,6 +1267,7 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
     }
     let (queued_requests, queued_bytes) = state.scheduler.queue_snapshot();
     let response_buffer = state.response_buffer.snapshot();
+    let (top_ips, ip_limits) = state.connections.snapshot();
     let ready = state.process.accepting_traffic() && routable_nodes > 0;
 
     Json(json!({
@@ -1213,6 +1296,14 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
         "connections": {
             "public": state.metrics.public_connections(),
             "max_public": state.settings.server.max_connections,
+            "top_ips": top_ips.into_iter().map(|(ip, active)| json!({
+                "ip": ip,
+                "active": active,
+            })).collect::<Vec<_>>(),
+            "ip_limits": ip_limits.into_iter().map(|(ip, limit)| json!({
+                "ip": ip,
+                "limit": limit,
+            })).collect::<Vec<_>>(),
         },
         "response_buffer": {
             "used_bytes": response_buffer.used_bytes,
@@ -1223,6 +1314,37 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
             "prefix_enabled": state.settings.routing.prefix.enabled,
         }
     }))
+}
+
+#[derive(Deserialize)]
+struct IpLimitInput {
+    limit: usize,
+}
+
+async fn set_ip_limit(
+    State(state): State<Arc<AppState>>,
+    Path(ip): Path<String>,
+    Json(input): Json<IpLimitInput>,
+) -> Response {
+    let Ok(ip) = ip.parse::<IpAddr>() else {
+        return admin_message(StatusCode::BAD_REQUEST, "invalid_ip", "invalid IP address");
+    };
+    if input.limit == 0 || input.limit > state.settings.server.max_connections {
+        return admin_message(
+            StatusCode::BAD_REQUEST,
+            "invalid_limit",
+            "limit must be between 1 and the public connection limit",
+        );
+    }
+    state.connections.set_limit(ip, input.limit);
+    Json(json!({"ip": ip, "limit": input.limit})).into_response()
+}
+
+async fn delete_ip_limit(State(state): State<Arc<AppState>>, Path(ip): Path<String>) -> Response {
+    let Ok(ip) = ip.parse::<IpAddr>() else {
+        return admin_message(StatusCode::BAD_REQUEST, "invalid_ip", "invalid IP address");
+    };
+    Json(json!({"deleted": state.connections.remove_limit(ip)})).into_response()
 }
 
 async fn admin_node(State(state): State<Arc<AppState>>, Path(node_id): Path<String>) -> Response {
@@ -1745,6 +1867,7 @@ mod tests {
             inner,
             1,
             Arc::clone(&metrics),
+            Arc::new(ConnectionTracker::default()),
             true,
             CancellationToken::new(),
         );
@@ -1766,5 +1889,20 @@ mod tests {
         assert_eq!(metrics.public_connections(), 1);
         drop((first_client, second_client, second_server));
         assert_eq!(metrics.public_connections(), 0);
+    }
+
+    #[test]
+    fn connection_tracker_limits_and_ranks_ips() {
+        let tracker = ConnectionTracker::default();
+        let first = "192.0.2.1".parse().unwrap();
+        let second = "192.0.2.2".parse().unwrap();
+        tracker.set_limit(first, 1);
+        assert!(tracker.open(first));
+        assert!(!tracker.open(first));
+        assert!(tracker.open(second));
+        assert!(tracker.open(second));
+        assert_eq!(tracker.snapshot().0, vec![(second, 2), (first, 1)]);
+        tracker.close(first);
+        assert!(tracker.open(first));
     }
 }
