@@ -21,7 +21,7 @@ using concurrency, observed load, latency, errors, and prompt-prefix locality.
   Chinese management application.
 - Bounded request admission, response buffering, streaming backpressure, and
   graceful shutdown.
-- A built-in two-worker supervisor for zero-downtime binary rollout and rollback.
+- A built-in deployment layer for binary upload, version switching, and rollback.
 - Docker and static Linux binary deployment.
 
 ## API
@@ -149,8 +149,7 @@ tools, and web search are rejected rather than silently changed. See the
   Protect the database, WAL files, snapshots, and backups.
 - SQLite must be on a local filesystem. Do not place it on NFS.
 - Node concurrency, queues, health, circuits, and prefix state are process-local.
-  With the built-in two-worker supervisor, set each node's concurrency to half
-  of the intended host-wide limit.
+  The built-in deployment layer keeps one active worker in steady state.
 - A retry can repeat upstream generation or billing. The default is one attempt.
 
 ## Documentation

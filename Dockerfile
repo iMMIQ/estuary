@@ -49,12 +49,13 @@ RUN set -eux; \
     ln -s "${release}" /opt/estuary/state/current; \
     ln -s "${release}" /opt/estuary/state/slots/a/current; \
     ln -s "${release}" /opt/estuary/state/slots/b/current; \
-    chown -R estuary:estuary /opt/estuary/state /var/lib/estuary; \
+    chown -R estuary:estuary /opt/estuary/releases /opt/estuary/state /var/lib/estuary; \
     rm /usr/local/bin/estuary-initial
 
 ENV ESTUARY_DATABASE=/var/lib/estuary/estuary.db \
     ESTUARY_LISTEN=0.0.0.0:8080 \
     ESTUARY_ADMIN_LISTEN=0.0.0.0:9090 \
+    ESTUARY_SLOT_A_ADMIN_LISTEN=127.0.0.1:19091 \
     ESTUARY_SLOT_B_ADMIN_LISTEN=127.0.0.1:19092 \
     ESTUARY_RELEASE_ROOT=/opt/estuary/releases \
     ESTUARY_STATE_ROOT=/opt/estuary/state \

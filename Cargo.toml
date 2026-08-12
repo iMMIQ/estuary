@@ -39,7 +39,7 @@ serde_json = "1.0"
 sonic-rs = "0.5.8"
 subtle = "2.6"
 thiserror = "2.0"
-tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

@@ -30,8 +30,8 @@ install -d -o estuary -g estuary -m 0750 /var/lib/estuary/run
 install -d -o root -g estuary -m 0750 /etc/estuary
 install -d -o root -g root -m 0755 \
     /opt/estuary \
-    /opt/estuary/bin \
-    /opt/estuary/releases
+    /opt/estuary/bin
+install -d -o estuary -g estuary -m 0750 /opt/estuary/releases
 install -d -o estuary -g estuary -m 0755 \
     /opt/estuary/state \
     /opt/estuary/state/slots/a \

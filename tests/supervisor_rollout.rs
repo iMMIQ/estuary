@@ -50,11 +50,8 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
     let state = root.join("state");
     let runtime = root.join("run");
     let stable = releases.join("stable");
-    let candidate = releases.join("candidate");
     fs::create_dir_all(&stable)?;
-    fs::create_dir_all(&candidate)?;
     copy_executable(&binary, &stable.join("estuary"))?;
-    copy_executable(&binary, &candidate.join("estuary"))?;
     fs::create_dir_all(state.join("slots/a"))?;
     fs::create_dir_all(state.join("slots/b"))?;
     symlink(&stable, &state.join("current"))?;
@@ -62,6 +59,7 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
     symlink(&stable, &state.join("slots/b/current"))?;
 
     let public = unused_address()?;
+    let management = unused_address()?;
     let admin_a = unused_address()?;
     let admin_b = unused_address()?;
     let child = Command::new(&binary)
@@ -70,7 +68,7 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
         .arg("--listen")
         .arg(public.to_string())
         .arg("--admin-listen")
-        .arg(admin_a.to_string())
+        .arg(management.to_string())
         .arg("supervisor")
         .arg("--release-root")
         .arg(&releases)
@@ -78,6 +76,8 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
         .arg(&state)
         .arg("--runtime-dir")
         .arg(&runtime)
+        .arg("--slot-a-admin-listen")
+        .arg(admin_a.to_string())
         .arg("--slot-b-admin-listen")
         .arg(admin_b.to_string())
         .arg("--start-timeout-seconds")
@@ -102,7 +102,43 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
     })
     .await?;
     let initial = control_request(&supervisor.runtime, json!({"command": "status"})).await?;
-    assert_running_slots(&initial, &stable)?;
+    assert_active_release(&initial, &stable)?;
+    let deploy_client = reqwest::Client::new();
+    assert_eq!(
+        deploy_client
+            .get(format!("http://{management}/deploy/"))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        deploy_client
+            .post(format!("http://{management}/deploy/api/releases"))
+            .body("not a binary")
+            .send()
+            .await?
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let uploaded = deploy_client
+        .post(format!("http://{management}/deploy/api/releases"))
+        .body(fs::read(&binary)?)
+        .send()
+        .await?;
+    assert_eq!(uploaded.status(), StatusCode::CREATED);
+    let version = uploaded.json::<Value>().await?["version"]
+        .as_str()
+        .context("missing uploaded version")?
+        .to_owned();
+    let candidate = releases.join(&version);
+    let listed = deploy_client
+        .get(format!("http://{management}/deploy/api/releases"))
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(listed["releases"].as_array().unwrap().len(), 2);
 
     fs::write(supervisor.runtime.join("admin.freeze"), b"test freeze\n")?;
     let frozen = reqwest::Client::new()
@@ -120,7 +156,7 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
     let old_a_pid = slot_pid(&initial, "a")?;
     send_signal(old_a_pid, "KILL")?;
     let recovered = wait_for_status(&supervisor.runtime, |status| {
-        slot_pid(status, "a").is_ok_and(|pid| pid != old_a_pid) && slots_running(status)
+        slot_pid(status, "a").is_ok_and(|pid| pid != old_a_pid) && one_slot_running(status)
     })
     .await?;
     assert_ne!(slot_pid(&recovered, "a")?, old_a_pid);
@@ -136,7 +172,7 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
     )
     .await?;
     assert_eq!(failed["ok"], false);
-    assert_running_slots(&failed, &stable)?;
+    assert_active_release(&failed, &stable)?;
     assert!(!supervisor.runtime.join("admin.freeze").exists());
     assert_public_available(public).await?;
 
@@ -147,21 +183,45 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
             tokio::spawn(assert_public_stays_available(public, stop))
         })
         .collect::<Vec<_>>();
-    let rolled = control_request(
-        &supervisor.runtime,
-        json!({"command": "rollout", "release": candidate}),
-    )
-    .await?;
+    let activated = deploy_client
+        .put(format!("http://{management}/deploy/api/releases/{version}"))
+        .send()
+        .await?;
     stop_requests.store(true, Ordering::Release);
     for task in availability {
         assert!(task.await?? > 0);
     }
-    assert_eq!(rolled["ok"], true, "{rolled:#}");
-    assert_running_slots(&rolled, &releases.join("candidate"))?;
+    assert_eq!(activated.status(), StatusCode::OK);
+    let rolled = control_request(&supervisor.runtime, json!({"command": "status"})).await?;
+    assert_active_release(&rolled, &candidate)?;
     assert_eq!(state.join("current").canonicalize()?, candidate);
     assert_public_available(public).await?;
+    assert_eq!(
+        deploy_client
+            .get(format!("http://{management}/admin/api/status"))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    wait_for_status(&supervisor.runtime, one_slot_running).await?;
+    assert_eq!(
+        deploy_client
+            .delete(format!("http://{management}/deploy/api/releases/stable"))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    assert!(!stable.exists());
 
-    let worker_pids = [slot_pid(&rolled, "a")?, slot_pid(&rolled, "b")?];
+    let worker_pids = rolled["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|slot| slot["pid"].as_u64())
+        .filter_map(|pid| u32::try_from(pid).ok())
+        .collect::<Vec<_>>();
     send_signal(supervisor.child.id(), "TERM")?;
     let status = supervisor.child.wait()?;
     assert!(status.success() || status.signal() == Some(15), "{status}");
@@ -237,21 +297,23 @@ fn slot_pid(status: &Value, name: &str) -> Result<u32> {
         .with_context(|| format!("missing PID for slot {name}: {status:#}"))
 }
 
-fn slots_running(status: &Value) -> bool {
+fn one_slot_running(status: &Value) -> bool {
     status["slots"]
         .as_array()
-        .is_some_and(|slots| slots.len() == 2 && slots.iter().all(|slot| slot["running"] == true))
+        .is_some_and(|slots| slots.iter().filter(|slot| slot["running"] == true).count() == 1)
 }
 
-fn assert_running_slots(status: &Value, release: &Path) -> Result<()> {
-    assert!(slots_running(status), "{status:#}");
+fn assert_active_release(status: &Value, release: &Path) -> Result<()> {
     let expected = release.canonicalize()?;
-    for slot in status["slots"].as_array().context("missing slots")? {
-        assert_eq!(
-            Path::new(slot["release"].as_str().context("missing release")?),
-            expected
-        );
-    }
+    let active = status["active_slot"]
+        .as_str()
+        .context("missing active slot")?;
+    let running = status["slots"]
+        .as_array()
+        .and_then(|slots| slots.iter().find(|slot| slot["slot"] == active))
+        .context("missing active worker")?;
+    assert_eq!(running["running"], true, "{status:#}");
+    assert_eq!(Path::new(running["release"].as_str().unwrap()), expected);
     Ok(())
 }
 

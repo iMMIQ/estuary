@@ -211,9 +211,9 @@ struct RetryOverrides {
 
 #[derive(Debug, Subcommand)]
 enum CommandMode {
-    /// Run the built-in A/B worker supervisor.
+    /// Run the built-in deployment layer and active gateway worker.
     Supervisor(SupervisorArgs),
-    /// Atomically roll a staged binary through both workers.
+    /// Stage and activate a gateway binary.
     Rollout(RolloutArgs),
     /// Show the local supervisor and worker state.
     Status(StatusArgs),
@@ -243,6 +243,12 @@ struct SupervisorPaths {
 struct SupervisorArgs {
     #[command(flatten)]
     paths: SupervisorPaths,
+    #[arg(
+        long,
+        env = "ESTUARY_SLOT_A_ADMIN_LISTEN",
+        default_value = "127.0.0.1:19091"
+    )]
+    slot_a_admin_listen: SocketAddr,
     #[arg(
         long,
         env = "ESTUARY_SLOT_B_ADMIN_LISTEN",
@@ -297,18 +303,13 @@ async fn main() -> Result<()> {
         }
         Some(CommandMode::Supervisor(arguments)) => {
             settings.validate()?;
-            let slot_a_admin = settings
-                .server
-                .admin_listen
-                .parse()
-                .context("invalid slot A admin listener")?;
             supervisor::run(SupervisorConfig {
                 settings,
                 database: cli.database.clone(),
                 release_root: arguments.paths.release_root.clone(),
                 state_root: arguments.paths.state_root.clone(),
                 runtime_dir: arguments.paths.runtime_dir.clone(),
-                slot_a_admin,
+                slot_a_admin: arguments.slot_a_admin_listen,
                 slot_b_admin: arguments.slot_b_admin_listen,
                 start_timeout: Duration::from_secs(arguments.start_timeout_seconds),
                 drain_timeout: Duration::from_secs(arguments.drain_timeout_seconds),

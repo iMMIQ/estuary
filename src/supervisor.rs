@@ -5,17 +5,32 @@ use std::{
     os::{fd::AsFd, unix::fs::PermissionsExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+use axum::{
+    Router,
+    body::Body,
+    extract::{DefaultBodyLimit, Path as AxumPath, Request, State},
+    http::{StatusCode as HttpStatusCode, header::AUTHORIZATION},
+    response::{Html, IntoResponse, Response},
+    routing::{get, put},
+};
+use base64::Engine as _;
 use command_fds::{CommandFdExt, FdMapping};
+use futures_util::StreamExt;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
+    net::{TcpListener as TokioTcpListener, UnixListener, UnixStream},
     sync::Mutex,
 };
 use tokio_util::sync::CancellationToken;
@@ -110,6 +125,7 @@ struct Supervisor {
     listener: Arc<TcpListener>,
     client: reqwest::Client,
     slots: Arc<Vec<Arc<Mutex<SlotRuntime>>>>,
+    active_slot: Arc<AtomicUsize>,
     rollout_lock: Arc<Mutex<()>>,
     shutdown: CancellationToken,
 }
@@ -125,6 +141,7 @@ enum SupervisorRequest {
 struct SupervisorResponse {
     ok: bool,
     message: String,
+    active_slot: SlotId,
     slots: Vec<SlotSnapshot>,
 }
 
@@ -142,6 +159,239 @@ struct RolloutJournal {
     previous_a: PathBuf,
     previous_b: PathBuf,
     phase: String,
+}
+
+const MAX_UPLOAD_BYTES: usize = 256 * 1024 * 1024;
+const DEPLOY_HTML: &str = r#"<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Estuary Deploy</title><style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b0f14;color:#edf1f5}body{margin:0}main{max-width:900px;margin:auto;padding:32px 20px}header{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #29313c;padding-bottom:18px}h1{font-size:22px;margin:0}small,p{color:#9ca6b2}.panel{border:1px solid #29313c;border-radius:6px;margin-top:18px;background:#11171e}form,.row{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid #222a34}.row:last-child{border:0}.row strong{min-width:130px}.row code{flex:1;color:#9ddff1}button,input::file-selector-button{border:1px solid #3b4654;border-radius:4px;background:#1a222c;color:#edf1f5;padding:8px 12px;cursor:pointer}button.primary{background:#16724a;border-color:#258d62}button.danger{color:#ff9ca3}button:disabled{opacity:.45;cursor:default}.badge{font-size:11px;color:#62db9f}#message{min-height:20px;color:#e8c26a}@media(max-width:600px){main{padding:20px 12px}.row{align-items:flex-start;flex-wrap:wrap}.row strong,.row code{width:100%}form{align-items:stretch;flex-direction:column}}
+</style></head><body><main><header><div><h1>Estuary Deploy</h1><small>网关版本部署与切换</small></div><button onclick="load()">刷新</button></header><section class="panel"><form id="upload"><input id="binary" type="file" required><button class="primary">上传版本</button></form><div id="releases"></div></section><p id="message"></p></main><script>
+const api='/deploy/api/releases',msg=document.querySelector('#message');
+async function request(url,options){msg.textContent='处理中...';const r=await fetch(url,options),b=await r.json().catch(()=>({}));if(!r.ok)throw Error(b.error?.message||`HTTP ${r.status}`);msg.textContent='';return b}
+async function load(){try{const {releases}=await request(api);document.querySelector('#releases').innerHTML=releases.map(r=>`<div class="row"><strong>${escapeHtml(r.version)} ${r.active?'<span class="badge">当前</span>':''}</strong><code>${format(r.size_bytes)}</code><button class="primary" ${r.active?'disabled':''} onclick="activate('${encodeURIComponent(r.version)}')">切换</button><button class="danger" ${r.current||r.active?'disabled':''} onclick="removeVersion('${encodeURIComponent(r.version)}')">删除</button></div>`).join('')||'<div class="row"><p>没有可用版本</p></div>'}catch(e){msg.textContent=e.message}}
+async function activate(v){try{await request(`${api}/${v}`,{method:'PUT'});await load()}catch(e){msg.textContent=e.message}}
+async function removeVersion(v){if(!confirm('删除这个版本？'))return;try{await request(`${api}/${v}`,{method:'DELETE'});await load()}catch(e){msg.textContent=e.message}}
+document.querySelector('#upload').onsubmit=async e=>{e.preventDefault();const f=document.querySelector('#binary').files[0];try{await request(api,{method:'POST',headers:{'content-type':'application/octet-stream'},body:f});e.target.reset();await load()}catch(e){msg.textContent=e.message}};
+function escapeHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}function format(n){return n<1048576?`${Math.ceil(n/1024)} KiB`:`${(n/1048576).toFixed(1)} MiB`}load();
+</script></body></html>"#;
+
+#[derive(Debug, Serialize)]
+struct ReleaseSnapshot {
+    version: String,
+    current: bool,
+    active: bool,
+    size_bytes: u64,
+}
+
+fn deploy_router(supervisor: Supervisor) -> Router {
+    let deploy = Router::new()
+        .route("/deploy/", get(deploy_index))
+        .route("/deploy/api/status", get(deploy_status))
+        .route(
+            "/deploy/api/releases",
+            get(deploy_releases).post(upload_release),
+        )
+        .route(
+            "/deploy/api/releases/{version}",
+            put(activate_release).delete(delete_release),
+        )
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+        .layer(axum::middleware::from_fn_with_state(
+            supervisor.clone(),
+            authorize_deploy,
+        ));
+    Router::new()
+        .merge(deploy)
+        .fallback(proxy_admin)
+        .with_state(supervisor)
+}
+
+async fn proxy_admin(State(supervisor): State<Supervisor>, request: Request) -> Response {
+    let active = supervisor.active_slot.load(Ordering::Acquire);
+    let admin = {
+        let slot = supervisor.slots[active].lock().await;
+        supervisor.config.slot_admin(slot.id)
+    };
+    let (mut parts, body) = request.into_parts();
+    let path = parts
+        .uri
+        .path_and_query()
+        .map_or("/", axum::http::uri::PathAndQuery::as_str);
+    let url = format!("http://{admin}{path}");
+    parts.headers.remove(axum::http::header::HOST);
+    let Ok(body) = axum::body::to_bytes(
+        body,
+        supervisor.config.settings.server.max_request_body_bytes,
+    )
+    .await
+    else {
+        return HttpStatusCode::PAYLOAD_TOO_LARGE.into_response();
+    };
+    let upstream = match supervisor
+        .client
+        .request(parts.method, url)
+        .headers(parts.headers)
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            error!(%error, "active worker admin request failed");
+            return deploy_message(
+                HttpStatusCode::SERVICE_UNAVAILABLE,
+                "active gateway management endpoint is unavailable",
+            );
+        }
+    };
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    let body = match upstream.bytes().await {
+        Ok(body) => body,
+        Err(error) => {
+            error!(%error, "failed to read active worker admin response");
+            return HttpStatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let mut response = Response::builder().status(status);
+    if let Some(response_headers) = response.headers_mut() {
+        response_headers.extend(headers);
+    }
+    response
+        .body(Body::from(body))
+        .unwrap_or_else(|_| HttpStatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn authorize_deploy(
+    State(supervisor): State<Supervisor>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(expected) = supervisor.config.settings.server.admin_token.as_deref() else {
+        return next.run(request).await;
+    };
+    let candidate = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(deploy_authorization_token);
+    if candidate.is_some_and(|value| bool::from(value.as_bytes().ct_eq(expected.as_bytes()))) {
+        return next.run(request).await;
+    }
+    (
+        HttpStatusCode::UNAUTHORIZED,
+        [("www-authenticate", "Basic realm=\"Estuary Deploy\"")],
+        "authentication required",
+    )
+        .into_response()
+}
+
+fn deploy_authorization_token(value: &str) -> Option<String> {
+    if let Some(token) = value.strip_prefix("Bearer ") {
+        return Some(token.to_owned());
+    }
+    let encoded = value.strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    String::from_utf8(decoded)
+        .ok()?
+        .split_once(':')
+        .map(|(_, password)| password.to_owned())
+}
+
+async fn deploy_index() -> Html<&'static str> {
+    Html(DEPLOY_HTML)
+}
+
+async fn deploy_status(State(supervisor): State<Supervisor>) -> Response {
+    let active = supervisor.active_slot.load(Ordering::Acquire);
+    let slots = supervisor.snapshots().await;
+    axum::Json(json!({
+        "active_slot": slots.get(active).map(|slot| slot.slot),
+        "active_version": slots.get(active).and_then(|slot| release_version(&slot.release)),
+        "switching": supervisor.config.journal_file().exists(),
+        "slots": slots,
+    }))
+    .into_response()
+}
+
+async fn deploy_releases(State(supervisor): State<Supervisor>) -> Response {
+    match supervisor.releases().await {
+        Ok(releases) => axum::Json(json!({"releases": releases})).into_response(),
+        Err(error) => deploy_error(HttpStatusCode::INTERNAL_SERVER_ERROR, &error),
+    }
+}
+
+async fn upload_release(State(supervisor): State<Supervisor>, body: Body) -> Response {
+    let temporary = supervisor
+        .config
+        .runtime_dir
+        .join(format!("upload-{}", uuid::Uuid::now_v7()));
+    let result = async {
+        let mut file = tokio::fs::File::create(&temporary).await?;
+        let mut stream = body.into_data_stream();
+        let mut size = 0_usize;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("failed to read upload")?;
+            size = size.saturating_add(chunk.len());
+            if size > MAX_UPLOAD_BYTES {
+                bail!("binary is too large");
+            }
+            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+        }
+        if size == 0 {
+            bail!("empty upload");
+        }
+        file.sync_all().await?;
+        drop(file);
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))?;
+        stage_release(&supervisor.config.release_root, &temporary)
+    }
+    .await;
+    let _ = fs::remove_file(&temporary);
+    match result {
+        Ok(release) => (
+            HttpStatusCode::CREATED,
+            axum::Json(json!({"version": release_version(&release), "release": release})),
+        )
+            .into_response(),
+        Err(error) => deploy_error(HttpStatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn activate_release(
+    State(supervisor): State<Supervisor>,
+    AxumPath(version): AxumPath<String>,
+) -> Response {
+    let target = supervisor.config.release_root.join(&version);
+    match supervisor.perform_rollout(target).await {
+        Ok(()) => axum::Json(json!({"active_version": version})).into_response(),
+        Err(error) => deploy_error(HttpStatusCode::CONFLICT, &error),
+    }
+}
+
+async fn delete_release(
+    State(supervisor): State<Supervisor>,
+    AxumPath(version): AxumPath<String>,
+) -> Response {
+    match supervisor.delete_release(&version).await {
+        Ok(()) => axum::Json(json!({"deleted": true})).into_response(),
+        Err(error) => deploy_error(HttpStatusCode::CONFLICT, &error),
+    }
+}
+
+fn deploy_message(status: HttpStatusCode, message: &str) -> Response {
+    (status, axum::Json(json!({"error": {"message": message}}))).into_response()
+}
+
+fn deploy_error(status: HttpStatusCode, error: &anyhow::Error) -> Response {
+    deploy_message(status, &format!("{error:#}"))
+}
+
+fn release_version(release: &Path) -> Option<String> {
+    release.file_name()?.to_str().map(str::to_owned)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -187,46 +437,39 @@ pub async fn run(config: SupervisorConfig) -> Result<()> {
         client: reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(2))
-            .timeout(WORKER_CONTROL_TIMEOUT)
             .build()
             .context("failed to build supervisor control client")?,
         slots: Arc::new(slots),
+        active_slot: Arc::new(AtomicUsize::new(0)),
         rollout_lock: Arc::new(Mutex::new(())),
         shutdown: CancellationToken::new(),
     };
 
     let control = bind_control_socket(&supervisor.config.control_socket())?;
-    for slot in supervisor.slots.iter() {
-        let mut slot = slot.lock().await;
-        if let Err(error) = supervisor.start_slot(&mut slot, false).await {
-            supervisor.shutdown.cancel();
-            drop(slot);
-            supervisor.drain_all().await;
-            if let Some(journal) = recovered_rollout.as_ref() {
-                if let Err(restore_error) = restore_rollout_links(&supervisor.config, journal) {
-                    error!(error = %restore_error, "failed to restore pre-rollout slot links");
-                }
-            }
-            let _ = fs::remove_file(supervisor.config.control_socket());
-            return Err(error);
-        }
+    let current = read_release_link(&supervisor.config.current_link())?;
+    {
+        let mut slot = supervisor.slots[0].lock().await;
+        slot.release = current;
+        supervisor.start_slot(&mut slot, false, true).await?;
+        atomic_symlink(&slot.release, &supervisor.config.slot_link(SlotId::A))?;
         reset_restart_backoff(&mut slot);
     }
-    if let Err(error) = supervisor.finalize_recovered_rollout().await {
-        supervisor.shutdown.cancel();
-        supervisor.drain_all().await;
-        if let Some(journal) = recovered_rollout.as_ref() {
-            if let Err(restore_error) = restore_rollout_links(&supervisor.config, journal) {
-                error!(error = %restore_error, "failed to restore pre-rollout slot links");
-            }
-        }
-        let _ = fs::remove_file(supervisor.config.control_socket());
-        return Err(error);
+    if recovered_rollout.is_some() {
+        supervisor.unfreeze_writes()?;
     }
     for slot in supervisor.slots.iter().cloned() {
         let watcher = supervisor.clone();
         tokio::spawn(async move { watcher.watch_slot(slot).await });
     }
+
+    let deploy_address: SocketAddr = supervisor.config.settings.server.admin_listen.parse()?;
+    let deploy_listener = TokioTcpListener::bind(deploy_address)
+        .await
+        .with_context(|| format!("failed to bind management listener on {deploy_address}"))?;
+    let deploy_supervisor = supervisor.clone();
+    let deploy = tokio::spawn(async move {
+        axum::serve(deploy_listener, deploy_router(deploy_supervisor)).await
+    });
 
     info!(path = %supervisor.config.control_socket().display(), "supervisor control socket listening");
     loop {
@@ -249,31 +492,67 @@ pub async fn run(config: SupervisorConfig) -> Result<()> {
         }
     }
     let _ = fs::remove_file(supervisor.config.control_socket());
+    deploy.abort();
     Ok(())
 }
 
 impl Supervisor {
-    async fn finalize_recovered_rollout(&self) -> Result<()> {
-        if !self.config.journal_file().exists() {
-            return Ok(());
+    async fn releases(&self) -> Result<Vec<ReleaseSnapshot>> {
+        let current = read_release_link(&self.config.current_link())?;
+        let active_index = self.active_slot.load(Ordering::Acquire);
+        let active = self.slots[active_index].lock().await.release.clone();
+        let mut releases = Vec::new();
+        for entry in fs::read_dir(&self.config.release_root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() || !entry.path().join("estuary").is_file() {
+                continue;
+            }
+            let release = entry.path().canonicalize()?;
+            releases.push(ReleaseSnapshot {
+                version: entry.file_name().to_string_lossy().into_owned(),
+                current: release == current,
+                active: release == active,
+                size_bytes: fs::metadata(release.join("estuary"))?.len(),
+            });
         }
-        let release_a = self.slots[0].lock().await.release.clone();
-        let release_b = self.slots[1].lock().await.release.clone();
-        if release_a != release_b {
-            warn!(
-                slot_a = %release_a.display(),
-                slot_b = %release_b.display(),
-                "mixed worker releases are running; management writes remain frozen"
-            );
-            return Ok(());
+        releases.sort_unstable_by(|a, b| b.version.cmp(&a.version));
+        Ok(releases)
+    }
+
+    async fn delete_release(&self, version: &str) -> Result<()> {
+        if !safe_version(version) {
+            bail!("invalid version");
         }
-        atomic_symlink(&release_a, &self.config.current_link())?;
-        self.unfreeze_writes()?;
-        info!(release = %release_a.display(), "recovered rollout after both workers started");
+        let target = validate_release_dir(
+            &self.config.release_root,
+            &self.config.release_root.join(version),
+        )?;
+        if read_release_link(&self.config.current_link())? == target {
+            bail!("cannot delete the current release");
+        }
+        for slot in self.slots.iter() {
+            let mut slot = slot.lock().await;
+            if slot
+                .child
+                .as_mut()
+                .is_some_and(|child| child.try_wait().ok().flatten().is_some())
+            {
+                slot.child = None;
+            }
+            if slot.child.is_some() && slot.release == target {
+                bail!("cannot delete a running release");
+            }
+        }
+        fs::remove_dir_all(target)?;
         Ok(())
     }
 
-    async fn start_slot(&self, slot: &mut SlotRuntime, require_ready: bool) -> Result<()> {
+    async fn start_slot(
+        &self,
+        slot: &mut SlotRuntime,
+        require_ready: bool,
+        activate: bool,
+    ) -> Result<()> {
         let binary = validate_release(&self.config.release_root, &slot.release)?;
         let listener = self
             .listener
@@ -318,14 +597,16 @@ impl Supervisor {
             stop_child(slot);
             return Err(error);
         }
-        self.worker_request(slot.id, Method::PUT, "/admin/api/process/activate")
-            .await
-            .context("failed to activate worker")?;
-        if require_ready {
+        if activate {
+            self.worker_request(slot.id, Method::PUT, "/admin/api/process/activate")
+                .await
+                .context("failed to activate worker")?;
+        }
+        if require_ready && activate {
             self.wait_for_http_ready(slot).await?;
             slot.must_be_ready = true;
         }
-        info!(slot = slot.id.name(), release = %slot.release.display(), "worker is accepting traffic");
+        info!(slot = slot.id.name(), release = %slot.release.display(), activate, "worker started");
         slot.started_at = Some(std::time::Instant::now());
         Ok(())
     }
@@ -378,6 +659,7 @@ impl Supervisor {
             if self
                 .client
                 .get(url)
+                .timeout(WORKER_CONTROL_TIMEOUT)
                 .send()
                 .await
                 .is_ok_and(|response| response.status() == StatusCode::OK)
@@ -398,7 +680,10 @@ impl Supervisor {
         path: &str,
     ) -> Result<serde_json::Value> {
         let url = format!("http://{}{}", self.config.slot_admin(slot), path);
-        let mut request = self.client.request(method, url);
+        let mut request = self
+            .client
+            .request(method, url)
+            .timeout(WORKER_CONTROL_TIMEOUT);
         if let Some(token) = self.config.settings.server.admin_token.as_deref() {
             request = request.bearer_auth(token);
         }
@@ -414,48 +699,6 @@ impl Supervisor {
             .json()
             .await
             .context("worker returned an invalid control response")
-    }
-
-    async fn roll_slot(&self, index: usize, target: &Path) -> Result<PathBuf> {
-        let slot_lock = Arc::clone(&self.slots[index]);
-        let mut slot = slot_lock.lock().await;
-        let previous = slot.release.clone();
-        if previous == target {
-            return Ok(previous);
-        }
-        let require_ready = self
-            .client
-            .get(format!(
-                "http://{}/health/ready",
-                self.config.slot_admin(slot.id)
-            ))
-            .send()
-            .await
-            .is_ok_and(|response| response.status() == StatusCode::OK);
-        slot.must_be_ready |= require_ready;
-
-        info!(slot = slot.id.name(), target = %target.display(), "draining worker for rollout");
-        self.worker_request(slot.id, Method::PUT, "/admin/api/process/drain")
-            .await?;
-        self.wait_for_exit(&mut slot).await?;
-        atomic_symlink(target, &self.config.slot_link(slot.id))?;
-        slot.release = target.to_path_buf();
-        if let Err(error) = self.start_slot(&mut slot, require_ready).await {
-            error!(slot = slot.id.name(), error = %error, "replacement failed; restoring previous worker");
-            atomic_symlink(&previous, &self.config.slot_link(slot.id))?;
-            slot.release.clone_from(&previous);
-            self.start_slot(&mut slot, require_ready)
-                .await
-                .with_context(|| {
-                    format!(
-                        "slot {} replacement and rollback both failed",
-                        slot.id.name()
-                    )
-                })?;
-            return Err(error);
-        }
-        reset_restart_backoff(&mut slot);
-        Ok(previous)
     }
 
     async fn wait_for_exit(&self, slot: &mut SlotRuntime) -> Result<()> {
@@ -486,30 +729,68 @@ impl Supervisor {
             .try_lock()
             .context("another rollout is already running")?;
         let target = validate_release_dir(&self.config.release_root, &target)?;
-        let previous_a = self.slots[0].lock().await.release.clone();
-        let previous_b = self.slots[1].lock().await.release.clone();
+        let active_index = self.active_slot.load(Ordering::Acquire);
+        let candidate_index = 1 - active_index;
+        let previous = self.slots[active_index].lock().await.release.clone();
+        if previous == target {
+            return Ok(());
+        }
         let mut journal = RolloutJournal {
             target: target.clone(),
-            previous_a: previous_a.clone(),
-            previous_b: previous_b.clone(),
+            previous_a: previous.clone(),
+            previous_b: previous,
             phase: "starting".to_owned(),
         };
         self.freeze_writes(&journal)?;
 
         let result = async {
-            "slot_a".clone_into(&mut journal.phase);
+            "warming".clone_into(&mut journal.phase);
             write_json_atomic(&self.config.journal_file(), &journal)?;
-            self.roll_slot(0, &target).await?;
-            "slot_b".clone_into(&mut journal.phase);
-            write_json_atomic(&self.config.journal_file(), &journal)?;
-            if let Err(error) = self.roll_slot(1, &target).await {
-                warn!(error = %error, "slot B failed; rolling slot A back to keep one version");
-                self.roll_slot(0, &previous_a)
+            let require_ready = {
+                let active = self.slots[active_index].lock().await;
+                self.client
+                    .get(format!(
+                        "http://{}/health/ready",
+                        self.config.slot_admin(active.id)
+                    ))
+                    .timeout(WORKER_CONTROL_TIMEOUT)
+                    .send()
                     .await
-                    .with_context(|| "slot B failed and slot A could not be rolled back")?;
-                return Err(error);
+                    .is_ok_and(|response| response.status() == StatusCode::OK)
+            };
+            let candidate_id = {
+                let mut candidate = self.slots[candidate_index].lock().await;
+                if candidate.child.is_some() {
+                    bail!("previous release is still draining");
+                }
+                candidate.release.clone_from(&target);
+                atomic_symlink(&target, &self.config.slot_link(candidate.id))?;
+                self.start_slot(&mut candidate, require_ready, false)
+                    .await?;
+                candidate.id
+            };
+            "switching".clone_into(&mut journal.phase);
+            write_json_atomic(&self.config.journal_file(), &journal)?;
+            self.worker_request(candidate_id, Method::PUT, "/admin/api/process/activate")
+                .await?;
+            if require_ready {
+                let mut candidate = self.slots[candidate_index].lock().await;
+                self.wait_for_http_ready(&mut candidate).await?;
+                candidate.must_be_ready = true;
             }
             atomic_symlink(&target, &self.config.current_link())?;
+            let active_id = self.slots[active_index].lock().await.id;
+            if let Err(error) = self
+                .worker_request(active_id, Method::PUT, "/admin/api/process/drain")
+                .await
+            {
+                atomic_symlink(&journal.previous_a, &self.config.current_link())?;
+                let _ = self
+                    .worker_request(candidate_id, Method::PUT, "/admin/api/process/drain")
+                    .await;
+                return Err(error).context("failed to drain previous worker");
+            }
+            self.active_slot.store(candidate_index, Ordering::Release);
             Ok(())
         }
         .await;
@@ -521,13 +802,13 @@ impl Supervisor {
                 Ok(())
             }
             Err(error) => {
-                let consistent = self.slots[0].lock().await.release == previous_a
-                    && self.slots[1].lock().await.release == previous_b;
-                if consistent {
-                    self.unfreeze_writes()?;
-                } else {
-                    warn!("workers remain on mixed releases; management writes stay frozen");
+                if candidate_index != self.active_slot.load(Ordering::Acquire) {
+                    let candidate_id = self.slots[candidate_index].lock().await.id;
+                    let _ = self
+                        .worker_request(candidate_id, Method::PUT, "/admin/api/process/drain")
+                        .await;
                 }
+                self.unfreeze_writes()?;
                 Err(error)
             }
         }
@@ -553,6 +834,11 @@ impl Supervisor {
             let Ok(mut slot) = slot_lock.try_lock() else {
                 continue;
             };
+            let active = self.active_slot.load(Ordering::Acquire)
+                == match slot.id {
+                    SlotId::A => 0,
+                    SlotId::B => 1,
+                };
             let exited = match slot.child.as_mut() {
                 Some(child) => match child.try_wait() {
                     Ok(Some(status)) => {
@@ -574,6 +860,7 @@ impl Supervisor {
                         "http://{}/health/ready",
                         self.config.slot_admin(slot.id)
                     ))
+                    .timeout(WORKER_CONTROL_TIMEOUT)
                     .send()
                     .await
                     .is_ok_and(|response| response.status() == StatusCode::OK);
@@ -588,7 +875,13 @@ impl Supervisor {
             }
             if exited {
                 slot.child = None;
+                if !active {
+                    continue;
+                }
                 schedule_restart(&mut slot);
+                continue;
+            }
+            if !active {
                 continue;
             }
             if std::time::Instant::now() < slot.restart_not_before {
@@ -604,7 +897,7 @@ impl Supervisor {
                     }
                 }
                 let require_ready = slot.must_be_ready;
-                if let Err(error) = self.start_slot(&mut slot, require_ready).await {
+                if let Err(error) = self.start_slot(&mut slot, require_ready, true).await {
                     error!(slot = slot.id.name(), %error, "worker restart failed");
                     schedule_restart(&mut slot);
                 }
@@ -658,6 +951,11 @@ impl Supervisor {
         let response = SupervisorResponse {
             ok,
             message,
+            active_slot: if self.active_slot.load(Ordering::Acquire) == 0 {
+                SlotId::A
+            } else {
+                SlotId::B
+            },
             slots: self.snapshots().await,
         };
         let mut encoded = serde_json::to_vec(&response)?;
@@ -755,7 +1053,7 @@ fn ensure_state_layout(config: &SupervisorConfig) -> Result<()> {
     })?;
     for slot in SlotId::ALL {
         let link = config.slot_link(slot);
-        if fs::symlink_metadata(&link).is_err() {
+        if read_release_link(&link).is_err() {
             atomic_symlink(&current, &link)?;
         }
     }
@@ -777,25 +1075,8 @@ fn recover_rollout_state(config: &SupervisorConfig) -> Result<Option<RolloutJour
         config.freeze_file(),
         b"interrupted binary rollout recovery\n",
     )?;
-    if a == b {
-        info!(release = %a.display(), "interrupted rollout will be finalized after both workers start");
-    } else {
-        warn!(slot_a = %a.display(), slot_b = %b.display(), "mixed worker releases detected; management writes remain frozen");
-    }
+    info!(slot_a = %a.display(), slot_b = %b.display(), "interrupted switch will recover the stable current release");
     Ok(Some(journal))
-}
-
-fn restore_rollout_links(config: &SupervisorConfig, journal: &RolloutJournal) -> Result<()> {
-    let previous_a = validate_release_dir(&config.release_root, &journal.previous_a)?;
-    let previous_b = validate_release_dir(&config.release_root, &journal.previous_b)?;
-    atomic_symlink(&previous_a, &config.slot_link(SlotId::A))?;
-    atomic_symlink(&previous_b, &config.slot_link(SlotId::B))?;
-    warn!(
-        slot_a = %previous_a.display(),
-        slot_b = %previous_b.display(),
-        "restored pre-rollout slot links after recovery startup failed"
-    );
-    Ok(())
 }
 
 fn bind_control_socket(path: &Path) -> Result<UnixListener> {
@@ -851,10 +1132,7 @@ fn stage_release(release_root: &Path, binary: &Path) -> Result<PathBuf> {
         .split_whitespace()
         .nth(1)
         .context("candidate did not report a version")?;
-    if !version
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
-    {
+    if !safe_version(version) {
         bail!("candidate reported an unsafe version: {version}");
     }
     fs::create_dir_all(release_root)?;
@@ -880,6 +1158,13 @@ fn stage_release(release_root: &Path, binary: &Path) -> Result<PathBuf> {
     release
         .canonicalize()
         .context("failed to resolve staged release")
+}
+
+fn safe_version(version: &str) -> bool {
+    !version.is_empty()
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
 }
 
 fn file_hash(path: &Path) -> Result<blake3::Hash> {
@@ -1029,6 +1314,50 @@ mod tests {
         assert!(validate_release_dir(&root, &root.join("valid")).is_ok());
         assert!(validate_release_dir(&root, &root.join("valid/nested")).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_repairs_a_slot_link_after_its_release_was_deleted() {
+        let root = std::env::temp_dir().join(format!("estuary-layout-{}", uuid::Uuid::now_v7()));
+        let releases = root.join("releases");
+        let current = releases.join("current");
+        let deleted = releases.join("deleted");
+        let state = root.join("state");
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(state.join("slots/a")).unwrap();
+        fs::create_dir_all(state.join("slots/b")).unwrap();
+        atomic_symlink(&current, &state.join("current")).unwrap();
+        atomic_symlink(&deleted, &state.join("slots/a/current")).unwrap();
+
+        let config = SupervisorConfig {
+            settings: Settings::default(),
+            database: root.join("estuary.db"),
+            release_root: releases,
+            state_root: state,
+            runtime_dir: root.join("run"),
+            slot_a_admin: "127.0.0.1:19091".parse().unwrap(),
+            slot_b_admin: "127.0.0.1:19092".parse().unwrap(),
+            start_timeout: Duration::from_secs(1),
+            drain_timeout: Duration::from_secs(1),
+        };
+        ensure_state_layout(&config).unwrap();
+        assert_eq!(
+            read_release_link(&config.slot_link(SlotId::A)).unwrap(),
+            current
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deploy_authorization_accepts_bearer_and_basic_passwords() {
+        assert_eq!(
+            deploy_authorization_token("Bearer secret").as_deref(),
+            Some("secret")
+        );
+        assert_eq!(
+            deploy_authorization_token("Basic dXNlcjpzZWNyZXQ=").as_deref(),
+            Some("secret")
+        );
     }
 
     #[test]

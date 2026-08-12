@@ -193,16 +193,16 @@ responses continue. The process exits when they finish or when
 
 ## Supervisor and Rollout
 
-The production supervisor binds the public socket once and passes it directly to
-two worker processes. Workers accept from the same kernel queue; inference bytes
-do not pass through the supervisor. Each worker has process-local routing state
-and shares the local SQLite database.
+The production deployment process binds the public socket once and passes it
+directly to the active worker. Inference bytes do not pass through the deployment
+process. The stable management listener forwards control-plane traffic to the
+active worker and serves the version manager at `/deploy/`.
 
-Rollout drains and replaces slot A, then slot B. The other slot continues to
-accept while one is replaced. New workers start paused, initialize their
-control-plane state, pass the required readiness gate, and activate the inherited
-listener. Management writes are frozen for the transaction. Replacement failure
-restores the previous worker, and a slot-B failure also rolls slot A back.
+During a switch, a candidate starts paused, initializes its control-plane state,
+passes the required readiness gate, and activates the inherited listener. The
+previous worker then stops accepting and drains existing responses. Management
+writes are frozen for the short transition. Candidate failure leaves the active
+worker unchanged.
 
 The running supervisor is not replaced by worker rollout. Its stable `current`
 link selects the new binary after the next external process restart. A supervisor

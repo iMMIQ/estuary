@@ -3,10 +3,11 @@
 [Documentation index](../docs/README.md) | [Architecture](../docs/architecture.md) |
 [Configuration and operations](../docs/operations.md)
 
-Estuary's production process model is one supervisor with two fixed worker
-slots. The supervisor owns the stable public socket and passes it directly to
-both workers. A rollout drains and replaces one worker at a time while the other
-continues to accept from the kernel queue.
+Estuary's production process model is one stable deployment process and one
+active gateway worker. The deployment process owns the public socket and passes
+it directly to the active worker, so inference bytes do not cross a proxy. A
+version switch warms a candidate worker, activates it, then drains the previous
+worker without interrupting accepted requests.
 
 The database, release state, and runtime files must be on a local Linux
 filesystem. Do not use NFS for SQLite or its WAL files.
@@ -25,7 +26,7 @@ The installer creates:
 | Path | Contents |
 | --- | --- |
 | `/opt/estuary/releases` | Immutable versioned binaries. |
-| `/opt/estuary/state` | Stable current and A/B slot links plus rollout journal. |
+| `/opt/estuary/state` | Current version, alternating worker slots, and switch journal. |
 | `/opt/estuary/bin/run` | Foreground supervisor launcher. |
 | `/var/lib/estuary` | SQLite database and runtime directory. |
 | `/etc/estuary/common.env` | Process configuration. |
@@ -46,9 +47,22 @@ For an interactive start:
 sudo -u estuary /opt/estuary/bin/run
 ```
 
-The public listener defaults to `:8080`; the slot-A management listener defaults
-to `127.0.0.1:9090`. Configure the first upstream at
-`http://127.0.0.1:9090/admin/`.
+The public listener defaults to `:8080`. The stable management listener defaults
+to `127.0.0.1:9090`: configure gateways at `/admin/` and manage executable
+versions at `/deploy/`.
+
+## Version Management
+
+Open `http://127.0.0.1:9090/deploy/` to upload a static Estuary binary, list
+installed versions, switch to any compatible version, or delete an inactive
+version. The deployment API uses the same `ESTUARY_ADMIN_TOKEN` authentication
+as the gateway management interface.
+
+Uploaded files are size-limited, written to a temporary file, synced, validated
+with `estuary --version`, content-checked when a version already exists, and
+then installed into the immutable release directory. Uploading an executable is
+equivalent to granting code execution and the management listener must remain
+private.
 
 ## Binary Rollout
 
@@ -58,19 +72,18 @@ Deploy a new static binary without restarting the supervisor:
 sudo ./deploy/rollout.sh ./estuary
 ```
 
-The rollout client validates `--version`, content-checks an existing version,
-stages and fsyncs the candidate, and requests a serialized A/B rollout:
+The rollout client remains available for local automation. It performs the same
+validation and requests a serialized version switch:
 
 1. Management writes are frozen and a rollout journal is persisted.
-2. Slot A stops accepting and drains every accepted response.
-3. Its replacement starts paused, initializes, passes the readiness requirement,
-   and activates the inherited public listener.
-4. Slot B repeats the same transition.
+2. The candidate starts paused and passes the current readiness requirement.
+3. The candidate activates the inherited public listener.
+4. The previous worker stops accepting and drains every accepted response.
 5. The stable `current` link is updated and management writes resume.
 
-If a replacement fails, its previous binary is restored. If slot B fails after
-slot A succeeded, slot A is also rolled back. A worker exceeding the rollout
-drain deadline is left alive and drained; it is not killed to complete a deploy.
+If candidate startup fails, the active worker is unchanged. After a successful
+switch, the previous worker may remain visible while long responses drain; a
+second switch is rejected until that worker exits.
 
 Inspect supervisor and worker state:
 
@@ -78,9 +91,8 @@ Inspect supervisor and worker state:
 /opt/estuary/state/current/estuary status
 ```
 
-If the supervisor restarts during rollout, equal slot links are reconciled and
-the transaction is finalized. Mixed links keep management writes frozen until a
-later rollout converges both slots.
+If the deployment process restarts during a switch, it starts the stable
+`current` version and clears the interrupted switch journal.
 
 The running supervisor itself is not replaced during worker rollout. The new
 `current` binary becomes supervisor on the next process-manager restart.
@@ -162,21 +174,20 @@ docker exec estuary /opt/estuary/state/current/estuary status
 docker exec --user root estuary rm /tmp/estuary.new
 ```
 
-Use the official static binary matching the container architecture. The release
-volume is root-owned, so only an operator with Docker-level privilege can stage
-a new executable; workers continue to run as the unprivileged `estuary` user.
+Use the official static binary matching the container architecture. The
+deployment process and workers run as the unprivileged `estuary` user; the
+release directory is writable only by that account inside the container.
 
 ## Capacity and Security
 
-- Both workers have process-local node semaphores. Set a node's
-  `max_concurrency` to half of its intended host-wide concurrency.
-- Capacity is reduced while one worker drains; old and new generations never
-  overlap in the same slot.
+- One worker accepts new traffic in steady state, so configured concurrency and
+  in-memory connection statistics apply to the whole host.
+- Old and new generations overlap only while the previous worker drains.
 - Protect `/var/lib/estuary`: upstream keys and custom header values are stored
   as plaintext in SQLite.
 - Keep the management listener private and use `ESTUARY_ADMIN_TOKEN` whenever it
   is not loopback-only.
 - The public listener has no inbound authentication and should be restricted or
   placed behind an authenticating proxy.
-- Container or host failure is outside the two-worker rollout boundary; the
+- Container or host failure is outside the version-switch boundary; the
   external process manager or Docker restart policy restores the supervisor.

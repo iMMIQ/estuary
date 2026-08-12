@@ -158,6 +158,6 @@ configured withdrawal delay, stops accepting public connections, and drains
 accepted queues and response bodies until the shutdown grace expires.
 
 Concurrency limits, queues, health state, circuit state, and prefix directories
-are process-local. The built-in supervisor runs two workers, so each node's
-configured `max_concurrency` should normally be half of the intended host-wide
-limit. See [deployment](../deploy/README.md) for the supported rollout topology.
+are process-local. The built-in deployment process keeps one active worker in
+steady state and briefly overlaps generations while the previous worker drains.
+See [deployment](../deploy/README.md) for the supported rollout topology.
