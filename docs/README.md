@@ -11,6 +11,7 @@ use. The maintained technical documentation is organized by task:
 | [Native vLLM provider](vllm.md) | vLLM version requirements, telemetry, tokenization, KV events, and client compatibility. |
 | [Deployment](../deploy/README.md) | Static binary installation, Docker, zero-downtime rollout, rollback, and persistent paths. |
 | [Performance benchmark](performance.md) | Reproducible gateway-overhead benchmark commands and output. |
+| [Code quality review](code-quality.md) | Review findings, completed debt cleanup, remaining risks, and verification results. |
 
 The executable is authoritative for runtime flags and environment variables:
 

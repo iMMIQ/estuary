@@ -124,26 +124,11 @@ impl NodeStore {
     }
 
     pub fn insert(&self, config: &NodeConfig) -> Result<StoredNode> {
-        validate_node_config(config)?;
-        let encoded = serde_json::to_string(config)?;
-        let now = unix_millis();
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction
-            .execute(
-                "INSERT INTO node_configs (
-                    id, config_json, revision, created_at_unix_ms, updated_at_unix_ms
-                 ) VALUES (?1, ?2, 1, ?3, ?3)",
-                params![config.id, encoded, now],
-            )
-            .with_context(|| format!("failed to insert node {:?}", config.id))?;
+        let stored = insert_node(&transaction, config)?;
         transaction.commit()?;
-        Ok(StoredNode {
-            config: config.clone(),
-            revision: 1,
-            created_at_unix_ms: now,
-            updated_at_unix_ms: now,
-        })
+        Ok(stored)
     }
 
     pub fn update(
@@ -200,12 +185,23 @@ impl NodeStore {
     }
 
     pub fn seed_if_empty(&self, nodes: &[NodeConfig]) -> Result<()> {
-        if nodes.is_empty() || !self.list()?.is_empty() {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connection.lock();
+        // Check emptiness and write the entire seed under one database write lock.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let populated: bool =
+            transaction.query_row("SELECT EXISTS(SELECT 1 FROM node_configs)", [], |row| {
+                row.get(0)
+            })?;
+        if populated {
             return Ok(());
         }
         for node in nodes {
-            self.insert(node)?;
+            insert_node(&transaction, node)?;
         }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -261,6 +257,26 @@ impl NodeStore {
     }
 }
 
+fn insert_node(connection: &Connection, config: &NodeConfig) -> Result<StoredNode> {
+    validate_node_config(config)?;
+    let encoded = serde_json::to_string(config)?;
+    let now = unix_millis();
+    connection
+        .execute(
+            "INSERT INTO node_configs (
+                id, config_json, revision, created_at_unix_ms, updated_at_unix_ms
+             ) VALUES (?1, ?2, 1, ?3, ?3)",
+            params![config.id, encoded, now],
+        )
+        .with_context(|| format!("failed to insert node {:?}", config.id))?;
+    Ok(StoredNode {
+        config: config.clone(),
+        revision: 1,
+        created_at_unix_ms: now,
+        updated_at_unix_ms: now,
+    })
+}
+
 fn decode_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNode> {
     let encoded: String = row.get(0)?;
     let config = serde_json::from_str(&encoded).map_err(|error| {
@@ -300,6 +316,36 @@ mod tests {
             models: HashMap::from([("public".to_owned(), "upstream".to_owned())]),
             ..NodeConfig::default()
         }
+    }
+
+    #[test]
+    fn failed_seed_rolls_back_nodes_and_control_revision() {
+        let store = NodeStore::memory().unwrap();
+        let revision = store.revision().unwrap();
+        assert!(store.seed_if_empty(&[node(), node()]).is_err());
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(store.revision().unwrap(), revision);
+
+        let mut second = node();
+        second.id = "node-b".to_owned();
+        store.seed_if_empty(&[node(), second]).unwrap();
+        assert_eq!(store.list().unwrap().len(), 2);
+        assert_eq!(store.revision().unwrap(), revision + 2);
+
+        store.seed_if_empty(&[NodeConfig::default()]).unwrap();
+        assert_eq!(store.list().unwrap().len(), 2);
+        assert_eq!(store.revision().unwrap(), revision + 2);
+    }
+
+    #[test]
+    fn invalid_seed_does_not_leave_partial_configuration() {
+        let store = NodeStore::memory().unwrap();
+        assert!(
+            store
+                .seed_if_empty(&[node(), NodeConfig::default()])
+                .is_err()
+        );
+        assert!(store.list().unwrap().is_empty());
     }
 
     #[test]

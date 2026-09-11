@@ -2,6 +2,10 @@ import type { NodeConfig, NodeDraft, NodeRecord, Pair, ProviderKind } from "./ty
 
 export type DraftErrors = Record<string, string>;
 
+function integerAtLeast(value: number, minimum: number): boolean {
+  return Number.isSafeInteger(value) && value >= minimum;
+}
+
 export function pairsToRecord(pairs: Pair[]): Record<string, string> {
   return Object.fromEntries(
     pairs
@@ -114,7 +118,7 @@ export function validateDraft(draft: NodeDraft): DraftErrors {
   }
 
   if (!draft.health_path.trim()) errors.health_path = "validation.healthPathRequired";
-  if (!Number.isFinite(draft.max_concurrency) || draft.max_concurrency < 1) {
+  if (!integerAtLeast(draft.max_concurrency, 1)) {
     errors.max_concurrency = "validation.concurrency";
   }
   if (!Number.isFinite(draft.weight) || draft.weight <= 0) {
@@ -141,17 +145,22 @@ export function validateDraft(draft: NodeDraft): DraftErrors {
     ] as const) {
       if (!value.startsWith("/")) errors[key] = "validation.pathSlash";
     }
-    if (draft.provider.monitor_interval_ms < 100) errors.monitor_interval_ms = "validation.min100ms";
-    if (draft.provider.request_timeout_ms < 1) errors.request_timeout_ms = "validation.min1ms";
-    if (draft.provider.telemetry_stale_ms < draft.provider.monitor_interval_ms) {
+    if (!integerAtLeast(draft.provider.monitor_interval_ms, 100)) errors.monitor_interval_ms = "validation.min100ms";
+    if (!integerAtLeast(draft.provider.request_timeout_ms, 1)) errors.request_timeout_ms = "validation.min1ms";
+    if (!integerAtLeast(draft.provider.telemetry_stale_ms, 1)) {
+      errors.telemetry_stale_ms = "validation.min1ms";
+    } else if (draft.provider.telemetry_stale_ms < draft.provider.monitor_interval_ms) {
       errors.telemetry_stale_ms = "validation.telemetryInterval";
     }
-    if (draft.provider.waiting_threshold < 1) errors.waiting_threshold = "validation.min1";
+    if (!integerAtLeast(draft.provider.waiting_threshold, 1)) errors.waiting_threshold = "validation.min1";
+    if (!integerAtLeast(draft.provider.tokenize_cache_entries, 1) || draft.provider.tokenize_cache_entries > 65536) {
+      errors.tokenize_cache_entries = "validation.tokenizeEntries";
+    }
     if (draft.provider.kv_events) {
-      if (draft.provider.kv_events.reconnect_ms < 1) errors.kv_reconnect_ms = "validation.min1ms";
-      if (draft.provider.kv_events.max_blocks < 1) errors.kv_max_blocks = "validation.min1";
-      if (draft.provider.kv_events.max_directory_bytes < 1) errors.kv_max_directory_bytes = "validation.min1byte";
-      if (draft.provider.kv_events.max_event_bytes < 1) errors.kv_max_event_bytes = "validation.min1byte";
+      if (!integerAtLeast(draft.provider.kv_events.reconnect_ms, 1)) errors.kv_reconnect_ms = "validation.min1ms";
+      if (!integerAtLeast(draft.provider.kv_events.max_blocks, 1)) errors.kv_max_blocks = "validation.min1";
+      if (!integerAtLeast(draft.provider.kv_events.max_directory_bytes, 1)) errors.kv_max_directory_bytes = "validation.min1byte";
+      if (!integerAtLeast(draft.provider.kv_events.max_event_bytes, 1)) errors.kv_max_event_bytes = "validation.min1byte";
     }
   }
 

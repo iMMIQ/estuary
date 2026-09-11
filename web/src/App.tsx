@@ -26,7 +26,7 @@ import {
   Waves,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import * as api from "./api";
@@ -36,6 +36,7 @@ import { NodeEditor, type EditorState } from "./NodeEditor";
 import { createDraft, draftToConfig, formatCompactNumber, recordToDraft, shouldClearApiKey } from "./node-config";
 import type { GatewayStatus, NodeRecord } from "./types";
 import { formatBytes, StatusBadge } from "./ui";
+import { useControlPlane } from "./use-control-plane";
 
 type View = "overview" | "upstreams";
 type NodeFilter = "all" | "accepting" | "attention" | "draining" | "not_ready";
@@ -394,12 +395,7 @@ function Upstreams({
 export default function App() {
   const { t, i18n } = useTranslation();
   const [view, setView] = useState<View>("overview");
-  const [nodes, setNodes] = useState<NodeRecord[]>([]);
-  const [status, setStatus] = useState<GatewayStatus | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [connectionError, setConnectionError] = useState<string | null>(null);
-  const [lastSync, setLastSync] = useState<number | null>(null);
+  const { nodes, status, loading, refreshing, connectionError, lastSync, refresh } = useControlPlane();
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -407,33 +403,12 @@ export default function App() {
   const [toast, setToast] = useState<ToastState | null>(null);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<NodeFilter>("all");
-  const refreshSequence = useRef(0);
 
   useEffect(() => {
     const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
     document.documentElement.lang = locale;
     document.title = t("app.title");
   }, [i18n.resolvedLanguage, t]);
-
-  const refresh = useCallback(async (quiet = false) => {
-    const sequence = ++refreshSequence.current;
-    if (!quiet) setRefreshing(true);
-    const [nodeResult, statusResult] = await Promise.allSettled([api.listNodes(), api.getStatus()]);
-    if (sequence !== refreshSequence.current) return;
-    if (nodeResult.status === "fulfilled") setNodes(nodeResult.value);
-    if (statusResult.status === "fulfilled") setStatus(statusResult.value);
-    const failure = nodeResult.status === "rejected" ? nodeResult.reason : statusResult.status === "rejected" ? statusResult.reason : null;
-    setConnectionError(failure instanceof Error ? failure.message : failure ? t("controlPlane.unavailable") : null);
-    if (!failure) setLastSync(Date.now());
-    setLoading(false);
-    setRefreshing(false);
-  }, [t]);
-
-  useEffect(() => {
-    void refresh(true);
-    const interval = window.setInterval(() => void refresh(true), 5000);
-    return () => window.clearInterval(interval);
-  }, [refresh]);
 
   useEffect(() => {
     if (!toast) return;

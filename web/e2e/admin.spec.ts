@@ -180,6 +180,58 @@ async function mockControlPlane(
   return nodes;
 }
 
+test("keeps slow polling results without starting overlapping requests", async ({ page }) => {
+  await page.clock.install({ time: new Date("2026-01-01T00:00:00Z") });
+  await page.clock.pauseAt(new Date("2026-01-01T00:01:00Z"));
+  await mockControlPlane(page);
+  let requests = 0;
+  let release!: () => void;
+  const delayed = new Promise<void>((resolve) => { release = resolve; });
+  await page.route("**/admin/api/nodes", async (route) => {
+    requests += 1;
+    await delayed;
+    await route.fulfill({ json: { nodes: [record(nodeConfig("slow-node"))] } });
+  });
+  await page.goto("/admin/");
+  await expect.poll(() => requests).toBeGreaterThan(0);
+  const initialRequests = requests;
+  await page.clock.runFor(10000);
+  expect(requests).toBe(initialRequests);
+  release();
+  await page.locator("button:visible").filter({ hasText: /^Upstreams$/ }).click();
+  await expect(page.getByText("slow-node", { exact: true })).toBeVisible();
+  await page.clock.runFor(5000);
+  await expect.poll(() => requests).toBe(initialRequests + 1);
+});
+
+test("manual refresh supersedes pending data and preserves a healthy partial result", async ({ page }) => {
+  await page.clock.install({ time: new Date("2026-01-01T00:00:00Z") });
+  await page.clock.pauseAt(new Date("2026-01-01T00:01:00Z"));
+  await mockControlPlane(page);
+  let pendingRequests = 0;
+  let release!: () => void;
+  const delayed = new Promise<void>((resolve) => { release = resolve; });
+  await page.route("**/admin/api/nodes", async (route) => {
+    pendingRequests += 1;
+    await delayed;
+    await route.fulfill({ json: { nodes: [record(nodeConfig("stale-node"))] } });
+  });
+  await page.goto("/admin/");
+  await expect.poll(() => pendingRequests).toBeGreaterThan(0);
+  await page.route("**/admin/api/nodes", (route) => route.fulfill({ json: { nodes: [record(nodeConfig("fresh-node"))] } }));
+  await page.route("**/admin/api/status", (route) => route.fulfill({ status: 503, json: { error: { message: "Status unavailable" } } }));
+  await page.getByRole("button", { name: "Refresh", exact: true }).click();
+  await page.locator("button:visible").filter({ hasText: /^Upstreams$/ }).click();
+  await expect(page.getByText("fresh-node", { exact: true })).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText("Status unavailable");
+  release();
+  await page.clock.runFor(5000);
+  await expect(page.getByText("stale-node", { exact: true })).toHaveCount(0);
+  await page.route("**/admin/api/status", (route) => route.fulfill({ json: status(1) }));
+  await page.getByRole("button", { name: "Retry", exact: true }).click();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
 test("creates an upstream through the management workflow", async ({ page }) => {
   const nodes = await mockControlPlane(page);
   await page.goto("/admin/");

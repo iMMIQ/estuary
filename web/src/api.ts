@@ -37,12 +37,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
-export async function listNodes(): Promise<NodeRecord[]> {
-  return (await request<NodeListResponse>("/admin/api/nodes")).nodes;
+function readOptions(signal?: AbortSignal): RequestInit {
+  const timeout = AbortSignal.timeout(15000);
+  return { signal: signal ? AbortSignal.any([signal, timeout]) : timeout };
 }
 
-export function getStatus(): Promise<GatewayStatus> {
-  return request("/admin/api/status");
+export async function listNodes(signal?: AbortSignal): Promise<NodeRecord[]> {
+  return (await request<NodeListResponse>("/admin/api/nodes", readOptions(signal))).nodes;
+}
+
+export function getStatus(signal?: AbortSignal): Promise<GatewayStatus> {
+  return request("/admin/api/status", readOptions(signal));
 }
 
 export function setIpLimit(ip: string, limit: number): Promise<unknown> {

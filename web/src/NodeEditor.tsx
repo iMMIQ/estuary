@@ -222,7 +222,7 @@ export function NodeEditor({
                 <NumberInput label={t("editor.requestTimeout")} min={1} value={draft.provider.request_timeout_ms} error={errorText(errors.request_timeout_ms)} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, request_timeout_ms: numeric(value) } }))} />
                 <NumberInput label={t("editor.telemetryStale")} min={1} value={draft.provider.telemetry_stale_ms} error={errorText(errors.telemetry_stale_ms)} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, telemetry_stale_ms: numeric(value) } }))} />
                 <NumberInput label={t("editor.waitingWatermark")} min={1} value={draft.provider.waiting_threshold} error={errorText(errors.waiting_threshold)} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, waiting_threshold: numeric(value) } }))} />
-                <NumberInput label={t("editor.tokenizeEntries")} min={1} value={draft.provider.tokenize_cache_entries} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, tokenize_cache_entries: numeric(value) } }))} />
+                <NumberInput label={t("editor.tokenizeEntries")} min={1} max={65536} allowDecimal={false} value={draft.provider.tokenize_cache_entries} error={errorText(errors.tokenize_cache_entries)} onChange={(value) => update((current) => ({ ...current, provider: { ...current.provider, tokenize_cache_entries: numeric(value) } }))} />
               </>}
             </div>
           </section>

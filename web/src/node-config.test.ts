@@ -138,4 +138,34 @@ describe("node config mapping", () => {
     draft.models = [{ key: "chat", value: "model" }];
     expect(validateDraft(draft)).toEqual({});
   });
+
+  test.each([NaN, Infinity, -Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1])("rejects invalid integer limits: %s", (value) => {
+    const draft = createDraft();
+    draft.max_concurrency = value;
+    draft.provider.monitor_interval_ms = value;
+    draft.provider.request_timeout_ms = value;
+    draft.provider.telemetry_stale_ms = value;
+    draft.provider.waiting_threshold = value;
+    draft.provider.tokenize_cache_entries = value;
+    draft.provider.kv_events = {
+      endpoint: "tcp://127.0.0.1:5557", replay_endpoint: null, topic: "",
+      reconnect_ms: value, max_blocks: value, max_directory_bytes: value, max_event_bytes: value,
+    };
+    const errors = validateDraft(draft);
+    for (const field of ["max_concurrency", "monitor_interval_ms", "request_timeout_ms", "telemetry_stale_ms", "waiting_threshold", "tokenize_cache_entries", "kv_reconnect_ms", "kv_max_blocks", "kv_max_directory_bytes", "kv_max_event_bytes"]) {
+      expect(errors[field]).toBeDefined();
+    }
+  });
+
+  test("bounds tokenization cache entries to the server limit", () => {
+    const draft = createDraft();
+    for (const value of [0, 65537]) {
+      draft.provider.tokenize_cache_entries = value;
+      expect(validateDraft(draft).tokenize_cache_entries).toBeDefined();
+    }
+    for (const value of [1, 65536]) {
+      draft.provider.tokenize_cache_entries = value;
+      expect(validateDraft(draft).tokenize_cache_entries).toBeUndefined();
+    }
+  });
 });
