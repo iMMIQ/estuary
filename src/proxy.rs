@@ -209,10 +209,10 @@ async fn proxy_inner(
     if is_inference_json && public_model.is_none() {
         return Err(GatewayError::MissingModel);
     }
-    if let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_mut()) {
-        if !state.scheduler.model_supports_multimodal(model) {
-            body_changed |= replace_unsupported_images(parsed, model) > 0;
-        }
+    if let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_mut())
+        && !state.scheduler.model_supports_multimodal(model)
+    {
+        body_changed |= replace_unsupported_images(parsed, model) > 0;
     }
 
     let original_body = if body_changed {
@@ -272,69 +272,74 @@ async fn proxy_inner(
         routing_parsed.as_ref().or(parsed.as_ref()),
         &state.settings.routing.prefix,
     );
-    if endpoint != "messages/count_tokens" {
-        if let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_ref()) {
-            let salted = parsed
-                .get("cache_salt")
-                .is_some_and(|value| !value.is_null());
-            let exact_cache_available = state.vllm.has_exact_cache_for_model(model);
-            let prefix_worth_tokenizing = exact_cache_available
-                && state
-                    .scheduler
-                    .approximate_prefix_worth_tokenizing(&prefix_input);
-            let tokenization = if protocol == ClientProtocol::Anthropic {
-                if salted {
-                    crate::vllm::RoutingTokenization::skipped("cache_salt")
-                } else if !exact_cache_available {
-                    crate::vllm::RoutingTokenization::skipped("directory_unavailable")
-                } else if !prefix_worth_tokenizing {
-                    crate::vllm::RoutingTokenization::skipped("prefix_gate")
-                } else {
-                    match anthropic_payloads
-                        .as_mut()
-                        .expect("Anthropic requests have adapter state")
-                        .prepare(AnthropicProtocol::Chat, parsed)
-                    {
-                        Ok(Some(payload)) => {
-                            state
-                                .vllm
-                                .tokenize_for_routing(
-                                    &state.client,
-                                    &payload.endpoint,
-                                    model,
-                                    &payload.parsed,
-                                    true,
-                                )
-                                .await
-                        }
-                        Ok(None) => unreachable!("Chat preparation produces a payload"),
-                        Err(_) => crate::vllm::RoutingTokenization::skipped("adapter_unsupported"),
-                    }
-                }
-            } else if salted {
+    if endpoint != "messages/count_tokens"
+        && let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_ref())
+    {
+        let salted = parsed
+            .get("cache_salt")
+            .is_some_and(|value| !value.is_null());
+        let exact_cache_available = state.vllm.has_exact_cache_for_model(model)
+            && !state
+                .scheduler
+                .nodes()
+                .iter()
+                .any(|node| node.model_family(model) == crate::config::ModelFamily::Deepseek);
+        let prefix_worth_tokenizing = exact_cache_available
+            && state
+                .scheduler
+                .approximate_prefix_worth_tokenizing(&prefix_input);
+        let tokenization = if protocol == ClientProtocol::Anthropic {
+            if salted {
                 crate::vllm::RoutingTokenization::skipped("cache_salt")
-            } else if !matches!(endpoint.as_str(), "chat/completions" | "completions") {
-                crate::vllm::RoutingTokenization::skipped("unsupported")
             } else if !exact_cache_available {
                 crate::vllm::RoutingTokenization::skipped("directory_unavailable")
+            } else if !prefix_worth_tokenizing {
+                crate::vllm::RoutingTokenization::skipped("prefix_gate")
             } else {
-                state
-                    .vllm
-                    .tokenize_for_routing(
-                        &state.client,
-                        &endpoint,
-                        model,
-                        parsed,
-                        prefix_worth_tokenizing,
-                    )
-                    .await
-            };
-            state
-                .metrics
-                .tokenization(tokenization.outcome, tokenization.elapsed);
-            if let Some(tokens) = tokenization.tokens {
-                prefix_input.set_token_ids(tokens);
+                match anthropic_payloads
+                    .as_mut()
+                    .expect("Anthropic requests have adapter state")
+                    .prepare(AnthropicProtocol::Chat, parsed)
+                {
+                    Ok(Some(payload)) => {
+                        state
+                            .vllm
+                            .tokenize_for_routing(
+                                &state.client,
+                                &payload.endpoint,
+                                model,
+                                &payload.parsed,
+                                true,
+                            )
+                            .await
+                    }
+                    Ok(None) => unreachable!("Chat preparation produces a payload"),
+                    Err(_) => crate::vllm::RoutingTokenization::skipped("adapter_unsupported"),
+                }
             }
+        } else if salted {
+            crate::vllm::RoutingTokenization::skipped("cache_salt")
+        } else if !matches!(endpoint.as_str(), "chat/completions" | "completions") {
+            crate::vllm::RoutingTokenization::skipped("unsupported")
+        } else if !exact_cache_available {
+            crate::vllm::RoutingTokenization::skipped("directory_unavailable")
+        } else {
+            state
+                .vllm
+                .tokenize_for_routing(
+                    &state.client,
+                    &endpoint,
+                    model,
+                    parsed,
+                    prefix_worth_tokenizing,
+                )
+                .await
+        };
+        state
+            .metrics
+            .tokenization(tokenization.outcome, tokenization.elapsed);
+        if let Some(tokens) = tokenization.tokens {
+            prefix_input.set_token_ids(tokens);
         }
     }
 
@@ -458,10 +463,10 @@ fn apply_vllm_native_thinking_compat(
             GatewayError::InvalidRequest("vLLM chat_template_kwargs must be an object".to_owned())
         })?;
     template_kwargs.insert("enable_thinking".to_owned(), Value::Bool(enable_thinking));
-    if let Some(thinking) = object.get_mut("thinking").and_then(Value::as_object_mut) {
-        if thinking.get("display").and_then(Value::as_str) == Some("omitted") {
-            thinking.remove("display");
-        }
+    if let Some(thinking) = object.get_mut("thinking").and_then(Value::as_object_mut)
+        && thinking.get("display").and_then(Value::as_str) == Some("omitted")
+    {
+        thinking.remove("display");
     }
     Ok(approximated_budget)
 }
@@ -693,6 +698,7 @@ fn prepared_payload(endpoint: &str, parsed: Value) -> PreparedPayload {
 #[derive(Clone, Debug)]
 enum UpstreamResponseMode {
     Passthrough,
+    Deepseek(Arc<crate::deepseek::Prepared>),
     Codex {
         namespaces: Arc<codex::NamespaceMap>,
     },
@@ -710,6 +716,9 @@ enum UpstreamResponseMode {
 
 impl UpstreamResponseMode {
     fn is_anthropic(&self) -> bool {
+        if let Self::Deepseek(prepared) = self {
+            return prepared.is_messages();
+        }
         matches!(
             self,
             Self::ChatToAnthropic { .. }
@@ -734,6 +743,7 @@ impl UpstreamResponseMode {
 }
 
 enum ResponseStreamAdapter {
+    Deepseek(Box<crate::deepseek::Converter>),
     Codex(codex::StreamRewriter),
     Chat(anthropic::StreamConverter),
     Responses(anthropic_responses::StreamConverter),
@@ -741,8 +751,9 @@ enum ResponseStreamAdapter {
 }
 
 impl ResponseStreamAdapter {
-    fn push_event(&mut self, event: sse::Event) -> Result<Vec<sse::Event>, GatewayError> {
+    async fn push_event(&mut self, event: sse::Event) -> Result<Vec<sse::Event>, GatewayError> {
         match self {
+            Self::Deepseek(converter) => converter.push_event(&event).await,
             Self::Codex(rewriter) => rewriter.push_event(event),
             Self::Chat(converter) => converter.push_event(&event),
             Self::Responses(converter) => converter.push_event(&event),
@@ -750,8 +761,9 @@ impl ResponseStreamAdapter {
         }
     }
 
-    fn finish(&mut self) -> Result<Vec<sse::Event>, GatewayError> {
+    async fn finish(&mut self) -> Result<Vec<sse::Event>, GatewayError> {
         match self {
+            Self::Deepseek(converter) => converter.finish().await,
             Self::Codex(_) | Self::Native(_) => Ok(Vec::new()),
             Self::Chat(converter) => converter.finish(),
             Self::Responses(converter) => converter.finish(),
@@ -790,12 +802,38 @@ async fn proxy_with_retries(
             .observe_prefix_match_tokens(selection.prefix_match_tokens);
 
         let node = Arc::clone(&selection.node);
-        let selected_protocol = request.anthropic_payloads.as_ref().map(|_| {
-            node.provider()
-                .anthropic_protocol
-                .resolve(node.provider().kind)
-        });
-        let selected_payload = if let Some(protocol) = selected_protocol {
+        let recipe = if matches!(request.endpoint.as_str(), "messages" | "responses")
+            && node.model_family(request.public_model.as_deref().unwrap_or_default())
+                == crate::config::ModelFamily::Deepseek
+        {
+            let (mut payload, prepared) = crate::deepseek::Prepared::new(
+                &request.endpoint,
+                request.parsed_body.as_ref().expect("inference JSON"),
+            )?;
+            if node.provider().kind == crate::config::ProviderKind::Vllm {
+                apply_vllm_native_thinking_compat(
+                    payload.as_object_mut().expect("recipe chat object"),
+                )?;
+            }
+            Some((
+                prepared_payload("chat/completions", payload),
+                Arc::new(prepared),
+            ))
+        } else {
+            None
+        };
+        let selected_protocol = request
+            .anthropic_payloads
+            .as_ref()
+            .filter(|_| recipe.is_none())
+            .map(|_| {
+                node.provider()
+                    .anthropic_protocol
+                    .resolve(node.provider().kind)
+            });
+        let selected_payload = if let Some((payload, _)) = &recipe {
+            Some(payload)
+        } else if let Some(protocol) = selected_protocol {
             let source = request
                 .parsed_body
                 .as_ref()
@@ -879,27 +917,40 @@ async fn proxy_with_retries(
             .anthropic_payloads
             .as_ref()
             .is_some_and(|payloads| payloads.expose_thinking);
-        let response_mode = match selected_protocol {
-            None => codex_namespaces.map_or(UpstreamResponseMode::Passthrough, |namespaces| {
-                UpstreamResponseMode::Codex { namespaces }
-            }),
-            Some(AnthropicProtocol::Native) => UpstreamResponseMode::NativeAnthropic {
-                expose_thinking: native_vllm_messages || expose_thinking,
-                thinking_budget_approximated,
-            },
-            Some(AnthropicProtocol::Responses) => {
-                UpstreamResponseMode::ResponsesToAnthropic { expose_thinking }
+        let response_mode = if let Some((_, prepared)) = recipe {
+            UpstreamResponseMode::Deepseek(prepared)
+        } else {
+            match selected_protocol {
+                None => codex_namespaces.map_or(UpstreamResponseMode::Passthrough, |namespaces| {
+                    UpstreamResponseMode::Codex { namespaces }
+                }),
+                Some(AnthropicProtocol::Native) => UpstreamResponseMode::NativeAnthropic {
+                    expose_thinking: native_vllm_messages || expose_thinking,
+                    thinking_budget_approximated,
+                },
+                Some(AnthropicProtocol::Responses) => {
+                    UpstreamResponseMode::ResponsesToAnthropic { expose_thinking }
+                }
+                Some(AnthropicProtocol::Chat) => {
+                    UpstreamResponseMode::ChatToAnthropic { expose_thinking }
+                }
+                Some(AnthropicProtocol::Auto) => {
+                    unreachable!("Anthropic protocol must be resolved")
+                }
             }
-            Some(AnthropicProtocol::Chat) => {
-                UpstreamResponseMode::ChatToAnthropic { expose_thinking }
-            }
-            Some(AnthropicProtocol::Auto) => unreachable!("Anthropic protocol must be resolved"),
         };
         let mut upstream_headers = HeaderMap::new();
         let connection_headers = connection_header_names(&request.headers);
         for (name, value) in &request.headers {
             if should_forward_request_header(name)
-                && should_forward_protocol_header(name, selected_protocol)
+                && should_forward_protocol_header(
+                    name,
+                    if matches!(&response_mode, UpstreamResponseMode::Deepseek(_)) {
+                        Some(AnthropicProtocol::Chat)
+                    } else {
+                        selected_protocol
+                    },
+                )
                 && !connection_headers.contains(name)
             {
                 upstream_headers.append(name, value.clone());
@@ -1119,10 +1170,10 @@ fn mapped_body(
     let object = value.as_object_mut().ok_or_else(|| {
         GatewayError::InvalidRequest("JSON request body must be an object".to_owned())
     })?;
-    if upstream_model != public_model {
-        if let Some(upstream_model) = upstream_model {
-            object.insert("model".to_owned(), Value::String(upstream_model.to_owned()));
-        }
+    if upstream_model != public_model
+        && let Some(upstream_model) = upstream_model
+    {
+        object.insert("model".to_owned(), Value::String(upstream_model.to_owned()));
     }
     let body = sonic_rs::to_vec(&value)
         .map(Bytes::from)
@@ -1175,6 +1226,9 @@ async fn buffered_success_response(
     } = buffered;
     let body = match response_mode {
         UpstreamResponseMode::Passthrough => Ok(upstream_body.clone()),
+        UpstreamResponseMode::Deepseek(prepared) => {
+            prepared.complete(&upstream_body, public_model).await
+        }
         UpstreamResponseMode::Codex { namespaces } => {
             codex::rewrite_response(&upstream_body, namespaces)
         }
@@ -1229,12 +1283,10 @@ async fn buffered_success_response(
             .headers_mut()
             .insert(HeaderName::from_static("x-upstream-request-id"), value);
     }
-    if expose_node_header {
-        if let Ok(value) = HeaderValue::from_str(node.id()) {
-            response
-                .headers_mut()
-                .insert(HeaderName::from_static("x-gateway-node"), value);
-        }
+    if expose_node_header && let Ok(value) = HeaderValue::from_str(node.id()) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-gateway-node"), value);
     }
     Ok(response)
 }
@@ -1388,6 +1440,20 @@ fn streaming_response(
         let mut idle_deadline = tokio::time::Instant::now() + stream_idle_timeout;
         let mut stream_adapter = match response_mode {
             UpstreamResponseMode::Passthrough => None,
+            UpstreamResponseMode::Deepseek(prepared) => {
+                match prepared.converter(&public_model, false) {
+                    Ok(converter) => Some(ResponseStreamAdapter::Deepseek(Box::new(converter))),
+                    Err(error) => {
+                        fail_response_stream(
+                            &pump_failure,
+                            &health_config,
+                            &mut guard,
+                            StreamFailure::upstream(error.to_string()),
+                        );
+                        return;
+                    }
+                }
+            }
             UpstreamResponseMode::Codex { namespaces } => Some(ResponseStreamAdapter::Codex(
                 codex::StreamRewriter::new(namespaces),
             )),
@@ -1495,7 +1561,7 @@ fn streaming_response(
                     let output = match (input, stream_adapter.as_mut()) {
                         (StreamingInput::Raw(bytes), None) => Ok(StreamingOutput::Raw(bytes)),
                         (StreamingInput::Event(event), Some(adapter)) => {
-                            adapter.push_event(event).map(StreamingOutput::Events)
+                            adapter.push_event(event).await.map(StreamingOutput::Events)
                         }
                         _ => Err(GatewayError::InvalidUpstreamResponse),
                     };
@@ -1524,7 +1590,7 @@ fn streaming_response(
                 }
                 None => {
                     if let Some(adapter) = stream_adapter.as_mut() {
-                        match adapter.finish() {
+                        match adapter.finish().await {
                             Ok(events) if !events.is_empty() => {
                                 permit.send(StreamingOutput::Events(events));
                             }
@@ -1606,12 +1672,10 @@ fn streaming_response(
             .headers_mut()
             .insert(HeaderName::from_static("x-upstream-request-id"), value);
     }
-    if expose_node_header {
-        if let Ok(value) = HeaderValue::from_str(&node_id) {
-            response
-                .headers_mut()
-                .insert(HeaderName::from_static("x-gateway-node"), value);
-        }
+    if expose_node_header && let Ok(value) = HeaderValue::from_str(&node_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-gateway-node"), value);
     }
     if headers
         .get(CONTENT_TYPE)

@@ -352,11 +352,11 @@ async fn run_worker(settings: Settings, database: &PathBuf, worker: &WorkerArgs)
 }
 
 fn load_settings(cli: &Cli) -> Result<Settings> {
-    if matches!(cli.command, Some(CommandMode::Worker(_))) {
-        if let Some(encoded) = std::env::var_os(supervisor::WORKER_SETTINGS_ENV) {
-            return serde_json::from_slice(encoded.as_encoded_bytes())
-                .context("invalid serialized worker settings");
-        }
+    if matches!(cli.command, Some(CommandMode::Worker(_)))
+        && let Some(encoded) = std::env::var_os(supervisor::WORKER_SETTINGS_ENV)
+    {
+        return serde_json::from_slice(encoded.as_encoded_bytes())
+            .context("invalid serialized worker settings");
     }
     settings_from_overrides(&cli.runtime)
 }

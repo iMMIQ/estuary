@@ -1,3 +1,4 @@
+export type ModelFamily = "generic" | "deepseek";
 export type ProviderKind = "openai" | "vllm";
 export type AnthropicProtocol = "auto" | "native" | "responses" | "chat";
 export type HealthState = "starting" | "healthy" | "degraded" | "unhealthy";
@@ -30,6 +31,7 @@ export interface ProviderConfig {
 
 export interface ModelCapabilityConfig {
   multimodal: boolean;
+  family?: ModelFamily;
 }
 
 export interface NodeConfig {
@@ -170,6 +172,7 @@ export interface Pair {
   key: string;
   value: string;
   multimodal?: boolean;
+  family?: ModelFamily;
 }
 
 export interface NodeDraft extends Omit<NodeConfig, "api_key" | "models" | "model_capabilities" | "headers_from_env"> {

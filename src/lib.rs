@@ -2,6 +2,7 @@ mod anthropic;
 mod anthropic_responses;
 mod codex;
 pub mod config;
+mod deepseek;
 pub mod error;
 pub mod health;
 pub mod kv_cache;

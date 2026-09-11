@@ -586,25 +586,19 @@ impl Gateway {
         let _ = health_shutdown.send(true);
         let _ = provider_shutdown.send(true);
         let _ = control_shutdown.send(true);
-        if !health_done {
-            if let Err(error) = health_handle.await {
-                first_error
-                    .get_or_insert_with(|| anyhow::anyhow!("health monitor task failed: {error}"));
-            }
+        if !health_done && let Err(error) = health_handle.await {
+            first_error
+                .get_or_insert_with(|| anyhow::anyhow!("health monitor task failed: {error}"));
         }
-        if !provider_done {
-            if let Err(error) = provider_handle.await {
-                first_error.get_or_insert_with(|| {
-                    anyhow::anyhow!("vLLM provider monitor task failed: {error}")
-                });
-            }
+        if !provider_done && let Err(error) = provider_handle.await {
+            first_error.get_or_insert_with(|| {
+                anyhow::anyhow!("vLLM provider monitor task failed: {error}")
+            });
         }
-        if !control_done {
-            if let Err(error) = control_handle.await {
-                first_error.get_or_insert_with(|| {
-                    anyhow::anyhow!("control-plane reconciler task failed: {error}")
-                });
-            }
+        if !control_done && let Err(error) = control_handle.await {
+            first_error.get_or_insert_with(|| {
+                anyhow::anyhow!("control-plane reconciler task failed: {error}")
+            });
         }
         self.state.process.mark_drained();
         if let Some(error) = first_error {
@@ -644,10 +638,8 @@ impl Gateway {
         let shutdown_grace = Duration::from_millis(self.state.settings.server.shutdown_grace_ms);
         let deadline = tokio::time::Instant::now() + shutdown_grace;
         let mut first_error = None;
-        if !public_done {
-            if let Err(error) = finish_server("public", public_handle, deadline).await {
-                first_error = Some(error);
-            }
+        if !public_done && let Err(error) = finish_server("public", public_handle, deadline).await {
+            first_error = Some(error);
         }
         if tokio::time::timeout_at(deadline, self.state.process.wait_for_idle())
             .await
@@ -660,10 +652,8 @@ impl Gateway {
         }
 
         admin_cancellation.cancel();
-        if !admin_done {
-            if let Err(error) = finish_server("admin", admin_handle, deadline).await {
-                first_error.get_or_insert(error);
-            }
+        if !admin_done && let Err(error) = finish_server("admin", admin_handle, deadline).await {
+            first_error.get_or_insert(error);
         }
         first_error
     }

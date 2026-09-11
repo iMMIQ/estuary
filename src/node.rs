@@ -636,6 +636,15 @@ impl Node {
         })
     }
 
+    pub fn model_family(&self, public_model: &str) -> crate::config::ModelFamily {
+        self.model_capabilities
+            .get(public_model)
+            .or_else(|| self.model_capabilities.get("*"))
+            .map_or(crate::config::ModelFamily::Generic, |capability| {
+                capability.family
+            })
+    }
+
     pub fn supports_multimodal(&self, public_model: &str) -> bool {
         self.model_capabilities
             .get(public_model)

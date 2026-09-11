@@ -560,24 +560,23 @@ pub(crate) fn convert_response(
         .and_then(Value::as_object)
         .ok_or(GatewayError::InvalidUpstreamResponse)?;
     let mut content = Vec::new();
-    if expose_thinking {
-        if let Some(reasoning) = message
+    if expose_thinking
+        && let Some(reasoning) = message
             .get("reasoning")
             .or_else(|| message.get("reasoning_content"))
             .and_then(Value::as_str)
             .filter(|reasoning| !reasoning.is_empty())
-        {
-            content.push(json!({
-                "type": "thinking",
-                "thinking": reasoning,
-                "signature": synthetic_signature(value.get("id").and_then(Value::as_str))
-            }));
-        }
+    {
+        content.push(json!({
+            "type": "thinking",
+            "thinking": reasoning,
+            "signature": synthetic_signature(value.get("id").and_then(Value::as_str))
+        }));
     }
-    if let Some(text) = message.get("content").and_then(Value::as_str) {
-        if !text.is_empty() {
-            content.push(json!({"type": "text", "text": text}));
-        }
+    if let Some(text) = message.get("content").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        content.push(json!({"type": "text", "text": text}));
     }
     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
@@ -634,11 +633,11 @@ pub(crate) fn rewrite_native_response(
         .ok_or(GatewayError::InvalidUpstreamResponse)?;
     if object.get("type").and_then(Value::as_str) == Some("message") {
         object.insert("model".to_owned(), Value::String(public_model.to_owned()));
-        if !expose_thinking {
-            if let Some(content) = object.get_mut("content").and_then(Value::as_array_mut) {
-                for block in content {
-                    suppress_native_thinking(block);
-                }
+        if !expose_thinking
+            && let Some(content) = object.get_mut("content").and_then(Value::as_array_mut)
+        {
+            for block in content {
+                suppress_native_thinking(block);
             }
         }
     } else if object.get("input_tokens").and_then(Value::as_u64).is_none() {
@@ -793,10 +792,10 @@ impl NativeStreamRewriter {
                 if let Some(block) = value.get_mut("content_block") {
                     suppress_native_thinking(block);
                 }
-            } else if value.get("type").and_then(Value::as_str) == Some("content_block_delta") {
-                if let Some(delta) = value.get_mut("delta") {
-                    suppress_native_thinking(delta);
-                }
+            } else if value.get("type").and_then(Value::as_str) == Some("content_block_delta")
+                && let Some(delta) = value.get_mut("delta")
+            {
+                suppress_native_thinking(delta);
             }
         }
         let name = event
@@ -918,69 +917,67 @@ impl StreamState {
         let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
             return Ok(());
         };
-        if self.expose_thinking {
-            if let Some(reasoning) = delta
+        if self.expose_thinking
+            && let Some(reasoning) = delta
                 .get("reasoning")
                 .or_else(|| delta.get("reasoning_content"))
                 .and_then(Value::as_str)
-            {
-                if !reasoning.is_empty() {
-                    self.finish_text(output)?;
-                    let index = if let Some(index) = self.thinking_index {
-                        index
-                    } else {
-                        let index = self.next_index;
-                        self.next_index += 1;
-                        self.thinking_index = Some(index);
-                        event(
-                            output,
-                            "content_block_start",
-                            json!({
-                                "type": "content_block_start", "index": index,
-                                "content_block": {"type": "thinking", "thinking": ""}
-                            }),
-                        )?;
-                        index
-                    };
-                    event(
-                        output,
-                        "content_block_delta",
-                        json!({
-                            "type": "content_block_delta", "index": index,
-                            "delta": {"type": "thinking_delta", "thinking": reasoning}
-                        }),
-                    )?;
-                }
-            }
-        }
-        if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            if !text.is_empty() {
-                self.finish_thinking(output)?;
-                let index = if let Some(index) = self.text_index {
-                    index
-                } else {
-                    let index = self.next_index;
-                    self.next_index += 1;
-                    self.text_index = Some(index);
-                    event(
-                        output,
-                        "content_block_start",
-                        json!({
-                            "type": "content_block_start", "index": index,
-                            "content_block": {"type": "text", "text": ""}
-                        }),
-                    )?;
-                    index
-                };
+            && !reasoning.is_empty()
+        {
+            self.finish_text(output)?;
+            let index = if let Some(index) = self.thinking_index {
+                index
+            } else {
+                let index = self.next_index;
+                self.next_index += 1;
+                self.thinking_index = Some(index);
                 event(
                     output,
-                    "content_block_delta",
+                    "content_block_start",
                     json!({
-                        "type": "content_block_delta", "index": index,
-                        "delta": {"type": "text_delta", "text": text}
+                        "type": "content_block_start", "index": index,
+                        "content_block": {"type": "thinking", "thinking": ""}
                     }),
                 )?;
-            }
+                index
+            };
+            event(
+                output,
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "thinking_delta", "thinking": reasoning}
+                }),
+            )?;
+        }
+        if let Some(text) = delta.get("content").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            self.finish_thinking(output)?;
+            let index = if let Some(index) = self.text_index {
+                index
+            } else {
+                let index = self.next_index;
+                self.next_index += 1;
+                self.text_index = Some(index);
+                event(
+                    output,
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start", "index": index,
+                        "content_block": {"type": "text", "text": ""}
+                    }),
+                )?;
+                index
+            };
+            event(
+                output,
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "text_delta", "text": text}
+                }),
+            )?;
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             if !calls.is_empty() {
@@ -1029,16 +1026,16 @@ impl StreamState {
                 ..ToolStream::default()
             }
         });
-        if let Some(id) = call.get("id").and_then(Value::as_str) {
-            if tool.id.is_empty() {
-                id.clone_into(&mut tool.id);
-            }
+        if let Some(id) = call.get("id").and_then(Value::as_str)
+            && tool.id.is_empty()
+        {
+            id.clone_into(&mut tool.id);
         }
         if let Some(function) = call.get("function").and_then(Value::as_object) {
-            if let Some(name) = function.get("name").and_then(Value::as_str) {
-                if tool.name.is_empty() {
-                    name.clone_into(&mut tool.name);
-                }
+            if let Some(name) = function.get("name").and_then(Value::as_str)
+                && tool.name.is_empty()
+            {
+                name.clone_into(&mut tool.name);
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                 if tool.started {

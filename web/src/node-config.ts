@@ -20,6 +20,7 @@ function modelPairs(node: NodeRecord): Pair[] {
     key,
     value,
     multimodal: node.config.model_capabilities?.[key]?.multimodal ?? true,
+    family: node.config.model_capabilities?.[key]?.family ?? "generic",
   }));
   return pairs.length > 0 ? pairs : [{ key: "", value: "", multimodal: true }];
 }
@@ -81,7 +82,7 @@ export function draftToConfig(draft: NodeDraft): NodeConfig {
     models: pairsToRecord(draft.models),
     model_capabilities: Object.fromEntries(
       draft.models
-        .map((row) => [row.key.trim(), { multimodal: row.multimodal !== false }] as const)
+        .map((row) => [row.key.trim(), { multimodal: row.multimodal !== false, family: row.family ?? "generic" }] as const)
         .filter(([key]) => key.length > 0),
     ),
     headers_from_env: pairsToRecord(draft.headers_from_env),

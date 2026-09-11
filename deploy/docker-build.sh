@@ -37,7 +37,7 @@ probe_apk() {
 probe_docker() {
     local name=$1 prefix=$2 start elapsed code image
     start=$(date +%s%3N)
-    for image in library/alpine:3.21 library/rust:1.85-alpine3.21 oven/bun:1.3.14-alpine; do
+    for image in library/alpine:3.21 library/rust:1.88-alpine3.22 oven/bun:1.3.14-alpine; do
         code=$(curl --location --silent --output /dev/null --write-out '%{http_code}' \
             --connect-timeout 3 --max-time 8 \
             --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
@@ -97,7 +97,7 @@ npm_registry=$(fastest npm https://registry.npmjs.org)
 cd "${root}"
 exec docker build --network host --tag "${ESTUARY_IMAGE:-estuary:local}" \
     --build-arg "ALPINE_IMAGE=${docker_registry}/library/alpine:3.21" \
-    --build-arg "RUST_IMAGE=${docker_registry}/library/rust:1.85-alpine3.21" \
+    --build-arg "RUST_IMAGE=${docker_registry}/library/rust:1.88-alpine3.22" \
     --build-arg "BUN_IMAGE=${docker_registry}/oven/bun:1.3.14-alpine" \
     --build-arg "APK_REPOSITORY=${apk_repository}" \
     --build-arg "CARGO_REGISTRY=${cargo_registry}" \

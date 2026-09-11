@@ -7,6 +7,7 @@ use. The maintained technical documentation is organized by task:
 | --- | --- |
 | [Architecture](architecture.md) | Request flow, scheduling, persistence, protocol adaptation, backpressure, and process lifecycle. |
 | [Configuration and operations](operations.md) | Runtime settings, node configuration, security, health checks, management endpoints, and metrics. |
+| [DeepSeek protocol conversion](deepseek.md) | Model family configuration and recipe adapters for Codex and Claude Code. |
 | [Native vLLM provider](vllm.md) | vLLM version requirements, telemetry, tokenization, KV events, and client compatibility. |
 | [Deployment](../deploy/README.md) | Static binary installation, Docker, zero-downtime rollout, rollback, and persistent paths. |
 | [Performance benchmark](performance.md) | Reproducible gateway-overhead benchmark commands and output. |

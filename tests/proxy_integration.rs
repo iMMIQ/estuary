@@ -349,7 +349,10 @@ async fn text_only_model_omits_openai_images_before_forwarding() {
     );
     upstream_node.model_capabilities.insert(
         "text-model".to_owned(),
-        ModelCapabilityConfig { multimodal: false },
+        ModelCapabilityConfig {
+            multimodal: false,
+            ..ModelCapabilityConfig::default()
+        },
     );
     let gateway = spawn_gateway(vec![upstream_node]).await;
 
@@ -2067,4 +2070,132 @@ async fn streaming_body_failure_never_switches_nodes_after_headers() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.bytes().await.is_err());
     assert_eq!(fallback_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn deepseek_recipe_routes_both_client_protocols_through_chat() {
+    use estuary::config::ModelFamily;
+    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let upstream = TestServer::spawn(Router::new().route("/v1/chat/completions", post({
+        let captured = Arc::clone(&captured);
+        move |Json(body): Json<Value>| {
+            let captured = Arc::clone(&captured);
+            async move {
+                captured.lock().unwrap().push(body.clone());
+                assert_eq!(body["model"], "deepseek-chat");
+                assert!(body.get("prompt").is_none());
+                let wire = body["tools"][0]["function"]["name"].as_str().unwrap();
+                let tool = json!({"index":0,"id":"upstream-call","type":"function","function":{"name":wire,"arguments":"{\"path\":\"README.md\"}"}});
+                let usage = json!({"prompt_tokens":12,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":4}});
+                if body["stream"] == true {
+                    let chunks = vec![
+                        json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"Checking."},"finish_reason":null}]}),
+                        json!({"choices":[{"index":0,"delta":{"tool_calls":[tool]},"finish_reason":"tool_calls"}]}),
+                        json!({"choices":[],"usage":usage}),
+                    ];
+                    let mut text = String::new();
+                    for chunk in chunks {
+                        use std::fmt::Write;
+                        write!(text, "data: {chunk}\n\n").unwrap();
+                    }
+                    text.push_str("data: [DONE]\n\n");
+                    Response::builder().header(CONTENT_TYPE,"text/event-stream").body(Body::from(text)).unwrap()
+                } else {
+                    let value = json!({"id":"upstream","choices":[{"index":0,"message":{"role":"assistant","content":"Checking.","tool_calls":[tool]},"finish_reason":"tool_calls"}],"usage":usage});
+                    Response::builder().header(CONTENT_TYPE,"application/json").body(Body::from(value.to_string())).unwrap()
+                }
+            }
+        }
+    }))).await;
+    let mut config = node("deepseek", &upstream, [("public-ds", "deepseek-chat")]);
+    config.model_capabilities.insert(
+        "public-ds".into(),
+        ModelCapabilityConfig {
+            family: ModelFamily::Deepseek,
+            ..ModelCapabilityConfig::default()
+        },
+    );
+    let gateway = spawn_gateway(vec![config]).await;
+    for endpoint in ["messages", "responses"] {
+        for streaming in [false, true] {
+            let mut body = if endpoint == "messages" {
+                json!({"model":"public-ds","max_tokens":128,"messages":[{"role":"user","content":"Read the file"}],"tools":[{"name":"read_file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]})
+            } else {
+                json!({"model":"public-ds","input":"Read the file","tools":[{"type":"namespace","name":"files","tools":[{"type":"function","name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]}]})
+            };
+            body["stream"] = json!(streaming);
+            let response = test_client()
+                .post(gateway.url(&format!("/v1/{endpoint}")))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{text}");
+            if streaming {
+                assert!(
+                    text.contains(if endpoint == "messages" {
+                        "event: message_stop"
+                    } else {
+                        "event: response.completed"
+                    }),
+                    "{text}"
+                );
+                assert!(text.contains("read_file"), "{text}");
+                assert!(!text.contains("recipe_tool_"), "{text}");
+            } else {
+                let result: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(result["model"], "public-ds");
+                assert_eq!(result["usage"]["output_tokens"], 7);
+                if endpoint == "messages" {
+                    assert_eq!(result["stop_reason"], "tool_use");
+                    assert_eq!(result["content"][1]["name"], "read_file");
+                    assert_eq!(result["content"][1]["input"]["path"], "README.md");
+                } else {
+                    assert_eq!(result["output"][1]["name"], "read_file");
+                    assert_eq!(result["output"][1]["namespace"], "files");
+                }
+            }
+        }
+    }
+    assert_eq!(captured.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn generic_model_on_mixed_node_keeps_responses_forwarding() {
+    use estuary::config::ModelFamily;
+    let upstream = TestServer::spawn(Router::new().route(
+        "/v1/responses",
+        post(|Json(body): Json<Value>| async move {
+            assert_eq!(body["model"], "generic-upstream");
+            assert_eq!(body["input"], "hello");
+            Json(json!({"id":"native-response", "output":[]}))
+        }),
+    ))
+    .await;
+    let mut config = node(
+        "mixed",
+        &upstream,
+        [("ds", "deepseek-chat"), ("generic", "generic-upstream")],
+    );
+    config.model_capabilities.insert(
+        "ds".into(),
+        ModelCapabilityConfig {
+            family: ModelFamily::Deepseek,
+            ..ModelCapabilityConfig::default()
+        },
+    );
+    let gateway = spawn_gateway(vec![config]).await;
+    let response = test_client()
+        .post(gateway.url("/v1/responses"))
+        .json(&json!({"model":"generic", "input":"hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["id"],
+        "native-response"
+    );
 }

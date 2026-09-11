@@ -482,7 +482,17 @@ mod tests {
             "data: [DONE]\r\n\r\n"
         );
         let output = rewrite_stream(vec![source.as_bytes()], namespaces).await;
-        assert!(output.starts_with("data: {\"name\":\"run\",\"namespace\":\"web\""));
+        let first: Value = serde_json::from_str(
+            output
+                .lines()
+                .next()
+                .unwrap()
+                .strip_prefix("data: ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["name"], "run");
+        assert_eq!(first["namespace"], "web");
         assert!(output.ends_with("data: [DONE]\n\n"));
     }
 }

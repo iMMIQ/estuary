@@ -480,7 +480,7 @@ impl BoundedCanonical {
         if self.full {
             return;
         }
-        let _ = serde_json::to_writer(self, value);
+        let _ = serde_json::to_writer(self, &CanonicalValue(value));
     }
 
     fn push_str(&mut self, value: &str) {
@@ -511,6 +511,29 @@ impl BoundedCanonical {
 
     fn finish(self) -> (String, usize) {
         (self.output, self.chars)
+    }
+}
+
+// recipe enables serde_json/preserve_order for the dependency graph. Routing
+// keys must remain independent of the client's JSON object insertion order.
+struct CanonicalValue<'a>(&'a Value);
+
+impl serde::Serialize for CanonicalValue<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self.0 {
+            Value::Object(object) => {
+                let mut entries = object.iter().collect::<Vec<_>>();
+                entries.sort_unstable_by_key(|(left, _)| *left);
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    map.serialize_entry(key, &CanonicalValue(value))?;
+                }
+                map.end()
+            }
+            Value::Array(values) => serializer.collect_seq(values.iter().map(CanonicalValue)),
+            value => value.serialize(serializer),
+        }
     }
 }
 

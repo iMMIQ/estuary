@@ -34,12 +34,20 @@ describe("node config mapping", () => {
     expect(draftToConfig(draft).provider.anthropic_protocol).toBe("responses");
   });
 
+  test("keeps model families independent on a mixed node", () => {
+    const draft = createDraft("openai");
+    draft.models = [{ key: "ds", value: "deepseek-chat", family: "deepseek" }, { key: "qwen", value: "qwen" }];
+    const config = draftToConfig(draft);
+    expect(config.model_capabilities.ds.family).toBe("deepseek");
+    expect(config.model_capabilities.qwen.family).toBe("generic");
+  });
+
   test("serializes per-model image capability", () => {
     const draft = createDraft("openai");
     draft.id = "node-a";
     draft.models = [{ key: "text", value: "internal-text", multimodal: false }];
     expect(draftToConfig(draft).model_capabilities).toEqual({
-      text: { multimodal: false },
+      text: { multimodal: false, family: "generic" },
     });
   });
 

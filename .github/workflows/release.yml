@@ -70,7 +70,7 @@ jobs:
         run: rm .cargo/config.toml
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.85.0"
+          toolchain: "1.88.0"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:

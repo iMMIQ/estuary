@@ -626,15 +626,13 @@ impl Supervisor {
             if let Ok(response) = self
                 .worker_request(slot.id, Method::GET, "/admin/api/process")
                 .await
-            {
-                if !require_ready
+                && (!require_ready
                     || response
                         .get("runtime_ready")
                         .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false)
-                {
-                    return Ok(());
-                }
+                        .unwrap_or(false))
+            {
+                return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
                 bail!("slot {} did not become warm before timeout", slot.id.name());

@@ -600,12 +600,24 @@ impl Default for NodeConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ModelCapabilityConfig {
     pub multimodal: bool,
+    pub family: ModelFamily,
 }
 
 impl Default for ModelCapabilityConfig {
     fn default() -> Self {
-        Self { multimodal: true }
+        Self {
+            multimodal: true,
+            family: ModelFamily::Generic,
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFamily {
+    #[default]
+    Generic,
+    Deepseek,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

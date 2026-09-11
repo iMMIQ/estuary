@@ -135,10 +135,10 @@ impl ExactCacheDirectory {
     }
 
     pub fn invalidate_node_owned(&self, node_id: &str, owner: u64) {
-        if let Some(node) = self.nodes.write().get_mut(node_id) {
-            if node.owner == owner {
-                node.invalidate();
-            }
+        if let Some(node) = self.nodes.write().get_mut(node_id)
+            && node.owner == owner
+        {
+            node.invalidate();
         }
     }
 
@@ -147,10 +147,10 @@ impl ExactCacheDirectory {
     }
 
     pub fn suspend_node_owned(&self, node_id: &str, owner: u64) {
-        if let Some(node) = self.nodes.write().get_mut(node_id) {
-            if node.owner == owner {
-                node.authoritative = false;
-            }
+        if let Some(node) = self.nodes.write().get_mut(node_id)
+            && node.owner == owner
+        {
+            node.authoritative = false;
         }
     }
 
@@ -159,10 +159,10 @@ impl ExactCacheDirectory {
     }
 
     pub fn resume_node_owned(&self, node_id: &str, owner: u64) {
-        if let Some(node) = self.nodes.write().get_mut(node_id) {
-            if node.owner == owner {
-                node.authoritative = true;
-            }
+        if let Some(node) = self.nodes.write().get_mut(node_id)
+            && node.owner == owner
+        {
+            node.authoritative = true;
         }
     }
 

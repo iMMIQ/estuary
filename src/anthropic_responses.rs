@@ -799,14 +799,13 @@ impl ResponseStreamState {
                     if let Some(ActiveBlock::Thinking {
                         encrypted_content, ..
                     }) = self.active.get_mut(&index)
+                        && encrypted_content.is_none()
                     {
-                        if encrypted_content.is_none() {
-                            *encrypted_content = value
-                                .get("item")
-                                .and_then(|item| item.get("encrypted_content"))
-                                .and_then(Value::as_str)
-                                .map(str::to_owned);
-                        }
+                        *encrypted_content = value
+                            .get("item")
+                            .and_then(|item| item.get("encrypted_content"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
                     }
                     let arguments_missing = matches!(
                         self.active.get(&index),
@@ -814,19 +813,18 @@ impl ResponseStreamState {
                             emitted_arguments: false
                         })
                     );
-                    if arguments_missing {
-                        if let Some(arguments) = value
+                    if arguments_missing
+                        && let Some(arguments) = value
                             .get("item")
                             .and_then(|item| item.get("arguments"))
                             .and_then(Value::as_str)
                             .filter(|arguments| !arguments.is_empty())
-                        {
-                            emit(
-                                output,
-                                "content_block_delta",
-                                json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":arguments}}),
-                            )?;
-                        }
+                    {
+                        emit(
+                            output,
+                            "content_block_delta",
+                            json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":arguments}}),
+                        )?;
                     }
                 }
                 self.close_output(output_index, output)?;

@@ -220,11 +220,11 @@ impl VllmManager {
                 }
                 continue;
             }
-            if let Some(restart) = restarts.get(&id) {
-                if restart.instance_id == node.instance_id() && Instant::now() < restart.not_before
-                {
-                    continue;
-                }
+            if let Some(restart) = restarts.get(&id)
+                && restart.instance_id == node.instance_id()
+                && Instant::now() < restart.not_before
+            {
+                continue;
             }
             self.token_cache
                 .lock()
@@ -271,10 +271,10 @@ impl VllmManager {
         if body.get("cache_salt").is_some_and(|value| !value.is_null()) {
             return RoutingTokenization::new(None, "cache_salt", started);
         }
-        if endpoint == "completions" {
-            if let Some(tokens) = pretokenized_completion(body) {
-                return RoutingTokenization::new(Some(tokens), "pretokenized", started);
-            }
+        if endpoint == "completions"
+            && let Some(tokens) = pretokenized_completion(body)
+        {
+            return RoutingTokenization::new(Some(tokens), "pretokenized", started);
         }
         if !matches!(endpoint, "chat/completions" | "completions") {
             return RoutingTokenization::new(None, "unsupported", started);
@@ -388,7 +388,7 @@ async fn run_node_monitor(
                     .fresh_vllm_waiting()
                     .is_some_and(|waiting| waiting >= node.provider().waiting_threshold);
                 let generation = node.provider_generation();
-                poll_node(&client, &node, tick % VERSION_RECHECK_TICKS == 0).await;
+                poll_node(&client, &node, tick.is_multiple_of(VERSION_RECHECK_TICKS)).await;
                 if node.is_retired() {
                     break;
                 }
