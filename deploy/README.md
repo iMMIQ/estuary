@@ -130,6 +130,27 @@ The Dockerfile is multi-stage. Bun and Rust toolchains remain in build stages;
 the final Alpine image contains only CA certificates, the Estuary binary, and
 the initialized release layout.
 
+Build versions are determined by `deploy/build-version.sh`: a matching
+`v<package-version>` tag on the current commit uses the plain package version;
+all other commits append `+<12-character Git hash>`. The build wrapper passes
+the result into Docker, and Cargo source builds resolve it automatically.
+Each commit can therefore occupy its own immutable deployment directory.
+
+For a direct Docker build, pass the version explicitly because `.git` is
+excluded from the build context:
+
+```bash
+docker build --build-arg ESTUARY_BUILD_VERSION="$(sh deploy/build-version.sh)" \
+  -t estuary:local .
+```
+
+Source archives without Git metadata report `<package-version>+unknown` unless
+`ESTUARY_BUILD_VERSION` is supplied. This override also supports reproducible
+builds, for example `ESTUARY_BUILD_VERSION=0.3.3+bbf691e19ba2 cargo build --release`.
+For a release, update `Cargo.toml`, its package entry in `Cargo.lock`, and
+`web/package.json` together before tagging the commit; release CI checks that
+the package versions match the tag.
+
 ## Docker Runtime
 
 `compose.yaml` consumes an image and never builds source code. Set a management

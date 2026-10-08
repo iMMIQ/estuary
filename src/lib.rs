@@ -21,3 +21,6 @@ pub mod vllm;
 
 pub use config::Settings;
 pub use server::Gateway;
+
+/// The release version, including the commit hash for untagged builds.
+pub const VERSION: &str = env!("ESTUARY_BUILD_VERSION");

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+build_version=$(sh "${root}/deploy/build-version.sh")
 results=$(mktemp -d)
 trap 'rm -rf -- "${results}"' EXIT
 case $(uname -m) in
@@ -95,7 +96,9 @@ cargo_registry=$(fastest cargo '')
 npm_registry=$(fastest npm https://registry.npmjs.org)
 
 cd "${root}"
+printf 'Build version: %s\n' "${build_version}" >&2
 exec docker build --network host --tag "${ESTUARY_IMAGE:-estuary:local}" \
+    --build-arg "ESTUARY_BUILD_VERSION=${build_version}" \
     --build-arg "ALPINE_IMAGE=${docker_registry}/library/alpine:3.21" \
     --build-arg "RUST_IMAGE=${docker_registry}/library/rust:1.88-alpine3.22" \
     --build-arg "BUN_IMAGE=${docker_registry}/oven/bun:1.3.14-alpine" \

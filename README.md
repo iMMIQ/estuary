@@ -76,6 +76,14 @@ cargo run --release -- \
 Open `http://127.0.0.1:9090/admin/` and add an upstream node. An empty database
 is valid, but readiness remains `503` until at least one node is routable.
 
+Build versions are resolved automatically. A commit tagged with the matching
+package version (for example, `v0.3.3`) reports `0.3.3`; other commits report
+the package version plus a 12-character Git hash, such as
+`0.3.3+bbf691e19ba2`. The CLI, management application, and deployment release
+directories use the same version. The Docker build wrapper passes this version
+into the image automatically. See [deployment](deploy/README.md) for builds
+without Git metadata.
+
 ## Configure A Node
 
 The management application validates and probes a node before saving it. The

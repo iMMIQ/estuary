@@ -324,7 +324,7 @@ impl Gateway {
             .pool_idle_timeout(Duration::from_secs(90))
             .no_proxy()
             .redirect(Policy::none())
-            .user_agent(concat!("estuary/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("estuary/", env!("ESTUARY_BUILD_VERSION")))
             .build()
             .context("failed to build upstream HTTP client")?;
         let scheduler = Arc::new(Scheduler::new(nodes.clone(), settings.routing.clone()));
@@ -1264,7 +1264,7 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
         "status": if ready { "ready" } else { "not_ready" },
         "live": true,
         "ready": ready,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": crate::VERSION,
         "process": state.process.snapshot(),
         "generated_at_unix_ms": unix_millis(),
         "fleet": {

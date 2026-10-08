@@ -23,7 +23,10 @@ RUN version="$(cut -d. -f1,2 /etc/alpine-release)" \
     && apk add --no-cache build-base cmake perl
 WORKDIR /build
 ARG CARGO_REGISTRY
+ARG ESTUARY_BUILD_VERSION
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
+COPY deploy/build-version.sh ./deploy/build-version.sh
 COPY src/ ./src/
 COPY benches/ ./benches/
 COPY --from=web-builder /build/web/dist ./web/dist/

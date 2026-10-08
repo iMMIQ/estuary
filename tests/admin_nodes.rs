@@ -54,6 +54,7 @@ fn node(base_url: &str) -> NodeConfig {
 }
 
 fn assert_empty_gateway_status(status: &Value) {
+    assert_eq!(status["version"], estuary::VERSION);
     assert_eq!(status["status"], "not_ready");
     assert_eq!(status["fleet"]["total_nodes"], 0);
     assert_eq!(status["queue"]["requests"], 0);

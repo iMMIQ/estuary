@@ -11,7 +11,7 @@ use serde_json::Value;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version = estuary::VERSION, about)]
 struct Cli {
     #[arg(long, env = "ESTUARY_DATABASE", default_value = "estuary.db")]
     database: PathBuf,
