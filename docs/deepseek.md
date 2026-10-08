@@ -34,6 +34,10 @@ For a DeepSeek model, both `POST /v1/responses` (Codex) and `POST /v1/messages`
 
 This path overrides the node's Anthropic protocol setting for generation requests
 for that model. `messages/count_tokens` keeps the existing native-only behavior.
+The incoming URL selects the response protocol; User-Agent and Anthropic headers
+do not switch a Responses request to Messages. Upstream Anthropic error envelopes
+are normalized to OpenAI errors for OpenAI clients, preserving the HTTP status,
+error message, and `Retry-After` header.
 Chat Completions requests themselves keep their normal forwarding behavior.
 Generic models retain the existing protocol settings and Responses forwarding.
 There is no V4/V4.1 prompt template, tokenizer download, raw Completions transport,
@@ -64,3 +68,27 @@ or model inference inside the gateway.
 
 The dependency uses Rust let chains, so source builds now require Rust 1.88 or
 newer. Docker and CI toolchain settings use the same minimum.
+
+## Live end-to-end verification
+
+The opt-in test uses a real DeepSeek API key and incurs API charges. Put only the
+key in `.cache/deepseek-e2e/api-key`, then run:
+
+```sh
+cargo build --locked
+python3 tests/deepseek_e2e.py --api-key-file .cache/deepseek-e2e/api-key
+```
+
+The test discovers available models, starts an isolated local gateway, and checks
+JSON/SSE responses, concurrent Responses and Messages requests with conflicting
+client headers, namespace tool results, and custom `apply_patch` calls. If Codex
+CLI is installed, it also checks an actual Codex turn and a command/tool-result
+round trip using temporary command-line settings. Existing Codex settings are
+not edited. Use `--model` to select a model or `--skip-codex` for HTTP-only runs.
+
+The gateway reads the key from a child-process environment variable; it is not
+written into the test database or passed in command-line arguments. Test reports
+and protocol traces are saved in ignored `target/deepseek-e2e/`, and the gateway
+is stopped when the test finishes. To diagnose adapter selection, enable
+`RUST_LOG=info,estuary::proxy=debug`: `upstream selected` records the client URL,
+upstream URL, and adapter (`deepseek_responses` or `deepseek_messages`).

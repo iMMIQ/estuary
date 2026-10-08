@@ -21,7 +21,7 @@ use bytes::{Bytes, BytesMut};
 use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -715,6 +715,18 @@ enum UpstreamResponseMode {
 }
 
 impl UpstreamResponseMode {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Passthrough => "passthrough",
+            Self::Deepseek(prepared) if prepared.is_messages() => "deepseek_messages",
+            Self::Deepseek(_) => "deepseek_responses",
+            Self::Codex { .. } => "codex_responses",
+            Self::ChatToAnthropic { .. } => "chat_to_anthropic",
+            Self::ResponsesToAnthropic { .. } => "responses_to_anthropic",
+            Self::NativeAnthropic { .. } => "native_anthropic",
+        }
+    }
+
     fn is_anthropic(&self) -> bool {
         if let Self::Deepseek(prepared) = self {
             return prepared.is_messages();
@@ -905,6 +917,7 @@ async fn proxy_with_retries(
             && selected_protocol.is_none()
             && node.provider().kind == crate::config::ProviderKind::Vllm
             && upstream_endpoint == "responses";
+        let upstream_endpoint_log = upstream_endpoint.to_owned();
         let (upstream_body, thinking_budget_approximated, codex_namespaces) = mapped_body(
             upstream_original,
             upstream_parsed,
@@ -1041,6 +1054,9 @@ async fn proxy_with_retries(
 
         debug!(
             node = node.id(),
+            client_endpoint = %request.endpoint,
+            upstream_endpoint = %upstream_endpoint_log,
+            adapter = response_mode.name(),
             score = selection.score,
             prefix_match_chars = selection.prefix_match_chars,
             status = %status,
@@ -1850,16 +1866,43 @@ async fn proxy_error_response(
         }
         return Ok(hold_response_buffer(response, buffered.reservation));
     }
-    let valid_openai_error = serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|value| value.get("error").cloned())
-        .is_some_and(|error| error.is_object());
+    let parsed_error = serde_json::from_slice::<Value>(body).ok();
+    let valid_openai_error = parsed_error
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .is_some_and(Value::is_object);
     if !valid_openai_error {
         let mut response = GatewayError::UpstreamStatus(status.as_u16()).into_response();
         if let Some(value) = headers.get("retry-after") {
             response.headers_mut().insert("retry-after", value.clone());
         }
         return Ok(response);
+    }
+    if let Some(value) = parsed_error.filter(|value| value["type"] == "error") {
+        // Anthropic's error object also passes the OpenAI object check above.
+        // Preserve its diagnostic without leaking its client-protocol envelope.
+        let error = &value["error"];
+        let error_type = match status {
+            StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+            StatusCode::UNAUTHORIZED => "authentication_error",
+            StatusCode::FORBIDDEN => "permission_error",
+            _ if status.is_client_error() => "invalid_request_error",
+            _ => "api_error",
+        };
+        let mut response = (
+            status,
+            Json(json!({"error": {
+                "message": error["message"].as_str().unwrap_or("upstream returned an error"),
+                "type": error_type,
+                "param": null,
+                "code": error["type"].as_str().unwrap_or("upstream_error"),
+            }})),
+        )
+            .into_response();
+        if let Some(value) = headers.get("retry-after") {
+            response.headers_mut().insert("retry-after", value.clone());
+        }
+        return Ok(hold_response_buffer(response, buffered.reservation));
     }
     let mut reservation = buffered.reservation;
     reservation.shrink_to(body.len());

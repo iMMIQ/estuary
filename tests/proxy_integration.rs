@@ -2173,6 +2173,72 @@ async fn streaming_body_failure_never_switches_nodes_after_headers() {
 }
 
 #[tokio::test]
+async fn deepseek_responses_does_not_leak_anthropic_upstream_error_envelopes() {
+    use estuary::config::ModelFamily;
+    let upstream = TestServer::spawn(Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            assert_eq!(body["model"], "deepseek-chat");
+            assert!(body["messages"].is_array());
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header(CONTENT_TYPE, "application/json")
+                .header("retry-after", "2")
+                .body(Body::from(
+                    json!({"type":"error", "error":{"type":"rate_limit_error", "message":"upstream is busy"}, "request_id":"anthropic-request"}).to_string(),
+                ))
+                .unwrap()
+        }),
+    ))
+    .await;
+    let mut config = node("deepseek", &upstream, [("public-ds", "deepseek-chat")]);
+    config.provider.anthropic_protocol = AnthropicProtocol::Native;
+    config.model_capabilities.insert(
+        "public-ds".into(),
+        ModelCapabilityConfig {
+            family: ModelFamily::Deepseek,
+            ..ModelCapabilityConfig::default()
+        },
+    );
+    let gateway = spawn_gateway(vec![config]).await;
+    for streaming in [false, true] {
+        let response = test_client()
+            .post(gateway.url("/v1/responses"))
+            .header("user-agent", "codex_cli_rs/1.0")
+            .json(&json!({"model":"public-ds", "input":"hello", "stream":streaming}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "2");
+        let body: Value = response.json().await.unwrap();
+        assert!(
+            body.get("type").is_none(),
+            "Responses received Anthropic envelope: {body}"
+        );
+        assert!(body.get("request_id").is_none());
+        assert_eq!(body["error"]["message"], "upstream is busy");
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["code"], "rate_limit_error");
+        assert!(body["error"]["param"].is_null());
+
+        let response = test_client()
+            .post(gateway.url("/v1/messages"))
+            .json(&json!({"model":"public-ds", "max_tokens":32,
+                          "messages":[{"role":"user","content":"hello"}], "stream":streaming}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "2");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["message"], "upstream is busy");
+    }
+}
+
+#[tokio::test]
 async fn deepseek_recipe_routes_both_client_protocols_through_chat() {
     use estuary::config::ModelFamily;
     let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -2208,6 +2274,7 @@ async fn deepseek_recipe_routes_both_client_protocols_through_chat() {
         }
     }))).await;
     let mut config = node("deepseek", &upstream, [("public-ds", "deepseek-chat")]);
+    config.provider.anthropic_protocol = AnthropicProtocol::Native;
     config.model_capabilities.insert(
         "public-ds".into(),
         ModelCapabilityConfig {
@@ -2216,6 +2283,7 @@ async fn deepseek_recipe_routes_both_client_protocols_through_chat() {
         },
     );
     let gateway = spawn_gateway(vec![config]).await;
+    let mut requests = Vec::new();
     for endpoint in ["messages", "responses"] {
         for streaming in [false, true] {
             let mut body = if endpoint == "messages" {
@@ -2224,42 +2292,69 @@ async fn deepseek_recipe_routes_both_client_protocols_through_chat() {
                 json!({"model":"public-ds","input":"Read the file","tools":[{"type":"namespace","name":"files","tools":[{"type":"function","name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]}]})
             };
             body["stream"] = json!(streaming);
-            let response = test_client()
+            let request = test_client()
                 .post(gateway.url(&format!("/v1/{endpoint}")))
-                .json(&body)
-                .send()
-                .await
-                .unwrap();
-            let status = response.status();
-            let text = response.text().await.unwrap();
-            assert_eq!(status, StatusCode::OK, "{text}");
-            if streaming {
-                assert!(
-                    text.contains(if endpoint == "messages" {
-                        "event: message_stop"
+                .header(
+                    "user-agent",
+                    if endpoint == "messages" {
+                        "codex_cli_rs/1.0"
                     } else {
-                        "event: response.completed"
-                    }),
-                    "{text}"
-                );
-                assert!(text.contains("read_file"), "{text}");
-                assert!(!text.contains("recipe_tool_"), "{text}");
-            } else {
-                let result: Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(result["model"], "public-ds");
-                assert_eq!(result["usage"]["output_tokens"], 7);
-                if endpoint == "messages" {
-                    assert_eq!(result["stop_reason"], "tool_use");
-                    assert_eq!(result["content"][1]["name"], "read_file");
-                    assert_eq!(result["content"][1]["input"]["path"], "README.md");
-                } else {
-                    assert_eq!(result["output"][1]["name"], "read_file");
-                    assert_eq!(result["output"][1]["namespace"], "files");
-                }
-            }
+                        "claude-code/1.0"
+                    },
+                )
+                .header("anthropic-version", "2023-06-01")
+                .json(&body)
+                .build()
+                .unwrap();
+            requests.push(async move {
+                let response = test_client().execute(request).await.unwrap();
+                let status = response.status();
+                let text = response.text().await.unwrap();
+                assert_eq!(status, StatusCode::OK, "{text}");
+                assert_deepseek_tool_response(endpoint, streaming, &text);
+            });
         }
     }
+    futures_util::future::join_all(requests).await;
     assert_eq!(captured.lock().unwrap().len(), 4);
+}
+
+fn assert_deepseek_tool_response(endpoint: &str, streaming: bool, text: &str) {
+    if streaming {
+        for line in text.lines().filter_map(|line| line.strip_prefix("event: ")) {
+            assert_eq!(
+                line.starts_with("response."),
+                endpoint == "responses",
+                "{text}"
+            );
+        }
+        assert!(
+            text.contains(if endpoint == "messages" {
+                "event: message_stop"
+            } else {
+                "event: response.completed"
+            }),
+            "{text}"
+        );
+        assert!(text.contains("read_file"), "{text}");
+        assert!(!text.contains("recipe_tool_"), "{text}");
+    } else {
+        let result: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(result["model"], "public-ds");
+        assert_eq!(result["usage"]["output_tokens"], 7);
+        if endpoint == "messages" {
+            assert_eq!(result["type"], "message");
+            assert!(result.get("output").is_none());
+            assert_eq!(result["stop_reason"], "tool_use");
+            assert_eq!(result["content"][1]["name"], "read_file");
+            assert_eq!(result["content"][1]["input"]["path"], "README.md");
+        } else {
+            assert_eq!(result["object"], "response");
+            assert!(result.get("content").is_none());
+            assert_eq!(result["output"][1]["name"], "read_file");
+            assert_eq!(result["output"][1]["namespace"], "files");
+        }
+    }
 }
 
 #[tokio::test]
