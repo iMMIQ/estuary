@@ -54,7 +54,7 @@ Each node contains:
 | `id` | Unique stable identifier. |
 | `base_url` | Absolute HTTP(S) OpenAI-compatible base URL. Credentials, query strings, and fragments are rejected. |
 | `models` | Public-to-upstream model mappings. A value of `*` preserves the requested model; a public key of `*` matches unlisted models. |
-| `model_capabilities` | Optional per-public-model capabilities. Set `multimodal: false` for a text-only model; omitted entries retain the legacy text-and-image behavior. |
+| `model_capabilities` | Per-public-model capabilities, with `*` as the fallback. Set `multimodal: false` for text-only models and `family: "deepseek"` for the DeepSeek recipe. Without either an exact entry or a fallback, models use the generic recipe and accept images. |
 | `max_concurrency` | Hard in-flight limit in this gateway process. |
 | `weight` | Positive scheduling weight. |
 | `health_path` | Authenticated active-probe path, default `/v1/models`. |
@@ -123,6 +123,33 @@ send `Authorization: Bearer TOKEN`.
 
 Use liveness for process restart policy and readiness for traffic admission.
 Upstream failure intentionally changes readiness, not liveness.
+
+## Management Application
+
+The editor preserves wildcard model capabilities and warns before leaving an
+unsaved draft. A revision conflict offers either reloading the current record
+or merging remote changes into untouched fields. Overlapping changes are shown
+by field name, and choosing the merge retains local values for those fields.
+Review the resulting configuration before saving again.
+
+The Models tab and save preview show each model's effective Responses and
+Messages conversion paths. A DeepSeek recipe takes precedence over the node's
+Anthropic protocol setting. Connection tests validate configuration and probe
+health/provider compatibility; they do not run an inference request or verify
+generation protocol conversion. Editing the draft invalidates the previous
+connection-test result.
+
+The overview includes measured TTFT, pending prefill/decode token reservations,
+and admission warnings. Missing or stale provider telemetry is unavailable,
+rather than zero. Failed refreshes retain previous data with a stale-data
+notice. Polling pauses while the page is hidden and backs off after failures.
+The vLLM runtime panel starts collapsed on small screens.
+
+Editor and details code loads on demand. The embedded server negotiates
+precompressed gzip JavaScript/CSS using `Accept-Encoding`, sets `Vary`, and
+retains immutable caching for hashed assets. The HTML entry point is uncached.
+Run `bun run build` in `web/` before building the gateway to update its bundled
+assets, including the generated `.gz` files.
 
 ## Metrics
 

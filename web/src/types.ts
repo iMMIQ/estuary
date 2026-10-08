@@ -78,6 +78,9 @@ export interface NodeRuntime {
   prefix_cache_hit_rate: number | null;
   preemptions_total: number | null;
   latency_ewma_ms: number;
+  ttft_ewma_ms: number | null;
+  pending_prefill_tokens: number;
+  pending_decode_tokens: number;
   error_ewma: number;
   last_error: string | null;
   last_change_unix_ms: number;
@@ -173,6 +176,7 @@ export interface Pair {
   value: string;
   multimodal?: boolean;
   family?: ModelFamily;
+  inherit_capability?: boolean;
 }
 
 export interface NodeDraft extends Omit<NodeConfig, "api_key" | "models" | "model_capabilities" | "headers_from_env"> {
@@ -180,4 +184,6 @@ export interface NodeDraft extends Omit<NodeConfig, "api_key" | "models" | "mode
   preserve_api_key: boolean;
   models: Pair[];
   headers_from_env: Pair[];
+  wildcard_capability?: ModelCapabilityConfig;
+  unmapped_capabilities?: Record<string, ModelCapabilityConfig>;
 }

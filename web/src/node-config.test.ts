@@ -7,9 +7,45 @@ import {
   recordToDraft,
   shouldClearApiKey,
   validateDraft,
+  effectiveCapability,
+  protocolPaths,
 } from "./node-config";
+import type { NodeRecord } from "./types";
 
 describe("node config mapping", () => {
+  test("round trips wildcard and explicit model capabilities without materializing inherited values", () => {
+    const config = draftToConfig(createDraft("openai"));
+    config.models = { ds: "deepseek-chat", plain: "other" };
+    config.model_capabilities = { "*": { family: "deepseek", multimodal: false }, plain: { family: "generic", multimodal: true } };
+    const draft = recordToDraft({ config, credentials: { api_key_source: "none" } } as NodeRecord);
+    expect(draft.models[0]).toMatchObject({ family: "deepseek", multimodal: false, inherit_capability: true });
+    expect(draftToConfig(draft).model_capabilities).toEqual(config.model_capabilities);
+    expect(effectiveCapability(config, "ds").family).toBe("deepseek");
+    expect(protocolPaths(config, "ds").responses).toBe("Responses → Chat Completions → Responses");
+    expect(protocolPaths(config, "plain").responses).toBe("Responses → Responses");
+    draft.models[0] = { ...draft.models[0], inherit_capability: false, family: "generic" };
+    expect(draftToConfig(draft).model_capabilities.ds.family).toBe("generic");
+    expect(draftToConfig(draft).model_capabilities["*"].family).toBe("deepseek");
+  });
+
+  test("generic protocol paths resolve provider defaults and explicit settings", () => {
+    const config = draftToConfig(createDraft("vllm"));
+    expect(protocolPaths(config, "x").messages).toBe("Messages → Messages");
+    config.provider.type = "openai";
+    expect(protocolPaths(config, "x").messages).toBe("Messages → Chat Completions → Messages");
+    config.provider.anthropic_protocol = "responses";
+    expect(protocolPaths(config, "x").messages).toBe("Messages → Responses → Messages");
+  });
+
+  test("catch-all model mapping retains capabilities for individual public aliases", () => {
+    const config = draftToConfig(createDraft("openai"));
+    config.models = { "*": "*" };
+    config.model_capabilities = { ds: { family: "deepseek", multimodal: false } };
+    const draft = recordToDraft({ config, credentials: { api_key_source: "none" } } as NodeRecord);
+    expect(draftToConfig(draft).model_capabilities).toEqual(config.model_capabilities);
+    draft.models = [{ key: "ds", value: "upstream" }];
+    expect(draftToConfig(draft).model_capabilities.ds.family).toBe("generic");
+  });
   test("drops blank key-value rows", () => {
     expect(
       pairsToRecord([

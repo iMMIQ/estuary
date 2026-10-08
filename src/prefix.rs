@@ -927,7 +927,10 @@ mod tests {
             Some(&json!({"prompt": "same"})),
             &config,
         );
-        assert!(directory.best_match(&other_model).node_ids.is_empty());
+        assert_eq!(
+            directory.best_match(&other_model).node_ids,
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -953,7 +956,10 @@ mod tests {
             Some(&json!({"prompt": "a"})),
             &config,
         );
-        assert!(directory.best_match(&evicted).node_ids.is_empty());
+        assert_eq!(
+            directory.best_match(&evicted).node_ids,
+            Vec::<String>::new()
+        );
 
         directory.clear_node("node-a");
         assert!(directory.trees.read().values.is_empty());
@@ -1045,7 +1051,7 @@ mod tests {
         tree.insert("cccc", "node-a", 8);
 
         assert_eq!(tree.prefix_match("aaaa", 4).node_ids, ["node-a"]);
-        assert!(tree.prefix_match("bbbb", 4).node_ids.is_empty());
+        assert_eq!(tree.prefix_match("bbbb", 4).node_ids, Vec::<String>::new());
         assert_eq!(tree.prefix_match("cccc", 4).node_ids, ["node-a"]);
     }
 

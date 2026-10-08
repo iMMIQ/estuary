@@ -1368,7 +1368,7 @@ async fn oversized_request_returns_openai_413_with_request_id() {
         .get("x-request-id")
         .and_then(|value| value.to_str().ok())
         .expect("413 x-request-id");
-    assert!(!request_id.is_empty());
+    assert_ne!(request_id, "");
 
     let body: Value = response.json().await.expect("413 OpenAI error JSON");
     assert_eq!(body["error"]["type"], "invalid_request_error");

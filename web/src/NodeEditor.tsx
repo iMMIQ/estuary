@@ -18,13 +18,14 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import * as api from "./api";
 import type { TranslationKey } from "./i18n";
-import { draftToConfig, shouldClearApiKey, validateDraft } from "./node-config";
+import { draftToConfig, draftWildcardCapability, effectiveModelMappings, protocolPaths, recordToDraft, shouldClearApiKey, validateDraft } from "./node-config";
+import { mergeDraft } from "./draft-merge";
 import type { DraftErrors } from "./node-config";
-import type { AnthropicProtocol, KvEventsConfig, NodeDraft, Pair, PreflightResponse, ProviderKind } from "./types";
+import type { AnthropicProtocol, KvEventsConfig, ModelCapabilityConfig, NodeDraft, NodeRecord, Pair, PreflightResponse, ProviderKind } from "./types";
 
 export type EditorState =
   | { mode: "create"; draft: NodeDraft; revision: null }
@@ -40,7 +41,9 @@ function PairEditor({
   onChange,
   keyLabel,
   valueLabel,
+  inherited,
 }: {
+  inherited?: ModelCapabilityConfig;
   rows: Pair[];
   error?: string;
   onChange: (rows: Pair[]) => void;
@@ -49,7 +52,7 @@ function PairEditor({
 }) {
   const { t } = useTranslation();
   const update = (index: number, key: keyof Pair, value: string | boolean) => {
-    onChange(rows.map((row, rowIndex) => rowIndex === index ? { ...row, [key]: value } : row));
+    onChange(rows.map((row, rowIndex) => rowIndex === index ? { ...row, ...(row.inherit_capability && ["family", "multimodal"].includes(key) ? { family: inherited?.family ?? "generic", multimodal: inherited?.multimodal ?? true } : {}), [key]: value, ...(["family", "multimodal"].includes(key) || (key === "key" && value === "*") ? { inherit_capability: false } : {}) } : row));
   };
 
   return <div className="mapping-editor">
@@ -57,8 +60,8 @@ function PairEditor({
     {rows.map((row, index) => <div className="mapping-row" key={index}>
       <TextInput aria-label={`${keyLabel} ${index + 1}`} value={row.key} error={Boolean(error)} onChange={(event) => update(index, "key", event.target.value)} />
       <TextInput aria-label={`${valueLabel} ${index + 1}`} value={row.value} error={Boolean(error)} onChange={(event) => update(index, "value", event.target.value)} />
-      <Switch size="sm" aria-label={`${t("editor.multimodal")} ${index + 1}`} checked={row.multimodal !== false} onChange={(event) => update(index, "multimodal", event.currentTarget.checked)} />
-      <Select aria-label={`${t("editor.modelFamily")} ${index + 1}`} value={row.family ?? "generic"} data={[{ value: "generic", label: t("family.generic") }, { value: "deepseek", label: t("family.deepseek") }]} onChange={(value) => value && update(index, "family", value)} />
+      <Switch size="sm" aria-label={`${t("editor.multimodal")} ${index + 1}`} checked={row.inherit_capability ? inherited?.multimodal ?? true : row.multimodal !== false} onChange={(event) => update(index, "multimodal", event.currentTarget.checked)} />
+      <Select aria-label={`${t("editor.modelFamily")} ${index + 1}`} value={row.inherit_capability ? "inherit" : row.family ?? "generic"} data={[{ value: "inherit", label: t("editor.inheritedFamily", { family: t(`family.${inherited?.family ?? "generic"}`) }) }, { value: "generic", label: t("family.generic") }, { value: "deepseek", label: t("family.deepseek") }]} onChange={(value) => { if (value === "inherit") onChange(rows.map((item, i) => i === index ? { ...item, inherit_capability: true, family: inherited?.family ?? "generic", multimodal: inherited?.multimodal ?? true } : item)); else if (value) update(index, "family", value); }} />
       <Button variant="subtle" color="gray" px={6} aria-label={t("editor.removeMapping", { count: index + 1 })} onClick={() => onChange(rows.length === 1 ? [{ key: "", value: "" }] : rows.filter((_, rowIndex) => rowIndex !== index))}><Trash2 size={14} /></Button>
     </div>)}
     {error && <span className="form-error" role="alert">{t(error as TranslationKey)}</span>}
@@ -75,7 +78,13 @@ export function NodeEditor({
   busy,
   onClose,
   onSave,
+  onDirtyChange,
+  conflict,
+  onResolveConflict,
 }: {
+  onDirtyChange: (dirty: boolean) => void;
+  conflict: NodeRecord | null;
+  onResolveConflict: () => void;
   state: EditorState;
   busy: boolean;
   onClose: () => void;
@@ -89,16 +98,44 @@ export function NodeEditor({
   const [checking, setChecking] = useState(false);
   const [preflight, setPreflight] = useState<PreflightResponse | null>(null);
   const [preflightError, setPreflightError] = useState<string | null>(null);
-  const initialDraft = useMemo(() => JSON.stringify(state.draft), [state.draft]);
-  const dirty = JSON.stringify(draft) !== initialDraft;
+  const [baseDraft, setBaseDraft] = useState(state.draft);
+  const [revision, setRevision] = useState(state.revision);
+  const pending = useRef<AbortController | null>(null);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(baseDraft);
+  const remoteDraft = conflict ? recordToDraft(conflict) : null;
+  const merged = remoteDraft ? mergeDraft(baseDraft, draft, remoteDraft) : null;
+  useEffect(() => { onDirtyChange(dirty); }, [dirty, onDirtyChange]);
+  useEffect(() => () => pending.current?.abort(), []);
+  useEffect(() => {
+    if (!dirty) return;
+    const preventLeave = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", preventLeave);
+    return () => window.removeEventListener("beforeunload", preventLeave);
+  }, [dirty]);
+  const resolveConflict = (keepChanges: boolean) => {
+    if (!conflict || !remoteDraft || !merged) return;
+    pending.current?.abort();
+    setDraft(keepChanges ? merged.draft : remoteDraft);
+    setBaseDraft(remoteDraft);
+    setRevision(conflict.revision);
+    setPreflight(null);
+    setPreflightError(null);
+    setErrors({});
+    setStep(0);
+    onResolveConflict();
+  };
 
   const update = useCallback((change: (current: NodeDraft) => NodeDraft) => {
+    pending.current?.abort();
+    pending.current = null;
+    setChecking(false);
     setDraft((current) => change(current));
     setPreflight(null);
     setPreflightError(null);
   }, []);
 
   const requestClose = () => {
+    if (busy) return;
     if (!dirty || window.confirm(t("editor.discard"))) onClose();
   };
 
@@ -121,15 +158,19 @@ export function NodeEditor({
 
   const testConnection = async () => {
     if (!validate()) return;
+    const controller = new AbortController();
+    pending.current?.abort();
+    pending.current = controller;
     setChecking(true);
     setPreflight(null);
     setPreflightError(null);
     try {
-      setPreflight(await api.preflightNode(draftToConfig(draft), shouldClearApiKey(draft)));
+      const result = await api.preflightNode(draftToConfig(draft), shouldClearApiKey(draft), controller.signal);
+      if (!controller.signal.aborted) setPreflight(result);
     } catch (error) {
-      setPreflightError(error instanceof Error ? error.message : t("editor.connectionTestFailed"));
+      if (!controller.signal.aborted) setPreflightError(error instanceof Error ? error.message : t("editor.connectionTestFailed"));
     } finally {
-      setChecking(false);
+      if (pending.current === controller) { pending.current = null; setChecking(false); }
     }
   };
 
@@ -166,10 +207,10 @@ export function NodeEditor({
     .map((value) => ({ value, label: t(`protocol.${value}` as TranslationKey) }));
 
   return <div className="editor-page page-frame">
-    <button className="breadcrumb-button" type="button" onClick={requestClose}><ArrowLeft size={15} /> {t("editor.back")}</button>
+    <button className="breadcrumb-button" type="button" disabled={busy} onClick={requestClose}><ArrowLeft size={15} /> {t("editor.back")}</button>
     <header className="editor-header"><h1>{state.mode === "create" ? t("editor.addTitle") : t("editor.editTitle", { id: draft.id })}</h1></header>
 
-    <Stepper active={step} onStepClick={(nextStep) => nextStep < step && setStep(nextStep)} className="node-stepper" size="sm">
+    <Stepper active={step} onStepClick={(nextStep) => !busy && nextStep < step && setStep(nextStep)} className="node-stepper" size="sm">
       <Stepper.Step label={t("editor.stepBasic")} description={t("editor.stepBasicDescription")} />
       <Stepper.Step label={t("editor.stepAdvanced")} description={t("editor.stepAdvancedDescription")} />
       <Stepper.Step label={t("editor.stepReview")} description={t("editor.stepReviewDescription")} />
@@ -177,10 +218,16 @@ export function NodeEditor({
 
     <form className="wizard-form" noValidate onSubmit={(event) => {
       event.preventDefault();
+      if (busy || checking) return;
       if (step < 2) next();
-      else if (validate()) void onSave({ ...state, draft } as EditorState);
+      else if (!conflict && validate()) void onSave({ ...state, draft, revision } as EditorState);
     }}>
-      <div className="wizard-content">
+      <fieldset className="wizard-content" disabled={busy}>
+        {conflict && <Alert color="amber" title={t("editor.conflictTitle")}>
+          <p>{t("editor.conflictDescription", { before: revision, after: conflict.revision })}</p>
+          {merged?.conflicts.length ? <p>{t("editor.conflictFields", { fields: merged.conflicts.join(", ") })}</p> : <p>{t("editor.conflictNoOverlap")}</p>}
+          <div className="conflict-actions"><Button variant="default" onClick={() => resolveConflict(false)}>{t("editor.reloadLatest")}</Button><Button onClick={() => resolveConflict(true)}>{t("editor.keepChanges")}</Button></div>
+        </Alert>}
         {step === 0 && <>
           <section className="wizard-section">
             <div className="section-title"><h2>{t("editor.basicInformation")}</h2><span>{t("editor.basicDescription")}</span></div>
@@ -205,7 +252,7 @@ export function NodeEditor({
           </section>
           <section className="wizard-section">
             <div className="section-title"><h2>{t("editor.modelMappings")}</h2><span>{t("editor.configuredCount", { count: draft.models.filter((row) => row.key && row.value).length })}</span></div>
-            <PairEditor rows={draft.models} error={errors.models} keyLabel={t("editor.publicModel")} valueLabel={t("editor.upstreamModel")} onChange={(models) => update((current) => ({ ...current, models }))} />
+            <PairEditor inherited={draftWildcardCapability(draft)} rows={draft.models} error={errors.models} keyLabel={t("editor.publicModel")} valueLabel={t("editor.upstreamModel")} onChange={(models) => update((current) => ({ ...current, models }))} />
           </section>
         </>}
 
@@ -277,6 +324,7 @@ export function NodeEditor({
             <ReviewRow label={t("editor.maxConcurrency")} value={draft.max_concurrency} />
             <ReviewRow label={t("editor.schedulingWeight")} value={draft.weight} />
             <ReviewRow label={t("editor.modelMappings")} value={draft.models.filter((row) => row.key && row.value).length} />
+            {effectiveModelMappings(draftToConfig(draft)).map(([model]) => <div className="protocol-review" key={model}><strong>{model}</strong><span>Codex: {protocolPaths(draftToConfig(draft), model).responses}</span><span>Claude: {protocolPaths(draftToConfig(draft), model).messages}</span></div>)}
             <ReviewRow label={t("editor.healthPath")} value={draft.health_path} />
             <ReviewRow label={t("editor.bearerCredential")} value={draft.api_key.trim() || draft.preserve_api_key || draft.api_key_env ? t("common.configured") : t("common.notConfigured")} />
             <ReviewRow label={t("editor.lifecycle")} value={draft.draining ? t("overview.draining") : t("editor.serving")} />
@@ -287,13 +335,13 @@ export function NodeEditor({
         {(preflight || preflightError) && <Alert className="preflight-alert" icon={preflight ? <Check size={16} /> : <X size={16} />} color={preflight ? "green" : "red"} title={preflight ? t("editor.connectionVerified") : t("editor.connectionFailed")}>
           {preflight ? t("editor.connectionPassed", { provider: preflight.runtime.provider === "vllm" ? "vLLM" : "OpenAI-compatible" }) : preflightError}
         </Alert>}
-      </div>
+      </fieldset>
 
       <footer className="wizard-footer">
         <Button variant="default" leftSection={checking ? <LoaderCircle className="spin" size={15} /> : <FlaskConical size={15} />} disabled={busy || checking} onClick={() => void testConnection()}>{t("editor.testConnection")}</Button>
         <span className="footer-spacer" />
         <Button variant="default" disabled={busy || checking} onClick={step === 0 ? requestClose : () => setStep((current) => current - 1)}>{step === 0 ? t("common.cancel") : t("common.back")}</Button>
-        <Button type="submit" disabled={busy || checking} leftSection={busy ? <LoaderCircle className="spin" size={15} /> : step === 2 ? <Check size={15} /> : undefined}>{step === 2 ? state.mode === "create" ? t("upstreams.addNode") : t("editor.saveChanges") : t("common.next")}</Button>
+        <Button type="submit" disabled={busy || checking || Boolean(conflict)} leftSection={busy ? <LoaderCircle className="spin" size={15} /> : step === 2 ? <Check size={15} /> : undefined}>{step === 2 ? state.mode === "create" ? t("upstreams.addNode") : t("editor.saveChanges") : t("common.next")}</Button>
       </footer>
     </form>
   </div>;

@@ -18,10 +18,10 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{
-        HeaderValue, Method, StatusCode,
+        HeaderMap, HeaderValue, Method, StatusCode,
         header::{
-            AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
-            WWW_AUTHENTICATE,
+            ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH,
+            CONTENT_SECURITY_POLICY, CONTENT_TYPE, VARY, WWW_AUTHENTICATE,
         },
     },
     middleware::{self, Next},
@@ -1028,33 +1028,64 @@ async fn admin_redirect() -> Redirect {
 }
 
 async fn admin_index() -> Response {
-    embedded_admin_response("index.html", false)
+    embedded_admin_response("index.html", false, false)
 }
 
-async fn admin_asset(Path(asset): Path<String>) -> Response {
+async fn admin_asset(Path(asset): Path<String>, headers: HeaderMap) -> Response {
     if AdminAssets::get(&asset).is_some() {
-        return embedded_admin_response(&asset, asset.starts_with("assets/"));
+        return embedded_admin_response(
+            &asset,
+            asset.starts_with("assets/"),
+            accepts_gzip(&headers),
+        );
     }
     if !asset.rsplit('/').next().unwrap_or_default().contains('.') {
-        return embedded_admin_response("index.html", false);
+        return embedded_admin_response("index.html", false, false);
     }
     StatusCode::NOT_FOUND.into_response()
 }
 
-fn embedded_admin_response(path: &str, immutable: bool) -> Response {
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    let mut wildcard = false;
+    let mut gzip = None;
+    for value in headers.get_all(ACCEPT_ENCODING) {
+        let Ok(value) = value.to_str() else { continue };
+        for item in value.split(',') {
+            let mut parts = item.trim().split(';');
+            let encoding = parts.next().unwrap_or_default().trim();
+            let quality = parts
+                .find_map(|part| part.trim().strip_prefix("q="))
+                .map_or(Some(1.0), |value| value.parse::<f32>().ok());
+            let allowed = quality.is_some_and(|quality| quality > 0.0 && quality <= 1.0);
+            if encoding.eq_ignore_ascii_case("gzip") {
+                gzip = Some(allowed);
+            } else if encoding == "*" {
+                wildcard = allowed;
+            }
+        }
+    }
+    gzip.unwrap_or(wildcard)
+}
+
+fn embedded_admin_response(path: &str, immutable: bool, gzip: bool) -> Response {
     let Some(asset) = AdminAssets::get(path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let content_type = mime_guess::from_path(path).first_or_octet_stream();
+    let compressed = gzip
+        .then(|| AdminAssets::get(&format!("{path}.gz")))
+        .flatten();
+    let is_compressed = compressed.is_some();
     let cache_control = if immutable {
         "public, max-age=31536000, immutable"
     } else {
         "no-store"
     };
-    Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, content_type.as_ref())
         .header(CACHE_CONTROL, cache_control)
+        .header(VARY, "Accept-Encoding")
         .header("x-content-type-options", "nosniff")
         .header("x-frame-options", "DENY")
         .header("referrer-policy", "no-referrer")
@@ -1063,8 +1094,14 @@ fn embedded_admin_response(path: &str, immutable: bool) -> Response {
             CONTENT_SECURITY_POLICY,
             "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
         )
-        .body(axum::body::Body::from(asset.data.into_owned()))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        .body(axum::body::Body::from(compressed.unwrap_or(asset).data.into_owned()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    if is_compressed {
+        response
+            .headers_mut()
+            .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+    }
+    response
 }
 
 async fn live() -> Json<serde_json::Value> {
@@ -1840,6 +1877,56 @@ fn unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gzip_negotiation_respects_explicit_refusal_and_quality() {
+        for (value, expected) in [
+            ("gzip, br", true),
+            ("GZIP; q=0.5", true),
+            ("identity", false),
+            ("gzip;q=0, *;q=1", false),
+            ("*;q=0.2", true),
+            ("gzip;q=invalid", false),
+            ("gzip;q=2", false),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(ACCEPT_ENCODING, value.parse().unwrap());
+            assert_eq!(accepts_gzip(&headers), expected, "{value}");
+        }
+        assert!(!accepts_gzip(&HeaderMap::new()));
+    }
+
+    #[tokio::test]
+    async fn admin_assets_serve_precompressed_bytes_with_matching_content_type_and_cache_policy() {
+        let path = AdminAssets::iter()
+            .find(|path| path.ends_with(".css"))
+            .unwrap();
+        let plain = embedded_admin_response(&path, true, false);
+        let compressed = embedded_admin_response(&path, true, true);
+        assert_eq!(compressed.headers()[CONTENT_ENCODING], "gzip");
+        assert_eq!(compressed.headers()[VARY], "Accept-Encoding");
+        assert_eq!(
+            compressed.headers()[CONTENT_TYPE],
+            plain.headers()[CONTENT_TYPE]
+        );
+        assert_eq!(
+            compressed.headers()[CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert!(!plain.headers().contains_key(CONTENT_ENCODING));
+        let compressed = axum::body::to_bytes(compressed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let plain = axum::body::to_bytes(plain.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(compressed.starts_with(&[0x1f, 0x8b]));
+        assert!(compressed.len() < plain.len());
+        assert_eq!(
+            embedded_admin_response("index.html", false, true).headers()[CACHE_CONTROL],
+            "no-store"
+        );
+    }
 
     #[test]
     fn metric_paths_have_bounded_cardinality() {

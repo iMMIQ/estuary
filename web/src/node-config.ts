@@ -1,4 +1,4 @@
-import type { NodeConfig, NodeDraft, NodeRecord, Pair, ProviderKind } from "./types";
+import type { ModelCapabilityConfig, NodeConfig, NodeDraft, NodeRecord, Pair, ProviderKind } from "./types";
 
 export type DraftErrors = Record<string, string>;
 
@@ -19,12 +19,39 @@ export function recordToPairs(record: Record<string, string>): Pair[] {
   return pairs.length > 0 ? pairs : [{ key: "", value: "" }];
 }
 
+export function effectiveCapability(config: NodeConfig, model: string): ModelCapabilityConfig {
+  return config.model_capabilities?.[model] ?? config.model_capabilities?.["*"] ?? { multimodal: true, family: "generic" };
+}
+
+export function effectiveModelMappings(config: NodeConfig): [string, string][] {
+  const entries = Object.entries(config.models);
+  const fallback = config.models["*"];
+  if (fallback !== undefined) {
+    for (const model of Object.keys(config.model_capabilities ?? {})) {
+      if (model !== "*" && !Object.hasOwn(config.models, model)) entries.push([model, fallback === "*" ? model : fallback]);
+    }
+  }
+  return entries;
+}
+
+export function protocolPaths(config: NodeConfig, model: string): { responses: string; messages: string } {
+  if (effectiveCapability(config, model).family === "deepseek") return {
+    responses: "Responses → Chat Completions → Responses",
+    messages: "Messages → Chat Completions → Messages",
+  };
+  const protocol = config.provider.anthropic_protocol === "auto"
+    ? config.provider.type === "vllm" ? "native" : "chat" : config.provider.anthropic_protocol;
+  return { responses: "Responses → Responses", messages: protocol === "native" ? "Messages → Messages"
+    : protocol === "responses" ? "Messages → Responses → Messages" : "Messages → Chat Completions → Messages" };
+}
+
 function modelPairs(node: NodeRecord): Pair[] {
   const pairs = Object.entries(node.config.models).map(([key, value]) => ({
     key,
     value,
-    multimodal: node.config.model_capabilities?.[key]?.multimodal ?? true,
-    family: node.config.model_capabilities?.[key]?.family ?? "generic",
+    multimodal: effectiveCapability(node.config, key).multimodal,
+    family: effectiveCapability(node.config, key).family ?? "generic",
+    inherit_capability: !Object.hasOwn(node.config.model_capabilities ?? {}, key),
   }));
   return pairs.length > 0 ? pairs : [{ key: "", value: "", multimodal: true }];
 }
@@ -69,12 +96,15 @@ export function recordToDraft(node: NodeRecord): NodeDraft {
     api_key: "",
     preserve_api_key: node.credentials.api_key_source === "database",
     models: modelPairs(node),
+    wildcard_capability: structuredClone(node.config.model_capabilities?.["*"]),
+    unmapped_capabilities: structuredClone(Object.fromEntries(Object.entries(node.config.model_capabilities ?? {})
+      .filter(([model]) => model !== "*" && !Object.hasOwn(node.config.models, model)))),
     headers_from_env: recordToPairs(node.config.headers_from_env),
   };
 }
 
 export function draftToConfig(draft: NodeDraft): NodeConfig {
-  const { preserve_api_key: _, ...config } = draft;
+  const { preserve_api_key: _, wildcard_capability, unmapped_capabilities, ...config } = draft;
   const apiKey = draft.api_key.trim();
   return {
     ...config,
@@ -84,11 +114,14 @@ export function draftToConfig(draft: NodeDraft): NodeConfig {
     api_key_env: apiKey ? null : draft.api_key_env?.trim() || null,
     health_path: draft.health_path.trim(),
     models: pairsToRecord(draft.models),
-    model_capabilities: Object.fromEntries(
+    model_capabilities: {
+      ...(draft.models.some(row => row.key.trim() === "*" && row.value.trim()) ? unmapped_capabilities : {}),
+      ...(wildcard_capability ? { "*": wildcard_capability } : {}), ...Object.fromEntries(
       draft.models
+        .filter((row) => !row.inherit_capability)
         .map((row) => [row.key.trim(), { multimodal: row.multimodal !== false, family: row.family ?? "generic" }] as const)
         .filter(([key]) => key.length > 0),
-    ),
+    ) },
     headers_from_env: pairsToRecord(draft.headers_from_env),
     provider: {
       ...draft.provider,
@@ -96,6 +129,11 @@ export function draftToConfig(draft: NodeDraft): NodeConfig {
         draft.provider.type === "vllm" ? draft.provider.kv_events : null,
     },
   };
+}
+
+export function draftWildcardCapability(draft: NodeDraft): ModelCapabilityConfig | undefined {
+  const row = draft.models.find(item => item.key.trim() === "*" && !item.inherit_capability);
+  return row ? { family: row.family ?? "generic", multimodal: row.multimodal !== false } : draft.wildcard_capability;
 }
 
 export function shouldClearApiKey(draft: NodeDraft): boolean {

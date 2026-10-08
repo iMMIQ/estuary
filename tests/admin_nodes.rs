@@ -140,12 +140,7 @@ async fn creates_updates_and_deletes_a_live_node() {
         .await
         .unwrap();
     assert_eq!(initial.status(), StatusCode::OK);
-    assert!(
-        initial.json::<Value>().await.unwrap()["nodes"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(initial.json::<Value>().await.unwrap()["nodes"], json!([]));
     let initial_status = client
         .get(admin.url("/admin/api/status"))
         .send()
@@ -425,7 +420,7 @@ async fn preflight_checks_a_node_without_persisting_it() {
         .json::<Value>()
         .await
         .unwrap();
-    assert!(nodes["nodes"].as_array().unwrap().is_empty());
+    assert_eq!(nodes["nodes"], json!([]));
 }
 
 #[tokio::test]

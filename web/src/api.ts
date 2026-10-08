@@ -50,6 +50,10 @@ export function getStatus(signal?: AbortSignal): Promise<GatewayStatus> {
   return request("/admin/api/status", readOptions(signal));
 }
 
+export function getNode(id: string): Promise<NodeRecord> {
+  return request(`/admin/api/nodes/${encodeURIComponent(id)}`, readOptions());
+}
+
 export function setIpLimit(ip: string, limit: number): Promise<unknown> {
   return request(`/admin/api/ip-limits/${encodeURIComponent(ip)}`, {
     method: "PUT",
@@ -61,10 +65,11 @@ export function deleteIpLimit(ip: string): Promise<unknown> {
   return request(`/admin/api/ip-limits/${encodeURIComponent(ip)}`, { method: "DELETE" });
 }
 
-export function preflightNode(config: NodeConfig, clearApiKey = false): Promise<PreflightResponse> {
+export function preflightNode(config: NodeConfig, clearApiKey = false, signal?: AbortSignal): Promise<PreflightResponse> {
   const query = clearApiKey ? "?clear_api_key=true" : "";
   return request(`/admin/api/nodes/preflight${query}`, {
     method: "POST",
+    ...readOptions(signal),
     body: JSON.stringify(config),
   });
 }

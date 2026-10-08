@@ -39,6 +39,27 @@ h2 { font-size: 13px; font-weight: 650; }
 h3 { font-size: 13px; font-weight: 640; }
 
 .app-shell { min-height: 100vh; }
+.conflict-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.protocol-panel { padding: 18px; margin-top: 16px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); }
+.protocol-panel > p { margin: 8px 0 14px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.protocol-review { display: grid; gap: 6px; padding: 12px 0; border-bottom: 1px solid var(--border-soft); font-size: 12px; overflow-wrap: anywhere; }
+.protocol-review span, .protocol-review small { color: var(--muted); }
+.data-status { max-width: 1204px; margin: 0 auto; padding: 10px 14px; color: var(--amber); font-size: 12px; }
+.scheduler-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 16px; gap: 16px; }
+.scheduler-grid .metric-box { border-right: 1px solid var(--border-soft); padding: 8px; }
+.scheduler-grid .metric-box:last-child { border-right: 0; }
+.vllm-runtime-panel > summary { cursor: pointer; list-style: none; }
+.vllm-runtime-panel > summary::-webkit-details-marker { display: none; }
+.vllm-runtime-panel > summary small { display: none; }
+.attention-actions-grid { margin-bottom: 16px; }
+@media (max-width: 720px) {
+  .vllm-runtime-panel > summary small { display: block; color: var(--indigo); font-size: 12px; }
+  .vllm-runtime-panel[open] > summary small { display: none; }
+  .scheduler-grid { grid-template-columns: 1fr; gap: 6px; padding: 10px; }
+  .scheduler-grid .metric-box { border-right: 0; border-bottom: 1px solid var(--border-soft); }
+  .scheduler-grid .metric-box:last-child { border-bottom: 0; }
+  .protocol-panel { padding: 12px; }
+}
 .desktop-sidebar {
   position: fixed; inset: 0 auto 0 0; z-index: 30; display: flex; width: 216px; flex-direction: column;
   padding: 24px 16px 18px; border-right: 1px solid var(--border); background: var(--sidebar);
@@ -408,3 +429,5 @@ h3 { font-size: 13px; font-weight: 640; }
   .app-notification { right: 10px; bottom: 68px; width: calc(100vw - 20px); }
   .connection-banner { margin: 0; }
 }
+
+fieldset.wizard-content { border: 0; margin: 0; min-inline-size: 0; }
