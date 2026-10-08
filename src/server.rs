@@ -16,7 +16,10 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{
+        DefaultBodyLimit, Path, Query, Request, State,
+        connect_info::{ConnectInfo, Connected},
+    },
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
         header::{
@@ -27,7 +30,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::{any, get, put},
-    serve::Listener,
+    serve::{IncomingStream, Listener},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::StreamExt;
@@ -50,6 +53,7 @@ use uuid::Uuid;
 use crate::{
     Settings, anthropic,
     config::{NodeConfig, validate_node_config},
+    connection_drain::{PendingConnection, PendingConnections},
     error::GatewayError,
     health::{preflight_health, run_health_monitor},
     lifecycle::ProcessLifecycle,
@@ -96,6 +100,7 @@ struct BoundedTcpListener {
     connections: Arc<ConnectionTracker>,
     track_public: bool,
     accept_cancellation: CancellationToken,
+    pending_connections: Arc<PendingConnections>,
 }
 
 impl BoundedTcpListener {
@@ -114,6 +119,7 @@ impl BoundedTcpListener {
             connections,
             track_public,
             accept_cancellation,
+            pending_connections: Arc::new(PendingConnections::default()),
         }
     }
 }
@@ -123,9 +129,14 @@ impl Listener for BoundedTcpListener {
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        // Include the accept future itself so stopping accepts cannot race a socket handoff.
+        let mut first_request = Some(self.pending_connections.track());
         let permit = tokio::select! {
             biased;
-            () = self.accept_cancellation.cancelled() => std::future::pending().await,
+            () = self.accept_cancellation.cancelled() => {
+                drop(first_request.take());
+                std::future::pending().await
+            },
             permit = Arc::clone(&self.permits).acquire_owned() => {
                 permit.expect("public connection semaphore is never closed")
             }
@@ -133,7 +144,10 @@ impl Listener for BoundedTcpListener {
         loop {
             let accepted = tokio::select! {
                 biased;
-                () = self.accept_cancellation.cancelled() => std::future::pending().await,
+                () = self.accept_cancellation.cancelled() => {
+                    drop(first_request.take());
+                    std::future::pending().await
+                },
                 accepted = self.inner.accept() => accepted,
             };
             match accepted {
@@ -148,6 +162,7 @@ impl Listener for BoundedTcpListener {
                     return (
                         BoundedTcpStream {
                             inner: stream,
+                            first_request: first_request.take().expect("accept is still active"),
                             _permit: permit,
                             metrics: Arc::clone(&self.metrics),
                             connections: Arc::clone(&self.connections),
@@ -173,11 +188,27 @@ impl Listener for BoundedTcpListener {
 #[derive(Debug)]
 struct BoundedTcpStream {
     inner: tokio::net::TcpStream,
+    first_request: PendingConnection,
     _permit: OwnedSemaphorePermit,
     metrics: Arc<Metrics>,
     connections: Arc<ConnectionTracker>,
     ip: IpAddr,
     track_public: bool,
+}
+
+impl Connected<IncomingStream<'_, BoundedTcpListener>> for PendingConnection {
+    fn connect_info(stream: IncomingStream<'_, BoundedTcpListener>) -> Self {
+        stream.io().first_request.clone()
+    }
+}
+
+async fn connection_request_started(request: Request, next: Next) -> Response {
+    if let Some(ConnectInfo(connection)) =
+        request.extensions().get::<ConnectInfo<PendingConnection>>()
+    {
+        connection.request_started();
+    }
+    next.run(request).await
 }
 
 impl AsyncRead for BoundedTcpStream {
@@ -491,6 +522,7 @@ impl Gateway {
             true,
             public_accept_cancellation.clone(),
         );
+        let public_pending = Arc::clone(&public_listener.pending_connections);
         let admin_listener = BoundedTcpListener::new(
             admin_listener,
             self.state.settings.server.max_admin_connections,
@@ -499,7 +531,10 @@ impl Gateway {
             false,
             admin_cancellation.clone(),
         );
-        let public_router = self.public_router();
+        let public_router = self
+            .public_router()
+            .layer(middleware::from_fn(connection_request_started))
+            .into_make_service_with_connect_info::<PendingConnection>();
         let admin_router = self.admin_router();
         let public_token = public_cancellation.clone();
         let public_shutdown = public_cancellation.clone();
@@ -576,6 +611,7 @@ impl Gateway {
                 &mut admin_handle,
                 &public_cancellation,
                 &public_accept_cancellation,
+                &public_pending,
                 &admin_cancellation,
                 stop_accept_before_withdrawal,
             )
@@ -616,6 +652,7 @@ impl Gateway {
         admin_handle: &mut JoinHandle<std::io::Result<()>>,
         public_cancellation: &CancellationToken,
         public_accept_cancellation: &CancellationToken,
+        public_pending: &PendingConnections,
         admin_cancellation: &CancellationToken,
         stop_accept_before_withdrawal: bool,
     ) -> Option<anyhow::Error> {
@@ -634,9 +671,16 @@ impl Gateway {
 
         self.state.process.mark_draining();
         public_accept_cancellation.cancel();
-        public_cancellation.cancel();
         let shutdown_grace = Duration::from_millis(self.state.settings.server.shutdown_grace_ms);
         let deadline = tokio::time::Instant::now() + shutdown_grace;
+        if !public_done
+            && tokio::time::timeout_at(deadline, public_pending.wait_for_requests())
+                .await
+                .is_err()
+        {
+            warn!("timed out waiting for accepted connections to begin their first request");
+        }
+        public_cancellation.cancel();
         let mut first_error = None;
         if !public_done && let Err(error) = finish_server("public", public_handle, deadline).await {
             first_error = Some(error);
@@ -1981,5 +2025,79 @@ mod tests {
         assert_eq!(tracker.snapshot().0, vec![(second, 2), (first, 1)]);
         tracker.close(first);
         assert!(tracker.open(first));
+    }
+    #[tokio::test]
+    async fn drain_preserves_an_accepted_connection_until_its_first_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public = public_listener.local_addr().unwrap();
+        let admin = admin_listener.local_addr().unwrap();
+        drop((public_listener, admin_listener));
+        let mut settings = Settings::default();
+        settings.server.listen = public.to_string();
+        settings.server.admin_listen = admin.to_string();
+        settings.server.withdrawal_delay_ms = 1;
+        settings.server.shutdown_grace_ms = 3_000;
+        let built = Gateway::build(settings).unwrap();
+        let state = Arc::clone(&built.state);
+        let gateway = tokio::spawn(async move { built.run().await });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if client
+                    .get(format!("http://{admin}/health/live"))
+                    .send()
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut connection = tokio::net::TcpStream::connect(public).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.metrics.public_connections() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        client
+            .put(format!("http://{admin}/admin/api/process/drain"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.process.snapshot().state != crate::lifecycle::ProcessState::Draining {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        connection
+            .write_all(b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            connection.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        tokio::time::timeout(Duration::from_secs(3), gateway)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

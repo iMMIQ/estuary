@@ -22,9 +22,7 @@ export class ApiError extends Error {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
-    headers: init?.body
-      ? { "content-type": "application/json", ...init.headers }
-      : init?.headers,
+    headers: init?.body ? { "content-type": "application/json", ...init.headers } : init?.headers,
   });
   if (!response.ok) {
     const body = (await response.json().catch(() => ({}))) as ErrorEnvelope;
@@ -65,7 +63,11 @@ export function deleteIpLimit(ip: string): Promise<unknown> {
   return request(`/admin/api/ip-limits/${encodeURIComponent(ip)}`, { method: "DELETE" });
 }
 
-export function preflightNode(config: NodeConfig, clearApiKey = false, signal?: AbortSignal): Promise<PreflightResponse> {
+export function preflightNode(
+  config: NodeConfig,
+  clearApiKey = false,
+  signal?: AbortSignal,
+): Promise<PreflightResponse> {
   const query = clearApiKey ? "?clear_api_key=true" : "";
   return request(`/admin/api/nodes/preflight${query}`, {
     method: "POST",
@@ -81,7 +83,11 @@ export function createNode(config: NodeConfig): Promise<NodeRecord> {
   });
 }
 
-export function updateNode(config: NodeConfig, revision: number, clearApiKey: boolean): Promise<NodeRecord> {
+export function updateNode(
+  config: NodeConfig,
+  revision: number,
+  clearApiKey: boolean,
+): Promise<NodeRecord> {
   return request(`/admin/api/nodes/${encodeURIComponent(config.id)}?timeout_ms=30000`, {
     method: "PUT",
     body: JSON.stringify({ config, revision, clear_api_key: clearApiKey }),

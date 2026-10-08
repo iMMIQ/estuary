@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { createDraft } from "./node-config";
 import { mergeDraft } from "./draft-merge";
+import { createDraft } from "./node-config";
 
 test("merges disjoint local and remote edits including nested provider fields", () => {
   const base = createDraft();
@@ -12,8 +12,11 @@ test("merges disjoint local and remote edits including nested provider fields", 
   remote.provider.waiting_threshold = 12;
   const result = mergeDraft(base, local, remote);
   expect(result.conflicts).toEqual([]);
-  expect(result.draft).toMatchObject({ base_url: "http://mine/v1", max_concurrency: 32,
-    provider: { request_timeout_ms: 7000, waiting_threshold: 12 } });
+  expect(result.draft).toMatchObject({
+    base_url: "http://mine/v1",
+    max_concurrency: 32,
+    provider: { request_timeout_ms: 7000, waiting_threshold: 12 },
+  });
 });
 
 test("reports simultaneous edits and keeps local values only after the user chooses to merge", () => {

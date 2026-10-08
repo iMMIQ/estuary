@@ -11,8 +11,11 @@ export function mergeDraft(base: NodeDraft, local: NodeDraft, remote: NodeDraft)
     if (same(before, mine)) return theirs;
     if (same(before, theirs) || same(mine, theirs)) return mine;
     if (object(before) && object(mine) && object(theirs)) {
-      return Object.fromEntries([...new Set([...Object.keys(before), ...Object.keys(mine), ...Object.keys(theirs)])]
-        .map(key => [key, merge(before[key], mine[key], theirs[key], path ? `${path}.${key}` : key)]));
+      return Object.fromEntries(
+        [...new Set([...Object.keys(before), ...Object.keys(mine), ...Object.keys(theirs)])].map(
+          (key) => [key, merge(before[key], mine[key], theirs[key], path ? `${path}.${key}` : key)],
+        ),
+      );
     }
     conflicts.push(path);
     return mine;

@@ -18,37 +18,64 @@ export function useControlPlane() {
   const [statusStale, setStatusStale] = useState(false);
   const [nodesLoaded, setNodesLoaded] = useState(false);
 
-  const refresh = useCallback(async (quiet = false) => {
-    // Explicit refreshes must read changes made after an older request started.
-    pending.current?.abort();
-    const controller = new AbortController();
-    pending.current = controller;
-    if (!quiet) setRefreshing(true);
-    const [nodeResult, statusResult] = await Promise.allSettled([
-      api.listNodes(controller.signal), api.getStatus(controller.signal),
-    ]);
-    if (controller.signal.aborted) return;
-    pending.current = null;
-    if (nodeResult.status === "fulfilled") { setNodes(nodeResult.value); setNodesLoaded(true); }
-    if (statusResult.status === "fulfilled") setStatus(statusResult.value);
-    setNodesStale(nodeResult.status === "rejected");
-    setStatusStale(statusResult.status === "rejected");
-    const failure = nodeResult.status === "rejected" ? nodeResult : statusResult.status === "rejected" ? statusResult : null;
-    setConnectionError(failure ? failure.reason instanceof Error ? failure.reason.message : t("controlPlane.unavailable") : null);
-    if (!failure) setLastSync(Date.now());
-    failures.current = failure ? failures.current + 1 : 0;
-    nextPoll.current = failure ? Date.now() + Math.min(60000, 5000 * 2 ** Math.min(failures.current, 4)) : 0;
-    setLoading(false);
-    setRefreshing(false);
-  }, [t]);
+  const refresh = useCallback(
+    async (quiet = false) => {
+      // Explicit refreshes must read changes made after an older request started.
+      pending.current?.abort();
+      const controller = new AbortController();
+      pending.current = controller;
+      if (!quiet) setRefreshing(true);
+      const [nodeResult, statusResult] = await Promise.allSettled([
+        api.listNodes(controller.signal),
+        api.getStatus(controller.signal),
+      ]);
+      if (controller.signal.aborted) return;
+      pending.current = null;
+      if (nodeResult.status === "fulfilled") {
+        setNodes(nodeResult.value);
+        setNodesLoaded(true);
+      }
+      if (statusResult.status === "fulfilled") setStatus(statusResult.value);
+      setNodesStale(nodeResult.status === "rejected");
+      setStatusStale(statusResult.status === "rejected");
+      const failure =
+        nodeResult.status === "rejected"
+          ? nodeResult
+          : statusResult.status === "rejected"
+            ? statusResult
+            : null;
+      setConnectionError(
+        failure
+          ? failure.reason instanceof Error
+            ? failure.reason.message
+            : t("controlPlane.unavailable")
+          : null,
+      );
+      if (!failure) setLastSync(Date.now());
+      failures.current = failure ? failures.current + 1 : 0;
+      nextPoll.current = failure
+        ? Date.now() + Math.min(60000, 5000 * 2 ** Math.min(failures.current, 4))
+        : 0;
+      setLoading(false);
+      setRefreshing(false);
+    },
+    [t],
+  );
 
   useEffect(() => {
     void refresh(true);
     const interval = window.setInterval(() => {
       // A slow response remains useful; polling must not supersede it.
-      if (!pending.current && document.visibilityState === "visible" && Date.now() >= nextPoll.current) void refresh(true);
+      if (
+        !pending.current &&
+        document.visibilityState === "visible" &&
+        Date.now() >= nextPoll.current
+      )
+        void refresh(true);
     }, 5000);
-    const resume = () => { if (document.visibilityState === "visible" && !pending.current) void refresh(true); };
+    const resume = () => {
+      if (document.visibilityState === "visible" && !pending.current) void refresh(true);
+    };
     document.addEventListener("visibilitychange", resume);
     return () => {
       document.removeEventListener("visibilitychange", resume);
@@ -58,5 +85,16 @@ export function useControlPlane() {
     };
   }, [refresh]);
 
-  return { nodes, status, loading, refreshing, connectionError, lastSync, refresh, nodesStale, statusStale, nodesLoaded };
+  return {
+    nodes,
+    status,
+    loading,
+    refreshing,
+    connectionError,
+    lastSync,
+    refresh,
+    nodesStale,
+    statusStale,
+    nodesLoaded,
+  };
 }

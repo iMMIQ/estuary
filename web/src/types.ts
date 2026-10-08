@@ -1,9 +1,9 @@
-export type ModelFamily = "generic" | "deepseek";
+type ModelFamily = "generic" | "deepseek";
 export type ProviderKind = "openai" | "vllm";
 export type AnthropicProtocol = "auto" | "native" | "responses" | "chat";
-export type HealthState = "starting" | "healthy" | "degraded" | "unhealthy";
-export type LifecycleState = "serving" | "draining";
-export type CircuitState = "closed" | "open" | "half_open";
+type HealthState = "starting" | "healthy" | "degraded" | "unhealthy";
+type LifecycleState = "serving" | "draining";
+type CircuitState = "closed" | "open" | "half_open";
 
 export interface KvEventsConfig {
   endpoint: string;
@@ -15,7 +15,7 @@ export interface KvEventsConfig {
   max_event_bytes: number;
 }
 
-export interface ProviderConfig {
+interface ProviderConfig {
   type: ProviderKind;
   anthropic_protocol: AnthropicProtocol;
   version_path: string;
@@ -50,7 +50,7 @@ export interface NodeConfig {
   provider: ProviderConfig;
 }
 
-export interface NodeRuntime {
+interface NodeRuntime {
   id: string;
   base_url: string;
   provider: ProviderKind;
@@ -88,7 +88,7 @@ export interface NodeRuntime {
   provider_telemetry_updated_unix_ms: number | null;
 }
 
-export interface AdmissionSnapshot {
+interface AdmissionSnapshot {
   state:
     | "accepting"
     | "draining"
@@ -179,7 +179,8 @@ export interface Pair {
   inherit_capability?: boolean;
 }
 
-export interface NodeDraft extends Omit<NodeConfig, "api_key" | "models" | "model_capabilities" | "headers_from_env"> {
+export interface NodeDraft
+  extends Omit<NodeConfig, "api_key" | "models" | "model_capabilities" | "headers_from_env"> {
   api_key: string;
   preserve_api_key: boolean;
   models: Pair[];

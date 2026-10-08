@@ -127,7 +127,15 @@ export async function mockControlPlane(
   const nodes = [...initial];
   const limits = new Map<string, number>();
   await page.route("**/admin/api/status", (route) =>
-    route.fulfill({ json: { ...status(nodes.length), connections: { ...status(nodes.length).connections, ip_limits: [...limits].map(([ip, limit]) => ({ ip, limit })) } } }),
+    route.fulfill({
+      json: {
+        ...status(nodes.length),
+        connections: {
+          ...status(nodes.length).connections,
+          ip_limits: [...limits].map(([ip, limit]) => ({ ip, limit })),
+        },
+      },
+    }),
   );
   await page.route("**/admin/api/ip-limits/**", (route) => {
     const ip = decodeURIComponent(new URL(route.request().url()).pathname.split("/").at(-1) ?? "");
@@ -148,12 +156,13 @@ export async function mockControlPlane(
     const request = route.request();
     const path = new URL(request.url()).pathname;
     const id = decodeURIComponent(path.split("/").at(-1) ?? "");
-    const nodeId = path.endsWith("/drain")
-      ? decodeURIComponent(path.split("/").at(-2) ?? "")
-      : id;
+    const nodeId = path.endsWith("/drain") ? decodeURIComponent(path.split("/").at(-2) ?? "") : id;
     const node = nodes.find((item) => item.config.id === nodeId);
     if (!node) {
-      await route.fulfill({ status: 404, json: { error: { message: "Node not found", code: "node_not_found" } } });
+      await route.fulfill({
+        status: 404,
+        json: { error: { message: "Node not found", code: "node_not_found" } },
+      });
       return;
     }
     if (path.endsWith("/drain")) {
@@ -173,7 +182,9 @@ export async function mockControlPlane(
     if (request.method() === "PUT" && revisionConflict) {
       await route.fulfill({
         status: 409,
-        json: { error: { message: "The node changed; refresh and retry", code: "revision_conflict" } },
+        json: {
+          error: { message: "The node changed; refresh and retry", code: "revision_conflict" },
+        },
       });
       return;
     }

@@ -63,7 +63,7 @@ volumes, shutdown, and rolling updates.
 
 ### From Source
 
-Rust 1.88 or newer is required.
+Rust 1.99 or newer is required.
 
 ```bash
 mkdir -p data

@@ -148,10 +148,6 @@ impl HealthState {
     pub fn is_routable(self) -> bool {
         matches!(self, Self::Healthy | Self::Degraded)
     }
-
-    pub fn is_ready(self) -> bool {
-        matches!(self, Self::Healthy | Self::Degraded)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -276,17 +272,6 @@ pub(crate) struct Workload {
 impl Node {
     pub fn from_config(config: &NodeConfig) -> Result<Arc<Self>> {
         Self::from_config_with_policies(config, true, CircuitBreakerConfig::default())
-    }
-
-    pub fn from_config_with_startup_policy(
-        config: &NodeConfig,
-        route_while_starting: bool,
-    ) -> Result<Arc<Self>> {
-        Self::from_config_with_policies(
-            config,
-            route_while_starting,
-            CircuitBreakerConfig::default(),
-        )
     }
 
     #[allow(clippy::too_many_lines)]

@@ -1,5 +1,5 @@
-ARG BUN_IMAGE=oven/bun:1.3.14-alpine
-ARG RUST_IMAGE=rust:1.88-alpine3.22
+ARG BUN_IMAGE=oven/bun:1.4.2-alpine
+ARG RUST_IMAGE=rust:1.99-alpine3.22
 ARG ALPINE_IMAGE=alpine:3.21
 
 FROM ${BUN_IMAGE} AS web-builder

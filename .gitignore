@@ -8,6 +8,8 @@
 /web/vite.config.js
 /web/vite.config.d.ts
 /coverage/
+/.ruff_cache/
+__pycache__/
 *.profraw
 *.profdata
 lcov.info

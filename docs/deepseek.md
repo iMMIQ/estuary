@@ -66,8 +66,8 @@ or model inference inside the gateway.
   would otherwise tokenize the original request with a different protocol adapter.
   Approximate prefix routing, scheduling, retries, and stream backpressure remain.
 
-The dependency uses Rust let chains, so source builds now require Rust 1.88 or
-newer. Docker and CI toolchain settings use the same minimum.
+Source builds use Rust 1.99, pinned in `rust-toolchain.toml`. Docker and CI use
+the same compiler version.
 
 ## Live end-to-end verification
 

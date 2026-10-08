@@ -8,7 +8,10 @@ trap 'rm -rf -- "${results}"' EXIT
 case $(uname -m) in
     x86_64) alpine_arch=x86_64 ;;
     aarch64 | arm64) alpine_arch=aarch64 ;;
-    *) echo "unsupported build architecture: $(uname -m)" >&2; exit 1 ;;
+    *)
+        echo "unsupported build architecture: $(uname -m)" >&2
+        exit 1
+        ;;
 esac
 
 probe_http() {
@@ -18,7 +21,7 @@ probe_http() {
         --connect-timeout 3 --max-time 10 --output /dev/null "${url}"; then
         elapsed=$(($(date +%s%3N) - start))
         printf '%s\t%s\t%s\n' "${elapsed}" "${name}" "${value}" \
-            > "${results}/${group}-${name}"
+            >"${results}/${group}-${name}"
     fi
 }
 
@@ -32,13 +35,13 @@ probe_apk() {
     done
     elapsed=$(($(date +%s%3N) - start))
     printf '%s\t%s\t%s\n' "${elapsed}" "${name}" "${base}" \
-        > "${results}/apk-${name}"
+        >"${results}/apk-${name}"
 }
 
 probe_docker() {
     local name=$1 prefix=$2 start elapsed code image
     start=$(date +%s%3N)
-    for image in library/alpine:3.21 library/rust:1.88-alpine3.22 oven/bun:1.3.14-alpine; do
+    for image in library/alpine:3.21 library/rust:1.99-alpine3.22 oven/bun:1.4.2-alpine; do
         code=$(curl --location --silent --output /dev/null --write-out '%{http_code}' \
             --connect-timeout 3 --max-time 8 \
             --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
@@ -51,13 +54,13 @@ probe_docker() {
     done
     elapsed=$(($(date +%s%3N) - start))
     printf '%s\t%s\t%s\n' "${elapsed}" "${name}" "${prefix}" \
-        > "${results}/docker-${name}"
+        >"${results}/docker-${name}"
 }
 
 fastest() {
     local group=$1 fallback=$2 match
-    match=$(find "${results}" -type f -name "${group}-*" -exec cat {} + 2>/dev/null \
-        | sort -n | head -n 1 || true)
+    match=$(find "${results}" -type f -name "${group}-*" -exec cat {} + 2>/dev/null |
+        sort -n | head -n 1 || true)
     if [[ -z ${match} ]]; then
         printf '%s' "${fallback}"
         return
@@ -100,8 +103,8 @@ printf 'Build version: %s\n' "${build_version}" >&2
 exec docker build --network host --tag "${ESTUARY_IMAGE:-estuary:local}" \
     --build-arg "ESTUARY_BUILD_VERSION=${build_version}" \
     --build-arg "ALPINE_IMAGE=${docker_registry}/library/alpine:3.21" \
-    --build-arg "RUST_IMAGE=${docker_registry}/library/rust:1.88-alpine3.22" \
-    --build-arg "BUN_IMAGE=${docker_registry}/oven/bun:1.3.14-alpine" \
+    --build-arg "RUST_IMAGE=${docker_registry}/library/rust:1.99-alpine3.22" \
+    --build-arg "BUN_IMAGE=${docker_registry}/oven/bun:1.4.2-alpine" \
     --build-arg "APK_REPOSITORY=${apk_repository}" \
     --build-arg "CARGO_REGISTRY=${cargo_registry}" \
     --build-arg "NPM_REGISTRY=${npm_registry}" \

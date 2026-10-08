@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
+    sync::Barrier,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -27,6 +28,8 @@ struct TestSupervisor {
     child: Child,
     root: PathBuf,
     runtime: PathBuf,
+    diagnostics: PathBuf,
+    completed: bool,
 }
 
 impl Drop for TestSupervisor {
@@ -38,6 +41,11 @@ impl Drop for TestSupervisor {
             let _ = self.child.wait();
         }
         let _ = fs::remove_dir_all(&self.root);
+        if self.completed {
+            let _ = fs::remove_dir_all(&self.diagnostics);
+        } else {
+            eprintln!("supervisor diagnostics: {}", self.diagnostics.display());
+        }
     }
 }
 
@@ -62,6 +70,11 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
     let management = unused_address()?;
     let admin_a = unused_address()?;
     let admin_b = unused_address()?;
+    let diagnostics = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/test-diagnostics")
+        .join(format!("supervisor-{}", uuid::Uuid::now_v7()));
+    fs::create_dir_all(&diagnostics)?;
+    let log = fs::File::create(diagnostics.join("supervisor.log"))?;
     let child = Command::new(&binary)
         .arg("--database")
         .arg(root.join("estuary.db"))
@@ -85,14 +98,16 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
         .arg("--drain-timeout-seconds")
         .arg("5")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log))
         .spawn()
         .context("failed to start test supervisor")?;
     let mut supervisor = TestSupervisor {
         child,
         root,
         runtime,
+        diagnostics,
+        completed: false,
     };
 
     wait_until(|| async {
@@ -177,12 +192,20 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
     assert_public_available(public).await?;
 
     let stop_requests = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(Barrier::new(9));
     let availability = (0..8)
         .map(|_| {
             let stop = Arc::clone(&stop_requests);
-            tokio::spawn(assert_public_stays_available(public, stop))
+            tokio::spawn(assert_public_stays_available(
+                public,
+                stop,
+                Arc::clone(&started),
+            ))
         })
         .collect::<Vec<_>>();
+    tokio::time::timeout(TEST_TIMEOUT, started.wait())
+        .await
+        .context("availability workers did not start before rollout")?;
     let activated = deploy_client
         .put(format!("http://{management}/deploy/api/releases/{version}"))
         .send()
@@ -228,6 +251,7 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
     for pid in worker_pids {
         wait_until(|| async move { !process_exists(pid) }).await?;
     }
+    supervisor.completed = true;
     Ok(())
 }
 
@@ -342,8 +366,14 @@ async fn assert_public_available(public: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-async fn assert_public_stays_available(public: SocketAddr, stop: Arc<AtomicBool>) -> Result<usize> {
+async fn assert_public_stays_available(
+    public: SocketAddr,
+    stop: Arc<AtomicBool>,
+    started: Arc<Barrier>,
+) -> Result<usize> {
     let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(TEST_TIMEOUT)
         .pool_max_idle_per_host(0)
         .http1_only()
         .build()?;
@@ -361,6 +391,10 @@ async fn assert_public_stays_available(public: SocketAddr, stop: Arc<AtomicBool>
             );
         }
         requests += 1;
+        if requests == 1 {
+            // All workers must actually issue traffic before the rollout can finish.
+            started.wait().await;
+        }
     }
     Ok(requests)
 }

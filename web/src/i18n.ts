@@ -253,16 +253,19 @@ const en = {
   "editor.serving": "Serving",
   "editor.bearerCredential": "Bearer credential",
   "editor.connectionRecommended": "Connection verification recommended",
-  "editor.connectionRecommendation": "Run Test Connection before applying this configuration to verify compatibility and health.",
+  "editor.connectionRecommendation":
+    "Run Test Connection before applying this configuration to verify compatibility and health.",
   "editor.connectionVerified": "Connection verified",
   "editor.connectionFailed": "Connection failed",
-  "editor.connectionPassed": "{{provider}} provider passed configuration, compatibility and health checks. Generation protocols were not tested.",
+  "editor.connectionPassed":
+    "{{provider}} provider passed configuration, compatibility and health checks. Generation protocols were not tested.",
   "editor.testConnection": "Test Connection",
   "editor.saveChanges": "Save Changes",
   "editor.discard": "Discard unsaved changes?",
   "editor.connectionTestFailed": "Connection test failed",
   "delete.title": "Delete {{id}}?",
-  "delete.description": "The node will drain first. Active requests must finish before its persisted configuration is removed.",
+  "delete.description":
+    "The node will drain first. Active requests must finish before its persisted configuration is removed.",
   "delete.node": "Delete Node",
   "toast.nodeAdded": "Node added",
   "toast.nodeUpdated": "Node updated",
@@ -325,13 +328,16 @@ const en = {
   "common.loading": "Loading…",
   "editor.inheritedFamily": "Inherited: {{family}}",
   "editor.conflictTitle": "Configuration changed elsewhere",
-  "editor.conflictDescription": "Revision {{before}} → {{after}}. Review the latest configuration before saving again.",
-  "editor.conflictFields": "Both versions changed these fields: {{fields}}. Keeping your changes uses your values for these fields.",
+  "editor.conflictDescription":
+    "Revision {{before}} → {{after}}. Review the latest configuration before saving again.",
+  "editor.conflictFields":
+    "Both versions changed these fields: {{fields}}. Keeping your changes uses your values for these fields.",
   "editor.conflictNoOverlap": "Your edits can be kept together with changes to other fields.",
   "editor.reloadLatest": "Reload latest configuration",
   "editor.keepChanges": "Merge and keep my changes",
   "protocol.effective": "Effective protocol paths",
-  "protocol.recipeOverride": "DeepSeek recipe selects the adapter for each client URL; the node’s Anthropic setting applies to generic models.",
+  "protocol.recipeOverride":
+    "DeepSeek recipe selects the adapter for each client URL; the node’s Anthropic setting applies to generic models.",
   "protocol.inherited": "Inherited from wildcard/default",
   "scheduler.overview": "Scheduling workload",
   "scheduler.maxTtft": "Highest node TTFT EWMA",
@@ -605,7 +611,8 @@ const zhCN: Record<keyof typeof en, string> = {
   "editor.connectionRecommendation": "应用配置前请运行连接测试，以验证兼容性和健康状态。",
   "editor.connectionVerified": "连接验证通过",
   "editor.connectionFailed": "连接失败",
-  "editor.connectionPassed": "{{provider}} 提供方已通过配置、兼容性和健康检查；尚未验证生成请求协议。",
+  "editor.connectionPassed":
+    "{{provider}} 提供方已通过配置、兼容性和健康检查；尚未验证生成请求协议。",
   "editor.testConnection": "测试连接",
   "editor.saveChanges": "保存更改",
   "editor.discard": "放弃未保存的更改？",
@@ -670,16 +677,19 @@ const zhCN: Record<keyof typeof en, string> = {
   "admission.circuit_open": "熔断器已开启",
   "admission.circuit_limited": "熔断器半开容量已用尽",
   "admission.waiting_watermark": "上游最新等待深度已达到水位线",
-  "admission.at_capacity": "所有本地并发许可均在使用中",  "common.loading": "加载中…",
+  "admission.at_capacity": "所有本地并发许可均在使用中",
+  "common.loading": "加载中…",
   "editor.inheritedFamily": "继承：{{family}}",
   "editor.conflictTitle": "配置已被其他操作修改",
   "editor.conflictDescription": "版本 {{before}} → {{after}}。请合并或重新加载最新配置后再保存。",
-  "editor.conflictFields": "两边都修改了以下字段：{{fields}}。选择保留修改将使用你的值，请在保存前检查。",
+  "editor.conflictFields":
+    "两边都修改了以下字段：{{fields}}。选择保留修改将使用你的值，请在保存前检查。",
   "editor.conflictNoOverlap": "可以保留你的修改，并采用远端对其他字段的修改。",
   "editor.reloadLatest": "重新加载最新配置",
   "editor.keepChanges": "合并并保留我的修改",
   "protocol.effective": "有效协议链路",
-  "protocol.recipeOverride": "DeepSeek recipe 按客户端路径选择适配器；节点的 Anthropic 设置适用于通用模型。",
+  "protocol.recipeOverride":
+    "DeepSeek recipe 按客户端路径选择适配器；节点的 Anthropic 设置适用于通用模型。",
   "protocol.inherited": "继承通配符或默认设置",
   "scheduler.overview": "调度负载",
   "scheduler.maxTtft": "最高节点首字延迟（EWMA）",
@@ -690,7 +700,6 @@ const zhCN: Record<keyof typeof en, string> = {
   "data.stale": "正在显示上次获取的数据",
   "data.partial": "部分指标不可用或已过期",
   "vllm.showRuntime": "展开运行指标",
-
 };
 
 export function resolveLocale(stored: string | null, languages: readonly string[]): Locale {
@@ -700,7 +709,11 @@ export function resolveLocale(stored: string | null, languages: readonly string[
 
 const initialLocale = resolveLocale(
   typeof window === "undefined" ? null : window.localStorage.getItem(localeStorageKey),
-  typeof navigator === "undefined" ? ["en"] : navigator.languages?.length ? navigator.languages : [navigator.language || "en"],
+  typeof navigator === "undefined"
+    ? ["en"]
+    : navigator.languages?.length
+      ? navigator.languages
+      : [navigator.language || "en"],
 );
 
 void i18n.use(initReactI18next).init({
@@ -713,4 +726,3 @@ void i18n.use(initReactI18next).init({
 });
 
 export const translationResources = { en, "zh-CN": zhCN } as const;
-export default i18n;

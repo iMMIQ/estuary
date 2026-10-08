@@ -8,7 +8,12 @@
     "build": "tsc -b && vite build",
     "test": "bun test src",
     "test:e2e": "bunx --bun playwright test",
-    "typecheck": "tsc -b --pretty false"
+    "typecheck": "tsc -b --pretty false",
+    "lint": "biome lint . --error-on-warnings",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "check": "biome check . --error-on-warnings",
+    "deadcode": "knip"
   },
   "dependencies": {
     "@mantine/core": "^9.5.1",
@@ -20,11 +25,13 @@
     "react-i18next": "^17.0.11"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.15",
     "@playwright/test": "1.62.1",
     "@types/bun": "^1.2.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "knip": "6.40.0",
     "typescript": "^5.7.2",
     "vite": "^6.0.5"
   }
