@@ -412,13 +412,13 @@ async fn run_node_monitor(
 async fn poll_node(client: &Client, node: &Arc<Node>, check_version: bool) {
     if check_version || node.provider_state() == ProviderState::Checking {
         match fetch_version(client, node).await {
-            Ok((raw, parsed)) if parsed >= MIN_VLLM_VERSION => {
+            Ok(raw) if is_supported_vllm_version(&raw) => {
                 if node.provider_state() != ProviderState::Ready {
                     info!(node = node.id(), version = %raw, "vLLM provider is ready");
                 }
                 node.record_vllm_ready(raw);
             }
-            Ok((raw, _)) => {
+            Ok(raw) => {
                 let message =
                     format!("vLLM {raw} is unsupported; Estuary requires >= {MIN_VLLM_VERSION}");
                 if node.record_vllm_incompatible(Some(raw.clone()), message.clone()) {
@@ -457,8 +457,8 @@ pub async fn preflight_vllm(client: &Client, node: &Arc<Node>) -> Result<()> {
     if node.provider().kind != ProviderKind::Vllm {
         return Ok(());
     }
-    let (raw, parsed) = fetch_version(client, node).await?;
-    if parsed < MIN_VLLM_VERSION {
+    let raw = fetch_version(client, node).await?;
+    if !is_supported_vllm_version(&raw) {
         bail!("vLLM {raw} is unsupported; Estuary requires >= {MIN_VLLM_VERSION}");
     }
     node.record_vllm_ready(raw);
@@ -472,14 +472,41 @@ struct VersionResponse {
     version: String,
 }
 
-async fn fetch_version(client: &Client, node: &Node) -> Result<(String, Version)> {
+async fn fetch_version(client: &Client, node: &Node) -> Result<String> {
     let body = management_get(client, node, &node.provider().version_path).await?;
     let response: VersionResponse =
         serde_json::from_slice(&body).context("invalid /version JSON")?;
-    let normalized = response.version.trim().trim_start_matches('v');
-    let version = Version::parse(normalized)
-        .with_context(|| format!("invalid vLLM version {:?}", response.version))?;
-    Ok((response.version, version))
+    if response.version.trim().is_empty() {
+        bail!(
+            "invalid vLLM version {:?}: version is empty",
+            response.version
+        );
+    }
+    Ok(response.version)
+}
+
+fn is_supported_vllm_version(raw: &str) -> bool {
+    let normalized = raw.trim().trim_start_matches('v');
+    // Python package versions can use dev/rc suffixes or omit the patch number.
+    // Compare only the numeric release prefix; opaque build labels such as
+    // "dev" cannot establish an old release and are allowed through the gate.
+    let release = normalized
+        .split(|ch: char| !ch.is_ascii_digit() && ch != '.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.');
+    let mut components = release.split('.');
+    let (Ok(major), Some(Ok(minor))) = (
+        components.next().unwrap_or_default().parse(),
+        components.next().map(str::parse),
+    ) else {
+        return true;
+    };
+    let patch = components
+        .next()
+        .and_then(|component| component.parse().ok())
+        .unwrap_or(0);
+    Version::new(major, minor, patch) >= MIN_VLLM_VERSION
 }
 
 async fn fetch_metrics(client: &Client, node: &Node) -> Result<VllmMetricsSnapshot> {
@@ -1834,23 +1861,81 @@ vllm:num_preemptions_total{model_name="a"} 2
     }
 
     #[tokio::test]
-    async fn accepts_v025_and_uses_external_load() {
-        let (base_url, server) = management_server("0.25.0").await;
-        let node = vllm_node(&base_url);
-        poll_node(&Client::new(), &node, true).await;
-        assert_eq!(node.provider_state(), ProviderState::Ready);
-        assert_eq!(node.scheduling_load(), 5);
-        server.abort();
+    async fn accepts_supported_vllm_versions_in_monitor_and_preflight() {
+        let client = Client::new();
+        for version in [
+            "0.25.0",
+            "0.25",
+            " v0.25.0 ",
+            "0.25.0.dev123+gabcdef",
+            "0.25.0-rc1",
+            "0.25.0rc1",
+            "0.25.dev123",
+            "0.26.0+custom/build",
+            "1.0.0",
+            "dev",
+            "main+gabcdef",
+        ] {
+            let (base_url, server) = management_server(version).await;
+            let node = vllm_node(&base_url);
+            poll_node(&client, &node, true).await;
+            assert_eq!(node.provider_state(), ProviderState::Ready, "{version}");
+            assert_eq!(node.scheduling_load(), 5, "{version}");
+            assert_eq!(node.snapshot().provider_version.as_deref(), Some(version),);
+
+            let candidate = vllm_node(&base_url);
+            preflight_vllm(&client, &candidate).await.unwrap();
+            assert_eq!(
+                candidate.provider_state(),
+                ProviderState::Ready,
+                "{version}"
+            );
+            assert_eq!(candidate.scheduling_load(), 5, "{version}");
+            assert_eq!(
+                candidate.snapshot().provider_version.as_deref(),
+                Some(version),
+            );
+            server.abort();
+        }
     }
 
     #[tokio::test]
     async fn rejects_vllm_below_v025() {
-        let (base_url, server) = management_server("0.24.1").await;
-        let node = vllm_node(&base_url);
-        poll_node(&Client::new(), &node, true).await;
-        assert_eq!(node.provider_state(), ProviderState::Incompatible);
-        assert!(!node.provider_is_ready());
-        server.abort();
+        let client = Client::new();
+        for version in ["0.24.1", "0.24", "v0.24.9", "0.24.1.dev123", "0.24.1-rc1"] {
+            let (base_url, server) = management_server(version).await;
+            let node = vllm_node(&base_url);
+            poll_node(&client, &node, true).await;
+            assert_eq!(
+                node.provider_state(),
+                ProviderState::Incompatible,
+                "{version}"
+            );
+            assert!(!node.provider_is_ready());
+
+            let candidate = vllm_node(&base_url);
+            let error = preflight_vllm(&client, &candidate).await.unwrap_err();
+            assert!(error.to_string().contains("requires >= 0.25.0"), "{error}");
+            assert!(!candidate.provider_is_ready());
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_vllm_versions() {
+        let client = Client::new();
+        for version in ["", " \t\n"] {
+            let (base_url, server) = management_server(version).await;
+            let node = vllm_node(&base_url);
+            poll_node(&client, &node, true).await;
+            assert!(!node.provider_is_ready());
+
+            let candidate = vllm_node(&base_url);
+            let error = preflight_vllm(&client, &candidate).await.unwrap_err();
+            assert!(error.to_string().contains("version is empty"), "{error}");
+            assert!(!candidate.provider_is_ready());
+            server.abort();
+        }
     }
 
     #[tokio::test]

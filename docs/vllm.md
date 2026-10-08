@@ -3,9 +3,14 @@
 [Documentation index](README.md) | [Architecture](architecture.md) |
 [Configuration and operations](operations.md)
 
-Estuary's native provider supports vLLM 0.25.0 and newer. A vLLM node remains
-outside the routing set until its origin-root `/version` response passes this
-fixed compatibility gate.
+Estuary's native provider targets vLLM 0.25.0 and newer, including development
+builds. The origin-root `/version` gate compares the numeric release prefix,
+accepting versions such as `0.25`, `v0.25.0`, `0.25.0.dev123+gabcdef`, and
+`0.25.0-rc1`. Recognizable releases below 0.25.0 are rejected, including builds
+with suffixes. Nonempty labels without a comparable release, such as `dev`,
+are accepted and reported unchanged; their compatibility depends on the
+upstream implementing the interfaces below. Empty versions, malformed JSON,
+and failed version probes still fail the check.
 
 ## Provider Interfaces
 
