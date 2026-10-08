@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    body::Body,
+    body::{Body, HttpBody as _},
     extract::{Request, State},
     http::{
         HeaderValue, Method, StatusCode,
@@ -21,6 +21,67 @@ use uuid::Uuid;
 use crate::{anthropic, error::GatewayError};
 
 use super::{AppState, RequestId};
+
+pub(super) async fn log_public_request(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if request.method() != Method::POST || !request.uri().path().starts_with("/v1/") {
+        return next.run(request).await;
+    }
+    let id = request
+        .extensions()
+        .get::<RequestId>()
+        .map(|id| id.0.as_str())
+        .unwrap_or_default();
+    let Some(observation) = state
+        .session_log
+        .begin(request.uri().path(), request.headers(), id)
+    else {
+        return next.run(request).await;
+    };
+    let mut guard = crate::session_log::DeliveryGuard(Arc::clone(&observation), false);
+    request.extensions_mut().insert(Arc::clone(&observation));
+    let response = next.run(request).await;
+    let streaming = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream"));
+    observation.headers(response.status().as_u16(), streaming);
+    let length = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let forbids_body = matches!(
+        response.status(),
+        StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+    );
+    let (parts, body) = response.into_parts();
+    guard.1 = forbids_body || length == Some(0) || body.is_end_stream();
+    let stream = async_stream::stream! {
+        let mut remaining = length;
+        let mut body = body.into_data_stream();
+        while let Some(item) = body.next().await {
+            match &item {
+                Ok(bytes) => {
+                    observation.downstream_bytes(bytes, streaming);
+                    if let Some(left) = &mut remaining {
+                        *left = left.saturating_sub(bytes.len() as u64);
+                        guard.1 = *left == 0;
+                    }
+                },
+                Err(_) => observation.error("downstream", "body_error"),
+            }
+            yield item;
+        }
+        guard.1 = true;
+        drop(guard);
+    };
+    Response::from_parts(parts, Body::from_stream(stream))
+}
 
 pub(super) async fn admit_public_request(
     State(state): State<Arc<AppState>>,
@@ -42,7 +103,17 @@ pub(super) async fn admit_public_request(
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
 
+    let started = std::time::Instant::now();
     let _admission = state.scheduler.admit_ingress(reserved_bytes).await;
+    if let Some(log) = request
+        .extensions()
+        .get::<Arc<crate::session_log::Observation>>()
+    {
+        log.timing(
+            "ingress_wait",
+            crate::session_log::micros(started.elapsed()),
+        );
+    }
     next.run(request).await
 }
 

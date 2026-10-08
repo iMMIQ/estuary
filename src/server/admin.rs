@@ -89,7 +89,7 @@ pub(super) async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                 "content-type",
                 "application/openmetrics-text; version=1.0.0; charset=utf-8",
             )],
-            body,
+            state.session_log.encode_metrics(body),
         )
             .into_response(),
         Err(error) => {

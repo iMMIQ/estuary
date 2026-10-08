@@ -24,7 +24,7 @@ use super::headers::copy_response_headers;
 use super::request_compat::THINKING_BUDGET_WARNING;
 use super::{MAX_ERROR_BODY_BYTES, UpstreamResponseMode};
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) async fn buffered_success_response(
     upstream: reqwest::Response,
     lease: &NodeLease,
@@ -42,6 +42,7 @@ pub(super) async fn buffered_success_response(
     public_model: &str,
     record_prefix: bool,
     metrics: &Metrics,
+    mut log_attempt: Option<&mut crate::session_log::AttemptGuard>,
 ) -> Result<Response, GatewayError> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
@@ -68,6 +69,13 @@ pub(super) async fn buffered_success_response(
         bytes: upstream_body,
         mut reservation,
     } = buffered;
+    if let Some(log) = &log_attempt {
+        log.capture(
+            &upstream_body,
+            false,
+            matches!(response_mode, UpstreamResponseMode::NativeAnthropic { .. }),
+        );
+    }
     let body = match response_mode {
         UpstreamResponseMode::Passthrough => Ok(upstream_body.clone()),
         UpstreamResponseMode::Deepseek(prepared) => {
@@ -108,6 +116,15 @@ pub(super) async fn buffered_success_response(
         lease.record_output_tokens(tokens);
     }
     metrics.observe_usage(usage);
+    if let Some(log) = log_attempt.as_mut() {
+        log.update(|attempt| {
+            attempt.usage = usage.log_value(matches!(
+                response_mode,
+                UpstreamResponseMode::NativeAnthropic { .. }
+            ));
+        });
+        log.finish("success", None);
+    }
     drop(upstream_body);
     reservation.shrink_to(body.len());
     lease.record_success(header_latency);
@@ -140,6 +157,7 @@ pub(super) async fn buffered_success_response(
     Ok(response)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn proxy_error_response(
     upstream: reqwest::Response,
     _lease: NodeLease,
@@ -148,6 +166,7 @@ pub(super) async fn proxy_error_response(
     upstream_body_timeout: Duration,
     client_protocol: ClientProtocol,
     request_id: &str,
+    mut log_attempt: Option<crate::session_log::AttemptGuard>,
 ) -> Result<Response, GatewayError> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
@@ -163,6 +182,10 @@ pub(super) async fn proxy_error_response(
     )
     .await?;
     let body = &buffered.bytes;
+    if let Some(log) = &mut log_attempt {
+        log.capture(body, false, false);
+        log.finish("error", Some("upstream_status"));
+    }
     if client_protocol == ClientProtocol::Anthropic {
         let mut response = anthropic::convert_error_response(status, body, request_id);
         if let Some(value) = headers.get("retry-after") {

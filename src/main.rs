@@ -33,6 +33,60 @@ struct RuntimeOverrides {
     circuit_breaker: CircuitBreakerOverrides,
     #[command(flatten)]
     retry: RetryOverrides,
+    #[command(flatten)]
+    session_log: SessionLogOverrides,
+}
+
+#[derive(Debug, Default, Args, Serialize)]
+struct SessionLogOverrides {
+    #[arg(
+        id = "session-log-database",
+        long = "session-log-database",
+        env = "ESTUARY_SESSION_LOG_DATABASE"
+    )]
+    database: Option<PathBuf>,
+    #[arg(
+        id = "session-log-capture-content",
+        long = "session-log-capture-content",
+        env = "ESTUARY_SESSION_LOG_CAPTURE_CONTENT"
+    )]
+    capture_content: Option<bool>,
+    #[arg(
+        id = "session-log-queue-capacity",
+        long = "session-log-queue-capacity",
+        env = "ESTUARY_SESSION_LOG_QUEUE_CAPACITY"
+    )]
+    queue_capacity: Option<usize>,
+    #[arg(
+        id = "session-log-max-content-bytes",
+        long = "session-log-max-content-bytes",
+        env = "ESTUARY_SESSION_LOG_MAX_CONTENT_BYTES"
+    )]
+    max_content_bytes: Option<usize>,
+    #[arg(
+        id = "session-log-max-payload-bytes",
+        long = "session-log-max-payload-bytes",
+        env = "ESTUARY_SESSION_LOG_MAX_PAYLOAD_BYTES"
+    )]
+    max_payload_bytes: Option<usize>,
+    #[arg(
+        id = "session-log-retention-days",
+        long = "session-log-retention-days",
+        env = "ESTUARY_SESSION_LOG_RETENTION_DAYS"
+    )]
+    retention_days: Option<u32>,
+    #[arg(
+        id = "session-log-content-retention-days",
+        long = "session-log-content-retention-days",
+        env = "ESTUARY_SESSION_LOG_CONTENT_RETENTION_DAYS"
+    )]
+    content_retention_days: Option<u32>,
+    #[arg(
+        id = "session-log-flush-interval-ms",
+        long = "session-log-flush-interval-ms",
+        env = "ESTUARY_SESSION_LOG_FLUSH_INTERVAL_MS"
+    )]
+    flush_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Args, Serialize)]
@@ -420,6 +474,12 @@ mod tests {
     fn cli_overrides_global_runtime_policies() {
         let cli = Cli::try_parse_from([
             "estuary",
+            "--session-log-database",
+            "session-test.sqlite",
+            "--session-log-capture-content",
+            "false",
+            "--session-log-queue-capacity",
+            "128",
             "--queue-max-requests",
             "42",
             "--request-stats-stale-ms",
@@ -447,6 +507,12 @@ mod tests {
         ])
         .unwrap();
         let settings = settings_from_overrides(&cli.runtime).unwrap();
+        assert_eq!(
+            settings.session_log.database,
+            Some(PathBuf::from("session-test.sqlite"))
+        );
+        assert!(!settings.session_log.capture_content);
+        assert_eq!(settings.session_log.queue_capacity, 128);
         assert_eq!(settings.routing.queue_max_requests, 42);
         assert_eq!(settings.routing.request_stats_stale_ms, 30_000);
         assert!((settings.routing.prefill_weight - 0.75).abs() < f64::EPSILON);

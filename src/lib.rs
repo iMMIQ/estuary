@@ -16,6 +16,7 @@ pub mod proxy;
 pub mod response_buffer;
 pub mod scheduler;
 pub mod server;
+pub mod session_log;
 mod sse;
 pub mod store;
 pub mod supervisor;

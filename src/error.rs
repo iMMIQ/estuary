@@ -58,7 +58,7 @@ impl GatewayError {
         }
     }
 
-    fn code(&self) -> &'static str {
+    pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::InvalidJson => "invalid_json",
             Self::MissingModel => "missing_model",

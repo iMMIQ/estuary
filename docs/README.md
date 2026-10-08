@@ -13,6 +13,8 @@ use. The maintained technical documentation is organized by task:
 | [Performance benchmark](performance.md) | Reproducible gateway-overhead benchmark commands and output. |
 | [Generated configuration contract](config-contract.md) | Canonical config types, defaults, validation rules, shared cases, and module boundaries. |
 | [Code quality review](code-quality.md) | Review findings, completed debt cleanup, remaining risks, and verification results. |
+| [Session logging](session-logging.md) | Enable independent storage, inspect sessions, and understand capture limits and retention. |
+| [Session logging design](session-logging-design.md) | Research and proposed schema, agent-context deduplication, performance/error capture, and independent log storage. |
 
 The executable is authoritative for runtime flags and environment variables:
 

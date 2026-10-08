@@ -5,11 +5,15 @@ use anyhow::Result;
 use estuary::config::{
     AnthropicProtocol, CircuitBreakerConfig, HealthConfig, ModelCapabilityConfig, ModelFamily,
     NodeConfig, PrefixConfig, ProviderConfig, ProviderKind, RetryConfig, RoutingConfig,
-    ServerConfig, Settings, VllmKvEventsConfig,
+    ServerConfig, SessionLogConfig, Settings, VllmKvEventsConfig,
     contract::{
         NodeValidationRule, RESERVED_UPSTREAM_HEADERS, RuleCondition, RuleKind,
         editor_node_defaults, node_validation_rules,
     },
+};
+use estuary::session_log::{
+    AttemptRecord, LogEvent, LogStatus, PayloadDetail, RequestDetail, RequestPage, RequestRecord,
+    SessionSummary,
 };
 use serde::Serialize;
 use ts_rs::{Config, TS};
@@ -38,6 +42,7 @@ fn main() -> Result<()> {
     export!(
         Settings,
         ServerConfig,
+        SessionLogConfig,
         RoutingConfig,
         PrefixConfig,
         HealthConfig,
@@ -53,7 +58,15 @@ fn main() -> Result<()> {
         RuleCondition,
         RuleKind,
         NodeValidationRule,
-        ConfigDefaults
+        ConfigDefaults,
+        AttemptRecord,
+        LogEvent,
+        LogStatus,
+        PayloadDetail,
+        RequestDetail,
+        RequestPage,
+        RequestRecord,
+        SessionSummary
     );
     fs::write(out.join("config.ts"), types)?;
     let defaults = ConfigDefaults {

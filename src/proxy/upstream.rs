@@ -45,6 +45,7 @@ pub(super) async fn proxy_with_retries(
         state
             .metrics
             .observe_queue_duration(queue_started.elapsed().as_secs_f64());
+        let scheduler_wait = queue_started.elapsed();
         let selection = selection?;
         state
             .metrics
@@ -215,6 +216,23 @@ pub(super) async fn proxy_with_retries(
         if let Ok(value) = HeaderValue::from_str(&request.request_id.0) {
             upstream_headers.insert(HeaderName::from_static("x-gateway-request-id"), value);
         }
+        let mut log_attempt = request.observation.as_ref().map(|log| {
+            let snapshot = node.snapshot();
+            let guard = log.attempt(crate::session_log::AttemptRecord {
+                number: attempt + 1,
+                node: node.id().chars().take(128).collect(), node_instance: node.instance_id(),
+                provider: serde_json::to_value(node.provider().kind).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default(),
+                endpoint: upstream_endpoint_log.chars().take(128).collect(), model: selection.upstream_model.as_ref().map(|m| m.chars().take(256).collect()),
+                adapter: response_mode.name().to_owned(), started_at_ms: crate::session_log::now_ms(), outcome: "started".to_owned(),
+                route: serde_json::json!({"score":selection.score,"prefix_match_chars":selection.prefix_match_chars,"prefix_match_tokens":selection.prefix_match_tokens,
+                    "active":snapshot.active,"capacity":snapshot.max_concurrency,"upstream_running":snapshot.upstream_running,"upstream_waiting":snapshot.upstream_waiting,
+                    "kv_utilization":snapshot.kv_cache_usage,"telemetry_updated_at_ms":snapshot.provider_telemetry_updated_unix_ms}),
+                ..crate::session_log::AttemptRecord::default()
+            });
+            guard.update(|record| {record.timings_us.insert("scheduler_wait".to_owned(), crate::session_log::micros(scheduler_wait));});
+            guard.input(&upstream_body);
+            guard
+        });
         let upstream_request = state
             .client
             .request(request.method.clone(), upstream_url)
@@ -239,6 +257,12 @@ pub(super) async fn proxy_with_retries(
                         &excluded,
                         node.id(),
                     );
+                if let Some(log) = &mut log_attempt {
+                    log.finish("error", Some("transport_error"));
+                    if retryable {
+                        log.update(|a| a.retry_reason = Some("connect_error".to_owned()));
+                    }
+                }
                 selection
                     .lease
                     .record_failure(error.to_string(), &state.settings.health);
@@ -253,6 +277,9 @@ pub(super) async fn proxy_with_retries(
                 return Err(GatewayError::Upstream("transport failure".to_owned()));
             }
             Err(_) => {
+                if let Some(log) = &mut log_attempt {
+                    log.finish("error", Some("header_timeout"));
+                }
                 selection
                     .lease
                     .record_failure("upstream response header timeout", &state.settings.health);
@@ -263,6 +290,20 @@ pub(super) async fn proxy_with_retries(
 
         let status = response.status();
         let header_latency = upstream_started.elapsed();
+        if let Some(log) = &log_attempt {
+            log.update(|record| {
+                record.http_status = Some(status.as_u16());
+                record.upstream_request_id = response
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.chars().take(128).collect());
+                record.timings_us.insert(
+                    "headers".to_owned(),
+                    crate::session_log::micros(header_latency),
+                );
+            });
+        }
         let configured_retry_status = state.settings.retry.statuses.contains(&status.as_u16());
         let retryable_status = configured_retry_status
             && attempt < state.settings.retry.max_attempts
@@ -285,6 +326,10 @@ pub(super) async fn proxy_with_retries(
         state.metrics.attempt(node.id(), status.as_str());
 
         if retryable_status {
+            if let Some(log) = &mut log_attempt {
+                log.finish("error", Some("upstream_status"));
+                log.update(|a| a.retry_reason = Some(status.as_str().to_owned()));
+            }
             state.metrics.retry(node.id(), status.as_str());
             excluded.insert(node.id().to_owned());
             drop(response);
@@ -318,6 +363,7 @@ pub(super) async fn proxy_with_retries(
                 upstream_body_timeout,
                 request.client_protocol,
                 &request.request_id.0,
+                log_attempt,
             )
             .await;
         }
@@ -339,6 +385,7 @@ pub(super) async fn proxy_with_retries(
                 request.public_model.as_deref().unwrap_or_default(),
                 request.record_prefix,
                 &state.metrics,
+                log_attempt.as_mut(),
             )
             .await;
             match buffered {
@@ -351,6 +398,12 @@ pub(super) async fn proxy_with_retries(
                             &excluded,
                             node.id(),
                         );
+                    if let Some(log) = &mut log_attempt {
+                        log.finish("error", Some("body_error"));
+                        if retryable {
+                            log.update(|a| a.retry_reason = Some("body_error".to_owned()));
+                        }
+                    }
                     if retryable {
                         state.metrics.retry(node.id(), "body_error");
                         excluded.insert(node.id().to_owned());
@@ -378,6 +431,7 @@ pub(super) async fn proxy_with_retries(
             response_mode,
             request.public_model.clone().unwrap_or_default(),
             request.record_prefix,
+            log_attempt,
         ));
     }
 }

@@ -5,6 +5,7 @@ import {
   Languages,
   LayoutDashboard,
   LoaderCircle,
+  MessagesSquare,
   Plus,
   Server,
   Trash2,
@@ -32,7 +33,11 @@ import { createDraft, draftToConfig, recordToDraft, shouldClearApiKey } from "./
 import type { NodeRecord } from "./types";
 import { useControlPlane } from "./use-control-plane";
 
-type View = "overview" | "upstreams";
+const SessionLogs = lazy(() =>
+  import("./SessionLogs").then((module) => ({ default: module.SessionLogs })),
+);
+
+type View = "overview" | "upstreams" | "logs";
 interface ToastState {
   tone: "success" | "error";
   message: string;
@@ -267,6 +272,14 @@ export default function App() {
             <Server size={16} />
             {t("nav.upstreams")}
           </button>
+          <button
+            type="button"
+            className={view === "logs" ? "active" : ""}
+            onClick={() => changeView("logs")}
+          >
+            <MessagesSquare size={16} />
+            {t("nav.logs")}
+          </button>
         </nav>
         <div className="sidebar-footer">
           <LanguageSwitch />
@@ -345,6 +358,8 @@ export default function App() {
               onToggleDrain={() => void toggleDrain(selectedNode)}
               onDelete={() => setConfirmDelete(selectedNode)}
             />
+          ) : view === "logs" ? (
+            <SessionLogs />
           ) : view === "overview" ? (
             <Overview
               loading={loading}
@@ -399,6 +414,14 @@ export default function App() {
           >
             <Server size={16} />
             {t("nav.upstreams")}
+          </button>
+          <button
+            type="button"
+            className={view === "logs" ? "active" : ""}
+            onClick={() => changeView("logs")}
+          >
+            <MessagesSquare size={16} />
+            {t("nav.logs")}
           </button>
           <button type="button" onClick={openAdd}>
             <Plus size={16} />

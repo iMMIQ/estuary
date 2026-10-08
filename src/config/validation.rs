@@ -7,6 +7,25 @@ use super::{NodeConfig, Settings, contract};
 impl Settings {
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<()> {
+        let log = &self.session_log;
+        if log
+            .database
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+            || log.queue_capacity < 2
+            || log.queue_capacity > 65_536
+            || log.max_payload_bytes == 0
+            || log.max_payload_bytes > 16 * 1024 * 1024
+            || log.max_content_bytes < log.max_payload_bytes
+            || log.max_content_bytes > 1024 * 1024 * 1024
+            || log.retention_days == 0
+            || log.content_retention_days == 0
+            || log.content_retention_days > log.retention_days
+            || log.flush_interval_ms == 0
+            || log.flush_interval_ms > 60_000
+        {
+            bail!("invalid session_log path, capture limits, retention or flush interval");
+        }
         let public_address = self
             .server
             .listen

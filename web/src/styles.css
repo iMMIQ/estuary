@@ -1868,7 +1868,7 @@ h3 {
     left: 0;
     display: grid;
     height: 58px;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(4, 1fr);
     border-top: 1px solid var(--border);
     background: rgba(11, 14, 19, 0.98);
   }
@@ -1909,4 +1909,57 @@ fieldset.filter-row {
   padding: 0;
   margin-inline: 0;
   min-inline-size: 0;
+}
+
+.session-logs {
+  padding: 28px;
+  min-width: 0;
+}
+.session-logs h1 {
+  margin: 0 0 8px;
+}
+.session-logs h2 {
+  margin-top: 24px;
+  font-size: 16px;
+}
+.log-table-wrap {
+  overflow-x: auto;
+}
+.log-table {
+  min-width: 760px;
+}
+.log-table small {
+  display: block;
+  color: var(--muted);
+}
+.log-timings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+.log-timings > div {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.log-attempt,
+.log-payload {
+  margin: 12px 0;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.session-logs pre {
+  max-height: 480px;
+  overflow: auto;
+  padding: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--panel-2);
+  font-size: 12px;
+}
+@media (max-width: 768px) {
+  .session-logs {
+    padding: 16px;
+  }
 }

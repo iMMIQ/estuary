@@ -106,3 +106,40 @@ export function setDraining(id: string, draining: boolean): Promise<unknown> {
     method: draining ? "PUT" : "DELETE",
   });
 }
+
+export function getLogStatus(
+  signal?: AbortSignal,
+): Promise<import("./session-log-types").LogStatus> {
+  return request("/admin/api/logs/status", readOptions(signal));
+}
+
+export function listLogRequests(
+  session: string | null,
+  cursor: string | null,
+  since: number,
+  signal?: AbortSignal,
+): Promise<import("./session-log-types").LogPage> {
+  const query = new URLSearchParams({ since: String(since) });
+  if (session) query.set("session", session);
+  if (cursor) query.set("cursor", cursor);
+  return request(`/admin/api/logs/requests?${query}`, readOptions(signal));
+}
+
+export async function listLogSessions(
+  since: number,
+  signal?: AbortSignal,
+): Promise<import("./session-log-types").LogSession[]> {
+  return (
+    await request<{ sessions: import("./session-log-types").LogSession[] }>(
+      `/admin/api/logs/sessions?since=${since}`,
+      readOptions(signal),
+    )
+  ).sessions;
+}
+
+export function getLogRequest(
+  id: string,
+  signal?: AbortSignal,
+): Promise<import("./session-log-types").LogDetail> {
+  return request(`/admin/api/logs/requests/${encodeURIComponent(id)}`, readOptions(signal));
+}

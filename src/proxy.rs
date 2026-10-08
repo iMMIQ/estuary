@@ -82,15 +82,19 @@ fn model_object(id: String) -> ModelObject {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy(
     State(state): State<Arc<AppState>>,
     Path(endpoint): Path<String>,
     Extension(request_id): Extension<RequestId>,
+    observation: Option<Extension<Arc<crate::session_log::Observation>>>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let observation = observation.map(|Extension(log)| log);
+    let body_started = std::time::Instant::now();
     let is_anthropic = matches!(endpoint.as_str(), "messages" | "messages/count_tokens")
         || endpoint.starts_with("files/");
     let gateway_request_id = request_id.0.clone();
@@ -104,11 +108,38 @@ pub async fn proxy(
     {
         Ok(body) => body,
         Err(error) if is_anthropic => {
+            if let Some(log) = &observation {
+                log.error("request_body", error.code());
+            }
             return anthropic::error_response(&error, &gateway_request_id);
         }
-        Err(error) => return error.into_response(),
+        Err(error) => {
+            if let Some(log) = &observation {
+                log.error("request_body", error.code());
+            }
+            return error.into_response();
+        }
     };
-    match proxy_inner(state, endpoint, request_id, method, uri, headers, body).await {
+    if let Some(log) = &observation {
+        log.request_body(&body, crate::session_log::micros(body_started.elapsed()));
+    }
+    let result = proxy_inner(
+        state,
+        endpoint,
+        request_id,
+        method,
+        uri,
+        headers,
+        body,
+        observation.clone(),
+    )
+    .await;
+    if let Err(error) = &result
+        && let Some(log) = &observation
+    {
+        log.error("proxy", error.code());
+    }
+    match result {
         Ok(response) => response,
         Err(error) if is_anthropic => anthropic::error_response(&error, &gateway_request_id),
         Err(error) => error.into_response(),
@@ -144,6 +175,7 @@ async fn read_request_body(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn proxy_inner(
     state: Arc<AppState>,
     endpoint: String,
@@ -152,6 +184,7 @@ async fn proxy_inner(
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
+    observation: Option<Arc<crate::session_log::Observation>>,
 ) -> Result<Response, GatewayError> {
     if endpoint.starts_with("files/") {
         return Err(GatewayError::UnsupportedFeature(
@@ -181,6 +214,9 @@ async fn proxy_inner(
     } else {
         sonic_rs::from_slice::<Value>(&body).ok()
     };
+    if let Some(log) = &observation {
+        log.parsed(parsed.as_ref());
+    }
     if is_inference_json && parsed.is_none() {
         return Err(GatewayError::InvalidJson);
     }
@@ -335,6 +371,13 @@ async fn proxy_inner(
         state
             .metrics
             .tokenization(tokenization.outcome, tokenization.elapsed);
+        if let Some(log) = &observation {
+            log.timing(
+                "tokenization",
+                crate::session_log::micros(tokenization.elapsed),
+            );
+            log.event(tokenization.outcome);
+        }
         if let Some(tokens) = tokenization.tokens {
             prefix_input.set_token_ids(tokens);
         }
@@ -358,6 +401,7 @@ async fn proxy_inner(
             anthropic_payloads,
             codex_request,
             record_prefix,
+            observation,
         },
     )
     .await
@@ -378,6 +422,7 @@ struct ProxyRequest {
     anthropic_payloads: Option<AnthropicPayloads>,
     codex_request: bool,
     record_prefix: bool,
+    observation: Option<Arc<crate::session_log::Observation>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

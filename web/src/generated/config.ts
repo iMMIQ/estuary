@@ -6,6 +6,7 @@ export type Settings = {
   health: HealthConfig;
   circuit_breaker: CircuitBreakerConfig;
   retry: RetryConfig;
+  session_log: SessionLogConfig;
   nodes: Array<NodeConfig>;
 };
 
@@ -32,6 +33,17 @@ export type ServerConfig = {
   max_buffered_response_bytes: number;
   expose_node_header: boolean;
   log_json: boolean;
+};
+
+export type SessionLogConfig = {
+  database: string | null;
+  capture_content: boolean;
+  queue_capacity: number;
+  max_content_bytes: number;
+  max_payload_bytes: number;
+  retention_days: number;
+  content_retention_days: number;
+  flush_interval_ms: number;
 };
 
 export type RoutingConfig = {
@@ -159,4 +171,89 @@ export type ConfigDefaults = {
   editor: NodeConfig;
   capability: ModelCapabilityConfig;
   kv_events: VllmKvEventsConfig;
+};
+
+export type AttemptRecord = {
+  number: number;
+  node: string;
+  node_instance: number;
+  provider: string;
+  endpoint: string;
+  model: string | null;
+  adapter: string;
+  started_at_ms: number;
+  http_status: number | null;
+  upstream_request_id: string | null;
+  outcome: string;
+  error_class: string | null;
+  retry_reason: string | null;
+  timings_us: { [key in string]: number };
+  route: Record<string, unknown>;
+  usage: unknown;
+};
+
+export type LogEvent = { kind: string; elapsed_us: number };
+
+export type LogStatus = {
+  enabled: boolean;
+  capture_content: boolean;
+  available: boolean;
+  queued: number;
+  content_bytes: number;
+  dropped: number;
+  truncated: number;
+  write_errors: number;
+  committed: number;
+  last_commit_at_ms: number;
+};
+
+export type PayloadDetail = {
+  stage: string;
+  attempt: number;
+  state: string;
+  bytes_seen: number;
+  representation: string;
+  content: unknown;
+};
+
+export type RequestDetail = { request: RequestRecord; payloads: Array<PayloadDetail> };
+
+export type RequestPage = { requests: Array<RequestRecord>; next_cursor: string | null };
+
+export type RequestRecord = {
+  id: string;
+  external_request_id: string;
+  session_id: string | null;
+  session_source: string | null;
+  boot_id: string;
+  process_id: number;
+  process_token: string | null;
+  gateway_version: string;
+  endpoint: string;
+  protocol: string;
+  model: string | null;
+  client: string | null;
+  streaming: boolean;
+  started_at_ms: number;
+  ended_at_ms: number | null;
+  http_status: number | null;
+  outcome: string;
+  delivery: string;
+  timings_us: { [key in string]: number };
+  request_bytes: number;
+  response_bytes: number;
+  error_phase: string | null;
+  error_class: string | null;
+  usage: unknown;
+  attempts: Array<AttemptRecord>;
+  events: Array<LogEvent>;
+  capture_state: string;
+};
+
+export type SessionSummary = {
+  id: string;
+  first_seen_at_ms: number;
+  last_seen_at_ms: number;
+  requests: number;
+  errors: number;
 };

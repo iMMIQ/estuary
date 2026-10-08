@@ -59,7 +59,20 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
     let runtime = root.join("run");
     let stable = releases.join("stable");
     fs::create_dir_all(&stable)?;
-    copy_executable(&binary, &stable.join("estuary"))?;
+    let upload_binary = stable.join("estuary");
+    copy_executable(&binary, &upload_binary)?;
+    // The deployment endpoint accepts release binaries; debug symbols alone
+    // can push a test executable over its 256 MiB upload limit.
+    if fs::metadata(&upload_binary)?.len() > 256 * 1024 * 1024 {
+        let result = Command::new("strip")
+            .arg("-S")
+            .arg(&upload_binary)
+            .status()
+            .context("strip debug symbols from the release upload fixture")?;
+        if !result.success() {
+            bail!("could not strip release upload fixture");
+        }
+    }
     fs::create_dir_all(state.join("slots/a"))?;
     fs::create_dir_all(state.join("slots/b"))?;
     symlink(&stable, &state.join("current"))?;
@@ -138,7 +151,7 @@ async fn supervisor_recovers_workers_and_rolls_back_as_one_unit() -> Result<()> 
     );
     let uploaded = deploy_client
         .post(format!("http://{management}/deploy/api/releases"))
-        .body(fs::read(&binary)?)
+        .body(fs::read(&upload_binary)?)
         .send()
         .await?;
     assert_eq!(uploaded.status(), StatusCode::CREATED);

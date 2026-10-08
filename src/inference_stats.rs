@@ -4,15 +4,33 @@ use serde_json::Value;
 
 const MAX_OBSERVATION_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 #[allow(clippy::struct_field_names)]
 pub(crate) struct Usage {
     pub input_tokens: Option<usize>,
+    #[serde(rename = "cache_read_tokens")]
     pub cached_tokens: Option<usize>,
+    pub cache_write_tokens: Option<usize>,
+    pub reasoning_tokens: Option<usize>,
     pub output_tokens: Option<usize>,
 }
 
 impl Usage {
+    pub fn log_value(self, anthropic: bool) -> Value {
+        let mut value = serde_json::to_value(self).unwrap_or_default();
+        if anthropic {
+            value["input_tokens"] = self
+                .input_tokens
+                .map(|n| {
+                    n.saturating_add(self.cached_tokens.unwrap_or_default())
+                        .saturating_add(self.cache_write_tokens.unwrap_or_default())
+                })
+                .into();
+        }
+        value["source"] = "provider_observer".into();
+        value["normalization_version"] = 1.into();
+        value
+    }
     pub fn from_response(bytes: &[u8]) -> Self {
         // Ignore response content while deserializing, avoiding a second large response allocation.
         let mut usage = Self::default();
@@ -34,12 +52,24 @@ impl Usage {
                     reported.completion_tokens.or(reported.output_tokens),
                 );
                 merge(
+                    &mut usage.cache_write_tokens,
+                    reported.cache_creation_input_tokens,
+                );
+                merge(
+                    &mut usage.reasoning_tokens,
+                    reported
+                        .completion_tokens_details
+                        .or(reported.output_tokens_details)
+                        .and_then(|details| details.reasoning_tokens),
+                );
+                merge(
                     &mut usage.cached_tokens,
                     reported
                         .prompt_tokens_details
                         .or(reported.input_tokens_details)
                         .and_then(|details| details.cached_tokens)
-                        .or(reported.cache_read_input_tokens),
+                        .or(reported.cache_read_input_tokens)
+                        .or(reported.prompt_cache_hit_tokens),
                 );
             }
         }
@@ -63,11 +93,24 @@ impl Usage {
                 count(usage, "completion_tokens").or_else(|| count(usage, "output_tokens")),
             );
             merge(
+                &mut self.cache_write_tokens,
+                count(usage, "cache_creation_input_tokens"),
+            );
+            merge(
+                &mut self.reasoning_tokens,
+                usage
+                    .pointer("/completion_tokens_details/reasoning_tokens")
+                    .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
+                    .and_then(Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok()),
+            );
+            merge(
                 &mut self.cached_tokens,
                 usage
                     .pointer("/prompt_tokens_details/cached_tokens")
                     .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
                     .or_else(|| usage.get("cache_read_input_tokens"))
+                    .or_else(|| usage.get("prompt_cache_hit_tokens"))
                     .and_then(Value::as_u64)
                     .and_then(|n| usize::try_from(n).ok()),
             );
@@ -96,6 +139,14 @@ struct ReportedUsage {
     prompt_tokens_details: Option<CacheUsage>,
     input_tokens_details: Option<CacheUsage>,
     cache_read_input_tokens: Option<usize>,
+    prompt_cache_hit_tokens: Option<usize>,
+    cache_creation_input_tokens: Option<usize>,
+    completion_tokens_details: Option<ReasoningUsage>,
+    output_tokens_details: Option<ReasoningUsage>,
+}
+#[derive(serde::Deserialize)]
+struct ReasoningUsage {
+    reasoning_tokens: Option<usize>,
 }
 
 #[derive(serde::Deserialize)]
@@ -116,6 +167,8 @@ fn merge(target: &mut Option<usize>, value: Option<usize>) {
     }
 }
 
+// These independent observations are not mutually exclusive lifecycle states.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
 pub(crate) struct StreamObservation {
     line: Vec<u8>,
@@ -123,17 +176,41 @@ pub(crate) struct StreamObservation {
     oversized: bool,
     previous_cr: bool,
     pub has_output: bool,
+    pub terminal_marker_seen: bool,
+    pub incomplete: bool,
+    pub error_seen: bool,
+    pub has_visible_text: bool,
     pub usage: Usage,
 }
 
 impl StreamObservation {
     pub fn observe_json(&mut self, data: &[u8]) {
+        if data.iter().all(u8::is_ascii_whitespace) {
+            return;
+        }
+        if data == b"[DONE]" {
+            self.terminal_marker_seen = true;
+            return;
+        }
         if data.len() > MAX_OBSERVATION_BYTES {
+            self.incomplete = true;
             return;
         }
         if let Ok(value) = serde_json::from_slice::<Value>(data) {
+            self.terminal_marker_seen |= matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("message_stop" | "response.completed")
+            );
+            self.error_seen |= value.get("error").is_some_and(|error| !error.is_null())
+                || matches!(
+                    value.get("type").and_then(Value::as_str),
+                    Some("error" | "response.failed" | "response.incomplete")
+                );
+            self.has_visible_text |= visible_text(&value);
             self.usage.observe(&value);
             self.has_output |= has_generation(&value);
+        } else {
+            self.incomplete = true;
         }
     }
 
@@ -153,6 +230,7 @@ impl StreamObservation {
             } else {
                 self.previous_cr = false;
                 self.oversized = true;
+                self.incomplete = true;
                 // Retain only whether this line is blank so we can recover at the next event.
                 if self.line.is_empty() {
                     self.line.push(b'x');
@@ -233,6 +311,21 @@ fn has_generation(value: &Value) -> bool {
         ) => nonempty(value.get("delta")),
         _ => false,
     }
+}
+
+fn visible_text(value: &Value) -> bool {
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                nonempty(choice.pointer("/delta/content")) || nonempty(choice.get("text"))
+            })
+        })
+        || (value.get("type").and_then(Value::as_str) == Some("content_block_delta")
+            && nonempty(value.pointer("/delta/text")))
+        || (value.get("type").and_then(Value::as_str) == Some("response.output_text.delta")
+            && nonempty(value.get("delta")))
 }
 
 #[cfg(test)]

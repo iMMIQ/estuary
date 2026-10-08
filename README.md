@@ -15,6 +15,7 @@ using concurrency, observed load, latency, errors, and prompt-prefix locality.
   Chat Completions upstream protocols.
 - Per-node model mappings, concurrency limits, weights, health checks, circuit
   breakers, and bounded retries.
+- Optional session logs in a separate database, with content deduplication and request/attempt inspection.
 - Approximate prompt-prefix affinity for generic servers and exact KV-block
   affinity for vLLM 0.25 and newer.
 - SQLite-backed node configuration with an embedded English and Simplified

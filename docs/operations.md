@@ -45,6 +45,13 @@ Timeouts exist independently for client body reads, upstream connection and
 headers, upstream streaming idle time, total upstream body time, and downstream
 stall time. Use `estuary --help` for their exact flags and environment names.
 
+## Session Logging
+
+Set `--session-log-database ./data/sessions.db` or
+`ESTUARY_SESSION_LOG_DATABASE` to enable independent conversation storage.
+The [session logging guide](session-logging.md) covers budgets, content capture,
+retention, protected query endpoints and durability.
+
 ## Node Configuration
 
 Each node contains:

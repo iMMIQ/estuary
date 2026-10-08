@@ -18,7 +18,44 @@ pub struct Settings {
     pub health: HealthConfig,
     pub circuit_breaker: CircuitBreakerConfig,
     pub retry: RetryConfig,
+    #[serde(skip_serializing_if = "SessionLogConfig::is_disabled")]
+    pub session_log: SessionLogConfig,
     pub nodes: Vec<NodeConfig>,
+}
+
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionLogConfig {
+    pub database: Option<PathBuf>,
+    pub capture_content: bool,
+    pub queue_capacity: usize,
+    pub max_content_bytes: usize,
+    pub max_payload_bytes: usize,
+    pub retention_days: u32,
+    pub content_retention_days: u32,
+    pub flush_interval_ms: u64,
+}
+
+impl Default for SessionLogConfig {
+    fn default() -> Self {
+        Self {
+            database: None,
+            capture_content: true,
+            queue_capacity: 4096,
+            max_content_bytes: 64 * 1024 * 1024,
+            max_payload_bytes: 2 * 1024 * 1024,
+            retention_days: 30,
+            content_retention_days: 7,
+            flush_interval_ms: 100,
+        }
+    }
+}
+
+impl SessionLogConfig {
+    fn is_disabled(&self) -> bool {
+        self.database.is_none()
+    }
 }
 
 #[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]

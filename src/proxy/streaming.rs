@@ -183,7 +183,9 @@ pub(super) fn streaming_response(
     response_mode: UpstreamResponseMode,
     public_model: String,
     record_prefix: bool,
+    log_attempt: Option<crate::session_log::AttemptGuard>,
 ) -> Response {
+    let raw_length = upstream.content_length();
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let upstream_request_id = headers.get("x-request-id").cloned();
@@ -204,6 +206,9 @@ pub(super) fn streaming_response(
             header_latency,
             upstream_started,
         );
+        guard.anthropic_usage =
+            matches!(&response_mode, UpstreamResponseMode::NativeAnthropic { .. });
+        guard.log_attempt = log_attempt;
         let needs_keepalive = is_anthropic;
         let keepalive_period = Duration::from_secs(10);
         let mut keepalive = tokio::time::interval_at(
@@ -212,6 +217,7 @@ pub(super) fn streaming_response(
         );
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut indexed = false;
+        let mut raw_bytes_seen = 0u64;
         let body_deadline = tokio::time::Instant::now() + upstream_body_timeout;
         let mut idle_deadline = tokio::time::Instant::now() + stream_idle_timeout;
         let mut stream_adapter = match response_mode {
@@ -271,6 +277,7 @@ pub(super) fn streaming_response(
             };
 
         loop {
+            let downstream_wait_started = Instant::now();
             let permit = tokio::select! {
                 biased;
                 () = sender.closed() => return,
@@ -288,6 +295,10 @@ pub(super) fn streaming_response(
                         Ok(Ok(permit)) => permit,
                         Ok(Err(_)) => return,
                         Err(_) => {
+                            if let Some(log) = &mut guard.log_attempt {
+                                log.terminal_error("downstream", "downstream_stall");
+                                log.finish("cancelled", Some("downstream_stall"));
+                            }
                             *pump_failure.lock() = Some(StreamFailure::timed_out(
                                 "downstream response body stalled",
                             ));
@@ -297,6 +308,15 @@ pub(super) fn streaming_response(
                 }
             };
 
+            if let Some(log) = &guard.log_attempt {
+                log.update(|attempt| {
+                    *attempt
+                        .timings_us
+                        .entry("downstream_blocked".to_owned())
+                        .or_default() +=
+                        crate::session_log::micros(downstream_wait_started.elapsed());
+                });
+            }
             let item = tokio::select! {
                 biased;
                 () = sender.closed() => return,
@@ -331,6 +351,14 @@ pub(super) fn streaming_response(
                 Some(Ok(input)) => {
                     idle_deadline = tokio::time::Instant::now() + stream_idle_timeout;
                     guard.observe(&input);
+                    if let StreamingInput::Raw(bytes) = &input {
+                        raw_bytes_seen = raw_bytes_seen.saturating_add(bytes.len() as u64);
+                        // Hyper may finish a Content-Length response without another
+                        // body poll. Classify the last raw chunk before forwarding it.
+                        if raw_length == Some(raw_bytes_seen) {
+                            guard.completed();
+                        }
+                    }
                     if record_prefix && !indexed && guard.first_token_observed {
                         prefix_directory.record(&stream_node_id, &prefix_input);
                         indexed = true;
@@ -512,6 +540,8 @@ pub(super) struct BodyGuard {
     pub(super) observation: crate::inference_stats::StreamObservation,
     pub(super) first_token_observed: bool,
     pub(super) terminal: bool,
+    pub(super) log_attempt: Option<crate::session_log::AttemptGuard>,
+    anthropic_usage: bool,
 }
 
 impl BodyGuard {
@@ -531,10 +561,41 @@ impl BodyGuard {
             observation: crate::inference_stats::StreamObservation::default(),
             first_token_observed: false,
             terminal: false,
+            log_attempt: None,
+            anthropic_usage: false,
         }
     }
 
     pub(super) fn completed(&mut self) {
+        if self.terminal {
+            return;
+        }
+        if let Some(log) = &mut self.log_attempt {
+            log.update(|attempt| {
+                attempt.timings_us.insert(
+                    "upstream_done".to_owned(),
+                    crate::session_log::micros(self.upstream_started.elapsed()),
+                );
+                attempt.usage = self.observation.usage.log_value(self.anthropic_usage);
+            });
+            if self.observation.error_seen {
+                log.terminal_error("stream", "upstream_stream_error");
+                log.finish("error", Some("upstream_stream_error"));
+            } else if self.observation.incomplete {
+                log.terminal_unknown("observation_incomplete");
+                log.finish("unknown", Some("observation_incomplete"));
+            } else if !self.observation.terminal_marker_seen {
+                if log.requires_terminal_marker() {
+                    log.terminal_error("stream", "missing_terminal_marker");
+                    log.finish("unknown", Some("missing_terminal_marker"));
+                } else {
+                    log.terminal_unknown("unrecognized_stream_completion");
+                    log.finish("unknown", Some("unrecognized_stream_completion"));
+                }
+            } else {
+                log.finish("success", None);
+            }
+        }
         if let Some(lease) = &self.lease {
             if let Some(tokens) = self.observation.usage.output_tokens {
                 lease.record_output_tokens(tokens);
@@ -546,9 +607,34 @@ impl BodyGuard {
     }
 
     pub(super) fn observe(&mut self, input: &StreamingInput) {
+        if let Some(log) = &self.log_attempt {
+            let elapsed = crate::session_log::micros(self.upstream_started.elapsed());
+            log.update(|attempt| {
+                attempt
+                    .timings_us
+                    .entry("first_chunk".to_owned())
+                    .or_insert(elapsed);
+            });
+            match input {
+                StreamingInput::Raw(bytes) => log.capture(bytes, true, self.anthropic_usage),
+                StreamingInput::Event(event) => {
+                    for line in event.data().split('\n') {
+                        log.capture(b"data: ", true, self.anthropic_usage);
+                        log.capture(line.as_bytes(), true, self.anthropic_usage);
+                        log.capture(b"\n", true, self.anthropic_usage);
+                    }
+                    log.capture(b"\n", true, self.anthropic_usage);
+                }
+            }
+        }
         match input {
             StreamingInput::Raw(bytes) => self.observation.observe_bytes(bytes),
             StreamingInput::Event(event) => self.observation.observe_json(event.data().as_bytes()),
+        }
+        if self.observation.has_visible_text
+            && let Some(log) = &self.log_attempt
+        {
+            log.first_visible_text();
         }
         if self.observation.has_output && !self.first_token_observed {
             let elapsed = self.upstream_started.elapsed();
@@ -556,11 +642,25 @@ impl BodyGuard {
                 lease.record_first_token(elapsed);
             }
             self.metrics.observe_first_token(elapsed);
+            if let Some(log) = &self.log_attempt {
+                log.first_output();
+            }
             self.first_token_observed = true;
         }
     }
 
     pub(super) fn failed(&mut self, message: String, health_config: &crate::config::HealthConfig) {
+        if let Some(log) = &mut self.log_attempt {
+            let class = if message.contains("idle timeout") {
+                "body_idle_timeout"
+            } else if message.contains("total timeout") {
+                "body_total_timeout"
+            } else {
+                "stream_error"
+            };
+            log.terminal_error("stream", class);
+            log.finish("error", Some(class));
+        }
         if let Some(lease) = &self.lease {
             lease.record_failure(message, health_config);
         }

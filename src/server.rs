@@ -51,6 +51,7 @@ use middleware::{
 mod reconcile;
 use reconcile::run_control_reconciler;
 mod admin;
+mod logs;
 use admin::{
     activate_process, admin_node, admin_nodes, admin_status, create_node, delete_ip_limit,
     delete_node, drain_node, drain_process, live, metrics, preflight_node, process_status, ready,
@@ -69,6 +70,7 @@ pub struct AppState {
     pub(crate) store: Arc<NodeStore>,
     pub(crate) process: Arc<ProcessLifecycle>,
     pub(crate) response_buffer: Arc<ResponseBufferBudget>,
+    pub(crate) session_log: Arc<crate::session_log::LogSink>,
     connections: Arc<ConnectionTracker>,
     runtime_revisions: RwLock<HashMap<String, u64>>,
     control_revision: AtomicU64,
@@ -80,6 +82,10 @@ pub struct Gateway {
 }
 
 impl Gateway {
+    pub fn session_logs(&self) -> Arc<crate::session_log::LogSink> {
+        Arc::clone(&self.state.session_log)
+    }
+
     pub fn build(settings: Settings) -> Result<Self> {
         let store = NodeStore::memory()?;
         store.seed_if_empty(&settings.nodes)?;
@@ -87,6 +93,7 @@ impl Gateway {
     }
 
     pub fn build_with_database(settings: Settings, path: impl AsRef<FsPath>) -> Result<Self> {
+        crate::session_log::separate_database(&settings.session_log, path.as_ref())?;
         let store = NodeStore::open(path)?;
         Self::build_with_store(settings, store, false)
     }
@@ -95,6 +102,7 @@ impl Gateway {
         settings: Settings,
         path: impl AsRef<FsPath>,
     ) -> Result<Self> {
+        crate::session_log::separate_database(&settings.session_log, path.as_ref())?;
         let store = NodeStore::open(path)?;
         Self::build_with_store(settings, store, true)
     }
@@ -133,6 +141,7 @@ impl Gateway {
             Arc::clone(&metrics),
         );
         let connections = Arc::new(ConnectionTracker::default());
+        let session_log = crate::session_log::LogSink::new(settings.session_log.clone());
         Ok(Self {
             state: Arc::new(AppState {
                 client,
@@ -147,6 +156,7 @@ impl Gateway {
                     ProcessLifecycle::new()
                 },
                 response_buffer,
+                session_log,
                 connections,
                 runtime_revisions: RwLock::new(runtime_revisions),
                 control_revision: AtomicU64::new(control_revision),
@@ -172,6 +182,10 @@ impl Gateway {
                 Arc::clone(&self.state),
                 observe_request,
             ))
+            .layer(axum_middleware::from_fn_with_state(
+                Arc::clone(&self.state),
+                middleware::log_public_request,
+            ))
             .layer(axum_middleware::from_fn(assign_request_id))
             .layer(axum_middleware::from_fn_with_state(
                 Arc::clone(&self.state),
@@ -188,6 +202,10 @@ impl Gateway {
             .route("/metrics", get(metrics))
             .route("/admin/nodes", get(nodes))
             .route("/admin/api/status", get(admin_status))
+            .route("/admin/api/logs/status", get(logs::status))
+            .route("/admin/api/logs/requests", get(logs::requests))
+            .route("/admin/api/logs/requests/{id}", get(logs::request))
+            .route("/admin/api/logs/sessions", get(logs::sessions))
             .route(
                 "/admin/api/ip-limits/{ip}",
                 put(set_ip_limit).delete(delete_ip_limit),
@@ -370,6 +388,7 @@ impl Gateway {
             }
         }
 
+        let drain_started = std::time::Instant::now();
         if let Some(error) = self
             .drain_http_servers(
                 public_done,
@@ -402,6 +421,12 @@ impl Gateway {
             first_error.get_or_insert_with(|| {
                 anyhow::anyhow!("control-plane reconciler task failed: {error}")
             });
+        }
+        let remaining = Duration::from_millis(self.state.settings.server.shutdown_grace_ms)
+            .saturating_sub(drain_started.elapsed())
+            .min(Duration::from_secs(1));
+        if !self.state.session_log.flush(remaining).await {
+            warn!("session log flush did not finish within shutdown budget");
         }
         self.state.process.mark_drained();
         if let Some(error) = first_error {
