@@ -115,7 +115,9 @@ The exact directory is conservative:
 - Chat Completions and single string or pre-tokenized Completions can use exact
   matching;
 - unsupported or failed tokenization uses character-prefix affinity;
-- removals and clear events delete learned state instead of estimating eviction;
+- removals and clear events delete exact state instead of estimating eviction;
+- an authoritative zero or partial match overrides character history for that
+  worker, so an evicted prefix cannot regain credit through historical affinity;
 - for multiple KV groups, the usable prefix is the minimum match across groups.
 
 Each Estuary node should represent one addressable vLLM cache domain. If one

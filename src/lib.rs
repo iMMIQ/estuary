@@ -5,6 +5,7 @@ pub mod config;
 mod deepseek;
 pub mod error;
 pub mod health;
+mod inference_stats;
 pub mod kv_cache;
 pub mod lifecycle;
 pub mod metrics;

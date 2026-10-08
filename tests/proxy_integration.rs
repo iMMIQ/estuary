@@ -1462,7 +1462,7 @@ async fn valid_upstream_openai_error_is_forwarded() {
 }
 
 async fn fixed_length_success() -> Response {
-    const BODY: &str = r#"{"id":"chatcmpl_fixed","object":"chat.completion","model":"internal-model","choices":[]}"#;
+    const BODY: &str = r#"{"id":"chatcmpl_fixed","object":"chat.completion","model":"internal-model","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":32}}}"#;
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
@@ -1510,6 +1510,106 @@ async fn complete_content_length_body_is_not_counted_as_cancelled() {
         .expect("metrics body");
     assert!(!metrics.contains("estuary_stream_cancellations_total{node=\"fixed-length-node\"}"));
     assert!(metrics.contains("estuary_node_active{node=\"fixed-length-node\"} 0"));
+    assert!(metrics.contains("estuary_inference_input_tokens_sum 42"));
+    assert!(metrics.contains("estuary_inference_cached_tokens_sum 32"));
+    assert!(metrics.contains("estuary_inference_output_tokens_sum 7"));
+}
+
+async fn read_metrics(admin: &TestServer) -> String {
+    test_client()
+        .get(admin.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+async fn receive_exact(response: &mut reqwest::Response, expected: &[u8]) -> Vec<u8> {
+    timeout(IO_TIMEOUT, async {
+        let mut received = Vec::new();
+        while received.len() < expected.len() {
+            received
+                .extend_from_slice(&response.chunk().await.unwrap().expect("stream ended early"));
+        }
+        assert_eq!(received, expected);
+        received
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn stream_observation_preserves_bytes_and_transitions_prefill_at_real_output() {
+    const ROLE: &[u8] =
+        b": ping\r\n\r\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\r\n\r\n";
+    const TEXT: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\r\n\r\n";
+    const USAGE: &[u8] = b"data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\ndata: [DONE]\n\n";
+    let (sender, receiver) = mpsc::channel::<Bytes>(4);
+    let receiver = Arc::new(Mutex::new(Some(receiver)));
+    let upstream = TestServer::spawn(Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let receiver = receiver.lock().unwrap().take().unwrap();
+            async move {
+                Response::builder()
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(stream::unfold(
+                        receiver,
+                        |mut receiver| async {
+                            receiver
+                                .recv()
+                                .await
+                                .map(|bytes| (Ok::<_, Infallible>(bytes), receiver))
+                        },
+                    )))
+                    .unwrap()
+            }
+        }),
+    ))
+    .await;
+    let gateway = Gateway::build(gateway_settings(vec![node(
+        "observed",
+        &upstream,
+        [("model", "model")],
+    )]))
+    .unwrap();
+    let public = TestServer::spawn(gateway.public_router()).await;
+    let admin = TestServer::spawn(gateway.admin_router()).await;
+    sender.send(Bytes::from_static(ROLE)).await.unwrap();
+    let mut response = test_client().post(public.url("/v1/chat/completions"))
+        .json(&json!({"model":"model","stream":true,"messages":[{"role":"user","content":"x".repeat(4_096)}]}))
+        .send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut forwarded = receive_exact(&mut response, ROLE).await;
+    let before = read_metrics(&admin).await;
+    assert!(before.contains("estuary_upstream_first_token_duration_seconds_count 0"));
+    assert!(before.contains("estuary_node_pending_decode_tokens{node=\"observed\"} 256"));
+    assert!(!before.contains("estuary_node_pending_prefill_tokens{node=\"observed\"} 0"));
+
+    sender.send(Bytes::from_static(TEXT)).await.unwrap();
+    forwarded.extend(receive_exact(&mut response, TEXT).await);
+    let during = read_metrics(&admin).await;
+    assert!(during.contains("estuary_upstream_first_token_duration_seconds_count 1"));
+    assert!(during.contains("estuary_node_pending_prefill_tokens{node=\"observed\"} 0"));
+    assert!(during.contains("estuary_node_active{node=\"observed\"} 1"));
+    sender.send(Bytes::from_static(USAGE)).await.unwrap();
+    drop(sender);
+    forwarded.extend(
+        timeout(IO_TIMEOUT, response.bytes())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(forwarded, [ROLE, TEXT, USAGE].concat());
+    let after = read_metrics(&admin).await;
+    assert!(after.contains("estuary_node_pending_decode_tokens{node=\"observed\"} 0"));
+    assert!(after.contains("estuary_node_active{node=\"observed\"} 0"));
+    assert!(after.contains("estuary_inference_input_tokens_sum 100"));
+    assert!(after.contains("estuary_inference_cached_tokens_sum 80"));
+    assert!(after.contains("estuary_inference_output_tokens_sum 7"));
+    assert!(after.contains("estuary_upstream_first_token_duration_seconds_count 1"));
 }
 
 #[derive(Clone)]

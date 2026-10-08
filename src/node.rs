@@ -157,6 +157,10 @@ impl HealthState {
 #[derive(Clone, Debug)]
 struct RuntimeStats {
     latency_ewma_ms: f64,
+    ttft_ewma_ms: f64,
+    ttft_updated_at: Option<Instant>,
+    output_tokens_ewma: f64,
+    output_updated_at: Option<Instant>,
     error_ewma: f64,
     request_stats_updated_at: Option<Instant>,
     consecutive_active_failures: u32,
@@ -170,6 +174,10 @@ impl Default for RuntimeStats {
     fn default() -> Self {
         Self {
             latency_ewma_ms: 0.0,
+            ttft_ewma_ms: 0.0,
+            ttft_updated_at: None,
+            output_tokens_ewma: 0.0,
+            output_updated_at: None,
             error_ewma: 0.0,
             request_stats_updated_at: None,
             consecutive_active_failures: 0,
@@ -196,6 +204,9 @@ pub struct NodeSnapshot {
     pub max_concurrency: usize,
     pub weight: f64,
     pub latency_ewma_ms: f64,
+    pub ttft_ewma_ms: Option<f64>,
+    pub pending_prefill_tokens: usize,
+    pub pending_decode_tokens: usize,
     pub error_ewma: f64,
     pub last_error: Option<String>,
     pub last_change_unix_ms: u64,
@@ -253,6 +264,13 @@ pub struct Node {
     active: AtomicUsize,
     health: AtomicU8,
     stats: Mutex<RuntimeStats>,
+    workload: Mutex<Workload>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Workload {
+    pub prefill_tokens: u128,
+    pub decode_tokens: u128,
 }
 
 impl Node {
@@ -379,6 +397,7 @@ impl Node {
             active: AtomicUsize::new(0),
             health: AtomicU8::new(HealthState::Starting.encode()),
             stats: Mutex::new(RuntimeStats::default()),
+            workload: Mutex::new(Workload::default()),
         }))
     }
 
@@ -800,6 +819,8 @@ impl Node {
             permit: Some(permit),
             circuit_ticket: Some(circuit_ticket),
             idle_notify,
+            workload: Mutex::new(Workload::default()),
+            generations: AtomicUsize::new(1),
         })
     }
 
@@ -813,10 +834,38 @@ impl Node {
 
     pub fn score_stats(&self, stale_after: Duration) -> Option<(f64, f64)> {
         let stats = self.stats.lock();
-        stats
+        let recent_request = stats
             .request_stats_updated_at
             .filter(|updated| updated.elapsed() <= stale_after)
-            .map(|_| (stats.latency_ewma_ms, stats.error_ewma))
+            .map(|_| (stats.latency_ewma_ms, stats.error_ewma));
+        if stats
+            .ttft_updated_at
+            .is_some_and(|updated| updated.elapsed() <= stale_after)
+        {
+            Some((
+                stats.ttft_ewma_ms,
+                recent_request.map_or(0.0, |(_, error)| error),
+            ))
+        } else {
+            recent_request
+        }
+    }
+
+    pub(crate) fn scheduling_workload(&self) -> Workload {
+        *self.workload.lock()
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub(crate) fn typical_output_tokens(&self, stale_after: Duration) -> usize {
+        let stats = self.stats.lock();
+        if stats
+            .output_updated_at
+            .is_some_and(|updated| updated.elapsed() <= stale_after)
+        {
+            (stats.output_tokens_ewma.ceil() as usize).max(1)
+        } else {
+            256
+        }
     }
 
     pub fn record_request_success(&self, latency: Duration) {
@@ -915,6 +964,7 @@ impl Node {
 
     pub fn snapshot(&self) -> NodeSnapshot {
         let active = self.active();
+        let workload = self.scheduling_workload();
         let stats = self.stats.lock();
         let provider = self.provider_runtime.lock();
         let mut circuit = self.circuit.lock();
@@ -934,6 +984,9 @@ impl Node {
             max_concurrency: self.max_concurrency,
             weight: self.weight,
             latency_ewma_ms: stats.latency_ewma_ms,
+            ttft_ewma_ms: stats.ttft_updated_at.map(|_| stats.ttft_ewma_ms),
+            pending_prefill_tokens: workload.prefill_tokens.try_into().unwrap_or(usize::MAX),
+            pending_decode_tokens: workload.decode_tokens.try_into().unwrap_or(usize::MAX),
             error_ewma: stats.error_ewma,
             last_error: stats.last_error.clone(),
             last_change_unix_ms: stats.last_change_unix_ms,
@@ -996,6 +1049,8 @@ impl NodeReservation {
             permit: Some(permit),
             circuit_ticket: Some(circuit_ticket),
             idle_notify,
+            workload: Mutex::new(Workload::default()),
+            generations: AtomicUsize::new(1),
         })
     }
 }
@@ -1006,9 +1061,55 @@ pub struct NodeLease {
     permit: Option<OwnedSemaphorePermit>,
     circuit_ticket: Option<CircuitTicket>,
     idle_notify: Arc<Notify>,
+    workload: Mutex<Workload>,
+    generations: AtomicUsize,
 }
 
 impl NodeLease {
+    pub(crate) fn assign_workload(
+        &self,
+        prefill_tokens: usize,
+        decode_tokens: usize,
+        generations: usize,
+    ) {
+        self.generations
+            .store(generations.max(1), Ordering::Relaxed);
+        let prefill_tokens = prefill_tokens as u128;
+        let decode_tokens = decode_tokens as u128;
+        let mut own = self.workload.lock();
+        let mut total = self.node.workload.lock();
+        total.prefill_tokens = total
+            .prefill_tokens
+            .saturating_sub(own.prefill_tokens)
+            .saturating_add(prefill_tokens);
+        total.decode_tokens = total
+            .decode_tokens
+            .saturating_sub(own.decode_tokens)
+            .saturating_add(decode_tokens);
+        *own = Workload {
+            prefill_tokens,
+            decode_tokens,
+        };
+    }
+
+    pub(crate) fn record_first_token(&self, latency: Duration) {
+        {
+            let mut own = self.workload.lock();
+            let mut total = self.node.workload.lock();
+            total.prefill_tokens = total.prefill_tokens.saturating_sub(own.prefill_tokens);
+            own.prefill_tokens = 0;
+        }
+        let mut stats = self.node.stats.lock();
+        update_ewma(&mut stats.ttft_ewma_ms, latency.as_secs_f64() * 1_000.0);
+        stats.ttft_updated_at = Some(Instant::now());
+    }
+
+    pub(crate) fn record_output_tokens(&self, tokens: usize) {
+        let mut stats = self.node.stats.lock();
+        let per_generation = tokens.div_ceil(self.generations.load(Ordering::Relaxed));
+        update_ewma(&mut stats.output_tokens_ewma, per_generation as f64);
+        stats.output_updated_at = Some(Instant::now());
+    }
     pub fn node(&self) -> &Arc<Node> {
         &self.node
     }
@@ -1030,6 +1131,12 @@ impl NodeLease {
 
 impl Drop for NodeLease {
     fn drop(&mut self) {
+        let own = self.workload.get_mut();
+        {
+            let mut total = self.node.workload.lock();
+            total.prefill_tokens = total.prefill_tokens.saturating_sub(own.prefill_tokens);
+            total.decode_tokens = total.decode_tokens.saturating_sub(own.decode_tokens);
+        }
         self.node.active.fetch_sub(1, Ordering::AcqRel);
         if let Some(ticket) = self.circuit_ticket.take() {
             self.node.release_circuit_ticket(ticket);
@@ -1063,6 +1170,28 @@ fn unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_work_reservations_release_without_erasing_other_leases() {
+        let node = Node::from_config(&NodeConfig {
+            id: "work".to_owned(),
+            base_url: "http://work.invalid/v1".to_owned(),
+            max_concurrency: 2,
+            ..NodeConfig::default()
+        })
+        .unwrap();
+        let large = node.try_acquire(Arc::new(Notify::new())).unwrap();
+        let small = node.try_acquire(Arc::new(Notify::new())).unwrap();
+        large.assign_workload(usize::MAX, usize::MAX, 1);
+        small.assign_workload(10, 20, 1);
+        assert_eq!(node.snapshot().pending_prefill_tokens, usize::MAX);
+        drop(large);
+        assert_eq!(node.snapshot().pending_prefill_tokens, 10);
+        assert_eq!(node.snapshot().pending_decode_tokens, 20);
+        drop(small);
+        assert_eq!(node.snapshot().pending_prefill_tokens, 0);
+        assert_eq!(node.snapshot().pending_decode_tokens, 0);
+    }
 
     #[test]
     fn vllm_counter_rates_handle_resets_and_prefix_hit_ratio() {

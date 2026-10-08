@@ -42,7 +42,9 @@ struct Candidate {
     upstream_model: Option<String>,
     prefix_match_chars: usize,
     prefix_match_tokens: usize,
-    cache_preferred: bool,
+    prefill_tokens: usize,
+    decode_tokens: usize,
+    normalized_load: f64,
     score: f64,
 }
 
@@ -227,6 +229,7 @@ impl Scheduler {
                     let Some(lease) = reservation.try_commit(Arc::clone(&self.idle_notify)) else {
                         continue;
                     };
+                    lease.assign_workload(candidate.prefill_tokens, candidate.decode_tokens, prefix_input.generations());
                     return Ok(Selection {
                         node: candidate.node,
                         lease,
@@ -268,6 +271,11 @@ impl Scheduler {
     ) -> Result<Option<Selection>, GatewayError> {
         for candidate in self.ranked_candidates(model, prefix_input, excluded)? {
             if let Some(lease) = candidate.node.try_acquire(Arc::clone(&self.idle_notify)) {
+                lease.assign_workload(
+                    candidate.prefill_tokens,
+                    candidate.decode_tokens,
+                    prefix_input.generations(),
+                );
                 return Ok(Some(Selection {
                     node: candidate.node,
                     lease,
@@ -339,7 +347,9 @@ impl Scheduler {
                 upstream_model,
                 prefix_match_chars: 0,
                 prefix_match_tokens: 0,
-                cache_preferred: false,
+                prefill_tokens: 0,
+                decode_tokens: 0,
+                normalized_load: load,
                 score: base_score,
             });
         }
@@ -352,22 +362,7 @@ impl Scheduler {
             return Err(GatewayError::NoHealthyNode(model_name));
         }
 
-        let (min_load, max_load) = candidates
-            .iter()
-            .map(|candidate| candidate.node.scheduling_load())
-            .fold((usize::MAX, 0), |(min, max), load| {
-                (min.min(load), max.max(load))
-            });
-        let min_load = if min_load == usize::MAX { 0 } else { min_load };
-        let load_imbalanced = max_load.saturating_sub(min_load)
-            > self.config.prefix.balance_abs_threshold
-            && (max_load as f64) > min_load as f64 * self.config.prefix.balance_rel_threshold;
-        self.apply_cache_affinity(
-            &mut candidates,
-            prefix_input,
-            &prefix_match,
-            load_imbalanced,
-        );
+        self.apply_cache_affinity(&mut candidates, prefix_input, &prefix_match);
 
         candidates.sort_by(|left, right| left.node.id().cmp(right.node.id()));
         if !candidates.is_empty() {
@@ -375,81 +370,87 @@ impl Scheduler {
             candidates.rotate_left(offset);
         }
         candidates.sort_by(|left, right| {
-            right
-                .cache_preferred
-                .cmp(&left.cache_preferred)
-                .then_with(|| {
-                    left.score
-                        .partial_cmp(&right.score)
-                        .unwrap_or(Ordering::Equal)
-                })
+            left.score
+                .partial_cmp(&right.score)
+                .unwrap_or(Ordering::Equal)
         });
         Ok(candidates)
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn apply_cache_affinity(
         &self,
         candidates: &mut [Candidate],
         prefix_input: &PrefixInput,
         prefix_match: &PrefixMatch,
-        load_imbalanced: bool,
     ) {
         let exact_match = prefix_input
             .token_ids()
             .map(|tokens| self.exact_cache.matches(tokens));
-        let exact_tokens = exact_match
-            .as_ref()
-            .and_then(|matched| {
-                candidates
-                    .iter()
-                    .filter_map(|candidate| matched.matched_tokens.get(candidate.node.id()))
-                    .max()
-                    .copied()
-            })
-            .unwrap_or_default();
-        let input_tokens = prefix_input.token_ids().map_or(0, <[u64]>::len);
-        let exact_ratio = if input_tokens == 0 {
-            0.0
-        } else {
-            exact_tokens as f64 / input_tokens as f64
-        };
-        let approximate_ratio = if prefix_match.input_chars == 0 {
-            0.0
-        } else {
-            prefix_match.matched_chars as f64 / prefix_match.input_chars as f64
-        };
-        let exact_cache_mode = self.config.prefix.enabled
-            && !load_imbalanced
-            && exact_ratio > self.config.prefix.cache_threshold;
-        let approximate_cache_mode = self.config.prefix.enabled
-            && !load_imbalanced
-            && !exact_cache_mode
-            && approximate_ratio > self.config.prefix.cache_threshold;
-
-        if exact_cache_mode {
-            let matched = exact_match.as_ref().expect("exact cache mode has matches");
-            for candidate in candidates.iter_mut() {
-                let tokens = matched
-                    .matched_tokens
-                    .get(candidate.node.id())
-                    .copied()
-                    .unwrap_or_default();
-                if tokens == exact_tokens {
-                    candidate.cache_preferred = true;
-                    candidate.prefix_match_tokens = tokens;
-                }
-            }
-        } else if approximate_cache_mode {
-            for candidate in candidates.iter_mut() {
-                if prefix_match
-                    .node_ids
-                    .iter()
-                    .any(|node_id| node_id == candidate.node.id())
+        let input_tokens = prefix_input.input_tokens();
+        let affinity_tokens = prefix_input.affinity_tokens();
+        let least_load = candidates
+            .iter()
+            .map(|candidate| candidate.normalized_load)
+            .fold(f64::INFINITY, f64::min);
+        for candidate in candidates {
+            let mut cached_tokens = 0.0;
+            if self.config.prefix.enabled {
+                if let Some(tokens) = exact_match
+                    .as_ref()
+                    .and_then(|matched| matched.matched_tokens.get(candidate.node.id()))
                 {
-                    candidate.cache_preferred = true;
-                    candidate.prefix_match_chars = prefix_match.matched_chars;
+                    // A trustworthy zero is evidence of a miss, not permission to reuse stale history.
+                    candidate.prefix_match_tokens = *tokens;
+                    cached_tokens = (*tokens).min(input_tokens) as f64;
+                } else if let Some(chars) = prefix_match.node_matches.get(candidate.node.id()) {
+                    let ratio = if prefix_match.input_chars == 0 {
+                        0.0
+                    } else {
+                        *chars as f64 / prefix_match.input_chars as f64
+                    };
+                    if ratio > self.config.prefix.cache_threshold {
+                        candidate.prefix_match_chars = *chars;
+                        let age = prefix_match
+                            .node_age_seconds
+                            .get(candidate.node.id())
+                            .copied()
+                            .unwrap_or(0.0);
+                        let confidence = 0.5
+                            * (-age * 1_000.0
+                                / self.config.prefix.approximate_half_life_ms.max(1) as f64)
+                                .exp2();
+                        cached_tokens = affinity_tokens as f64 * ratio * confidence;
+                    }
                 }
             }
+            // Gradually reduce locality credit on busier workers, using capacity and weight.
+            let excess = (candidate.normalized_load - least_load).max(0.0)
+                * candidate.node.max_concurrency() as f64
+                * candidate.node.weight();
+            let decay = 1.0
+                + excess
+                    / self.config.prefix.balance_abs_threshold.max(1) as f64
+                    / self.config.prefix.balance_rel_threshold;
+            let credited = (cached_tokens / decay).floor() as usize;
+            candidate.prefill_tokens = input_tokens.saturating_sub(credited);
+            candidate.decode_tokens =
+                prefix_input.output_tokens(candidate.node.typical_output_tokens(
+                    Duration::from_millis(self.config.request_stats_stale_ms),
+                ));
+            let work = candidate.node.scheduling_workload();
+            candidate.score += (self.config.prefill_weight
+                * work
+                    .prefill_tokens
+                    .saturating_add(candidate.prefill_tokens as u128) as f64
+                / self.config.prefill_token_scale as f64
+                + self.config.decode_weight
+                    * work
+                        .decode_tokens
+                        .saturating_add(candidate.decode_tokens as u128)
+                        as f64
+                    / self.config.decode_token_scale as f64)
+                / candidate.node.weight();
         }
     }
 
@@ -825,5 +826,289 @@ mod tests {
 
         scheduler.prefix_directory().record("node", &request);
         assert!(scheduler.approximate_prefix_worth_tokenizing(&request));
+    }
+
+    fn prompt(text: &str) -> PrefixInput {
+        prefix::routing_text(
+            "completions",
+            Some("model"),
+            Some(&json!({"prompt": text})),
+            &PrefixConfig::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn cache_savings_can_pay_for_load_only_for_large_prompts() {
+        let cached = node("cached", 4);
+        let idle = node("idle", 4);
+        let scheduler = Scheduler::new(vec![Arc::clone(&cached), idle], RoutingConfig::default());
+        let held = cached.try_acquire(Arc::new(Notify::new())).unwrap();
+        for (length, expected) in [(64, "idle"), (16_384, "cached")] {
+            let input = prompt(&"x".repeat(length));
+            scheduler.prefix_directory().record("cached", &input);
+            let selected = scheduler
+                .acquire(Some("model"), input, &HashSet::new(), length)
+                .await
+                .unwrap();
+            assert_eq!(selected.node.id(), expected);
+        }
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn exact_eviction_overrides_approximate_history_even_for_zero_matches() {
+        let scheduler = Scheduler::new(
+            vec![node("a-idle", 4), node("z-cached", 4)],
+            RoutingConfig::default(),
+        );
+        let mut request = prompt("previously cached prompt");
+        request.set_token_ids(vec![1, 2, 3, 4]);
+        scheduler.prefix_directory().record("z-cached", &request);
+        scheduler.exact_cache.configure_node("z-cached", 10);
+        scheduler
+            .exact_cache
+            .apply(
+                "z-cached",
+                vec![CacheMutation::Store {
+                    hashes: vec![BlockHash::Integer(1)],
+                    parent: None,
+                    token_ids: vec![1, 2, 3, 4],
+                    block_size: 4,
+                    group: 0,
+                }],
+            )
+            .unwrap();
+        scheduler
+            .exact_cache
+            .apply(
+                "z-cached",
+                vec![CacheMutation::Remove {
+                    hashes: vec![BlockHash::Integer(1)],
+                    group: 0,
+                }],
+            )
+            .unwrap();
+        let selected = scheduler
+            .acquire(Some("model"), request.clone(), &HashSet::new(), 128)
+            .await
+            .unwrap();
+        assert_eq!(selected.node.id(), "a-idle");
+        drop(selected);
+        // A loss of authority allows the conservative historical fallback again.
+        scheduler.exact_cache.suspend_node("z-cached");
+        let selected = scheduler
+            .acquire(Some("model"), request, &HashSet::new(), 128)
+            .await
+            .unwrap();
+        assert_eq!(selected.node.id(), "z-cached");
+    }
+
+    #[tokio::test]
+    async fn exact_partial_matches_receive_credit_below_the_approximate_gate() {
+        let scheduler = Scheduler::new(
+            vec![node("a-idle", 4), node("z-partial", 4)],
+            RoutingConfig::default(),
+        );
+        scheduler.exact_cache.configure_node("z-partial", 10);
+        scheduler
+            .exact_cache
+            .apply(
+                "z-partial",
+                vec![CacheMutation::Store {
+                    hashes: vec![BlockHash::Integer(1)],
+                    parent: None,
+                    token_ids: vec![1, 2, 3, 4],
+                    block_size: 4,
+                    group: 0,
+                }],
+            )
+            .unwrap();
+        let mut input = prompt("partial prompt");
+        input.set_token_ids((1..=20).collect());
+        let selected = scheduler
+            .acquire(Some("model"), input, &HashSet::new(), 128)
+            .await
+            .unwrap();
+        assert_eq!(selected.node.id(), "z-partial");
+        assert_eq!(selected.prefix_match_tokens, 4);
+    }
+
+    #[tokio::test]
+    async fn equal_request_counts_prefer_the_worker_with_less_prefill_work() {
+        let long = node("a-long", 8);
+        let short = node("z-short", 8);
+        let scheduler = Scheduler::new(
+            vec![Arc::clone(&long), Arc::clone(&short)],
+            RoutingConfig::default(),
+        );
+        let first = scheduler
+            .acquire(
+                Some("model"),
+                prompt(&"x".repeat(32_768)),
+                &HashSet::from(["z-short".to_owned()]),
+                32_768,
+            )
+            .await
+            .unwrap();
+        let second = scheduler
+            .acquire(
+                Some("model"),
+                prompt("short"),
+                &HashSet::from(["a-long".to_owned()]),
+                128,
+            )
+            .await
+            .unwrap();
+        assert_eq!(long.active(), short.active());
+        let selected = scheduler
+            .acquire(Some("model"), prompt("new request"), &HashSet::new(), 128)
+            .await
+            .unwrap();
+        assert_eq!(selected.node.id(), "z-short");
+        drop((selected, first, second));
+        for node in [&long, &short] {
+            assert_eq!(node.snapshot().pending_prefill_tokens, 0);
+            assert_eq!(node.snapshot().pending_decode_tokens, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn first_token_releases_prefill_work_without_releasing_capacity() {
+        let only = node("only", 4);
+        let scheduler = Scheduler::new(vec![Arc::clone(&only)], RoutingConfig::default());
+        let selected = scheduler
+            .acquire(
+                Some("model"),
+                prompt(&"x".repeat(4_096)),
+                &HashSet::new(),
+                4_096,
+            )
+            .await
+            .unwrap();
+        assert_eq!(only.snapshot().pending_prefill_tokens, 1_024);
+        assert_eq!(only.snapshot().pending_decode_tokens, 256);
+        selected
+            .lease
+            .record_first_token(Duration::from_millis(750));
+        assert_eq!(only.snapshot().pending_prefill_tokens, 0);
+        assert_eq!(only.snapshot().pending_decode_tokens, 256);
+        assert_eq!(only.active(), 1);
+        assert_eq!(only.score_stats(Duration::from_secs(1)), Some((750.0, 0.0)));
+        selected.lease.record_output_tokens(64);
+        assert_eq!(only.typical_output_tokens(Duration::from_secs(1)), 64);
+        drop(selected);
+        assert_eq!(only.snapshot().pending_decode_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn truncated_affinity_cannot_credit_the_unindexed_prompt_suffix() {
+        let config = RoutingConfig {
+            prefix: PrefixConfig {
+                max_request_chars: 32,
+                ..PrefixConfig::default()
+            },
+            ..RoutingConfig::default()
+        };
+        let cached = node("cached", 4);
+        let scheduler = Scheduler::new(vec![Arc::clone(&cached)], config.clone());
+        let input = prefix::routing_text(
+            "completions",
+            Some("model"),
+            Some(&json!({"prompt": "x".repeat(16_384)})),
+            &config.prefix,
+        );
+        scheduler.prefix_directory().record("cached", &input);
+        let selected = scheduler
+            .acquire(Some("model"), input, &HashSet::new(), 16_384)
+            .await
+            .unwrap();
+        assert_eq!(selected.prefix_match_chars, 32);
+        assert!(cached.snapshot().pending_prefill_tokens >= 4_092);
+    }
+
+    #[tokio::test]
+    async fn aged_character_history_loses_its_routing_credit() {
+        let config = RoutingConfig {
+            prefix: PrefixConfig {
+                approximate_half_life_ms: 1,
+                ..PrefixConfig::default()
+            },
+            ..RoutingConfig::default()
+        };
+        let scheduler = Scheduler::new(vec![node("a-idle", 4), node("z-cached", 4)], config);
+        let input = prompt(&"x".repeat(64));
+        scheduler.prefix_directory().record("z-cached", &input);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let selected = scheduler
+            .acquire(Some("model"), input, &HashSet::new(), 128)
+            .await
+            .unwrap();
+        assert_eq!(selected.node.id(), "a-idle");
+    }
+
+    #[tokio::test]
+    async fn equal_request_counts_prefer_less_output_work_and_normalize_generation_history() {
+        let long = node("a-long", 8);
+        let short = node("z-short", 8);
+        let scheduler = Scheduler::new(
+            vec![Arc::clone(&long), Arc::clone(&short)],
+            RoutingConfig::default(),
+        );
+        let held_long = long.try_acquire(Arc::new(Notify::new())).unwrap();
+        held_long.assign_workload(0, 8_192, 2);
+        let held_short = short.try_acquire(Arc::new(Notify::new())).unwrap();
+        held_short.assign_workload(0, 32, 1);
+        let selected = scheduler
+            .acquire(Some("model"), prompt("new"), &HashSet::new(), 128)
+            .await
+            .unwrap();
+        assert_eq!(selected.node.id(), "z-short");
+        held_long.record_output_tokens(100);
+        assert_eq!(long.typical_output_tokens(Duration::from_secs(1)), 50);
+    }
+
+    #[tokio::test]
+    async fn queued_admission_accounts_work_and_cancelled_waiters_do_not_leak() {
+        let only = node("only", 1);
+        let scheduler = Arc::new(Scheduler::new(
+            vec![Arc::clone(&only)],
+            RoutingConfig::default(),
+        ));
+        let held = only.try_acquire(Arc::new(Notify::new())).unwrap();
+        let spawn_waiter = || {
+            let scheduler = Arc::clone(&scheduler);
+            tokio::spawn(async move {
+                scheduler
+                    .acquire(
+                        Some("model"),
+                        prompt(&"x".repeat(4_096)),
+                        &HashSet::new(),
+                        4_096,
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+        let cancelled = spawn_waiter();
+        while scheduler.queue_snapshot().0 == 0 {
+            tokio::task::yield_now().await;
+        }
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert_eq!(only.snapshot().pending_prefill_tokens, 0);
+        let pending = spawn_waiter();
+        while scheduler.queue_snapshot().0 == 0 {
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+        let selected = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(only.snapshot().pending_prefill_tokens, 1_024);
+        assert_eq!(only.snapshot().pending_decode_tokens, 256);
+        drop(selected);
+        assert_eq!(only.snapshot().pending_prefill_tokens, 0);
+        assert_eq!(only.snapshot().pending_decode_tokens, 0);
     }
 }

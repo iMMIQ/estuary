@@ -29,6 +29,11 @@ Common settings and defaults:
 | `ESTUARY_MAX_REQUEST_BODY_BYTES` | `16777216` | Maximum inference request body. |
 | `ESTUARY_QUEUE_MAX_REQUESTS` | `512` | Requests admitted to upstream-capacity waiting. |
 | `ESTUARY_QUEUE_MAX_BYTES` | `268435456` | Aggregate admitted request-body budget. |
+| `ESTUARY_PREFILL_WEIGHT` | `1.0` | Contribution of estimated uncached input work to routing. |
+| `ESTUARY_DECODE_WEIGHT` | `0.25` | Contribution of estimated output work to routing. |
+| `ESTUARY_PREFILL_TOKEN_SCALE` | `4096` | Input tokens corresponding to one prefill score unit before node weight. |
+| `ESTUARY_DECODE_TOKEN_SCALE` | `1024` | Output tokens corresponding to one decode score unit before node weight. |
+| `ESTUARY_PREFIX_APPROXIMATE_HALF_LIFE_MS` | `300000` | Half-life of historical character-cache confidence. |
 | `ESTUARY_MAX_NON_STREAMING_RESPONSE_BYTES` | `67108864` | Maximum buffered response body. |
 | `ESTUARY_MAX_BUFFERED_RESPONSE_BYTES` | `268435456` | Aggregate non-streaming response-buffer budget. |
 | `ESTUARY_WITHDRAWAL_DELAY_MS` | `10000` | Delay between failed readiness and stopping public accepts. |
@@ -161,3 +166,32 @@ Concurrency limits, queues, health state, circuit state, and prefix directories
 are process-local. The built-in deployment process keeps one active worker in
 steady state and briefly overlaps generations while the previous worker drains.
 See [deployment](../deploy/README.md) for the supported rollout topology.
+
+## Scheduling Observability
+
+Node runtime snapshots include `ttft_ewma_ms`, `pending_prefill_tokens`, and
+`pending_decode_tokens`. The pending values are estimates held by local leases,
+not measurements of the backend's scheduler. They return to zero when leases
+complete or are cancelled.
+
+Prometheus exposes:
+
+- `estuary_node_pending_prefill_tokens` and `estuary_node_pending_decode_tokens`;
+- `estuary_upstream_first_token_duration_seconds`, from upstream dispatch to the
+  first observed text, reasoning, or tool generation event;
+- `estuary_inference_input_tokens`, `estuary_inference_cached_tokens`, and
+  `estuary_inference_output_tokens`, using reported usage of completed requests.
+
+Queue duration remains a separate metric. Usage histograms have no sample when
+the upstream omits usage. TTFT observation does not count pings or metadata and
+does not change SSE bytes. See [the scheduling model](architecture.md#scheduling)
+for fallbacks and estimation limits.
+
+Set both workload weights to zero to retain count/latency/error scoring without
+token-work contributions. Setting `ESTUARY_PREFIX_ENABLED=false` disables cache
+credit while preserving workload tracking. Existing balance thresholds scale
+cache-credit decay rather than trigger a global strategy switch.
+
+Default workload settings are omitted from serialized supervisor settings so
+workers from earlier releases can still read the default payload. Non-default
+workload overrides require a worker release that supports these options.

@@ -109,6 +109,8 @@ impl Settings {
             ("load_weight", self.routing.load_weight),
             ("latency_weight", self.routing.latency_weight),
             ("error_weight", self.routing.error_weight),
+            ("prefill_weight", self.routing.prefill_weight),
+            ("decode_weight", self.routing.decode_weight),
         ] {
             if !value.is_finite() || value < 0.0 {
                 bail!("routing.{name} must be finite and non-negative");
@@ -120,7 +122,13 @@ impl Settings {
         if self.routing.request_stats_stale_ms == 0 {
             bail!("routing.request_stats_stale_ms must be greater than zero");
         }
+        if self.routing.prefill_token_scale == 0 || self.routing.decode_token_scale == 0 {
+            bail!("routing token scales must be greater than zero");
+        }
         if self.routing.prefix.enabled {
+            if self.routing.prefix.approximate_half_life_ms == 0 {
+                bail!("routing.prefix.approximate_half_life_ms must be greater than zero");
+            }
             if !self.routing.prefix.cache_threshold.is_finite()
                 || !(0.0..=1.0).contains(&self.routing.prefix.cache_threshold)
             {
@@ -432,6 +440,14 @@ pub struct RoutingConfig {
     pub load_weight: f64,
     pub latency_weight: f64,
     pub error_weight: f64,
+    #[serde(skip_serializing_if = "is_default_prefill_weight")]
+    pub prefill_weight: f64,
+    #[serde(skip_serializing_if = "is_default_decode_weight")]
+    pub decode_weight: f64,
+    #[serde(skip_serializing_if = "is_default_prefill_scale")]
+    pub prefill_token_scale: usize,
+    #[serde(skip_serializing_if = "is_default_decode_scale")]
+    pub decode_token_scale: usize,
     pub target_latency_ms: f64,
     pub request_stats_stale_ms: u64,
     pub prefix: PrefixConfig,
@@ -445,6 +461,10 @@ impl Default for RoutingConfig {
             load_weight: 1.0,
             latency_weight: 0.20,
             error_weight: 1.0,
+            prefill_weight: 1.0,
+            decode_weight: 0.25,
+            prefill_token_scale: 4_096,
+            decode_token_scale: 1_024,
             target_latency_ms: 1_000.0,
             request_stats_stale_ms: 60_000,
             prefix: PrefixConfig::default(),
@@ -457,6 +477,8 @@ impl Default for RoutingConfig {
 pub struct PrefixConfig {
     pub enabled: bool,
     pub cache_threshold: f64,
+    #[serde(skip_serializing_if = "is_default_approximate_half_life")]
+    pub approximate_half_life_ms: u64,
     pub balance_abs_threshold: usize,
     pub balance_rel_threshold: f64,
     pub max_request_chars: usize,
@@ -470,6 +492,7 @@ impl Default for PrefixConfig {
         Self {
             enabled: true,
             cache_threshold: 0.5,
+            approximate_half_life_ms: 300_000,
             balance_abs_threshold: 2,
             balance_rel_threshold: 1.1,
             max_request_chars: 128 * 1024,
@@ -478,6 +501,29 @@ impl Default for PrefixConfig {
             max_directory_chars: 16_000_000,
         }
     }
+}
+
+// Keep default supervisor settings readable by workers predating workload routing.
+// Serde serialization predicates require references to the fields.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_prefill_weight(value: &f64) -> bool {
+    value.to_bits() == RoutingConfig::default().prefill_weight.to_bits()
+}
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_decode_weight(value: &f64) -> bool {
+    value.to_bits() == RoutingConfig::default().decode_weight.to_bits()
+}
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_prefill_scale(value: &usize) -> bool {
+    *value == RoutingConfig::default().prefill_token_scale
+}
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_decode_scale(value: &usize) -> bool {
+    *value == RoutingConfig::default().decode_token_scale
+}
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_approximate_half_life(value: &u64) -> bool {
+    *value == PrefixConfig::default().approximate_half_life_ms
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -731,6 +777,85 @@ fn is_reserved_upstream_header(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_workload_settings_preserve_legacy_worker_payloads() {
+        let mut settings = Settings::default();
+        let value = serde_json::to_value(&settings).unwrap();
+        for key in [
+            "prefill_weight",
+            "decode_weight",
+            "prefill_token_scale",
+            "decode_token_scale",
+        ] {
+            assert!(value["routing"].get(key).is_none());
+        }
+        assert!(
+            value["routing"]["prefix"]
+                .get("approximate_half_life_ms")
+                .is_none()
+        );
+        let restored: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.routing.prefill_token_scale, 4_096);
+        settings.routing.prefill_weight = 0.0;
+        settings.routing.prefix.approximate_half_life_ms = 60_000;
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["routing"]["prefill_weight"], 0.0);
+        assert_eq!(
+            value["routing"]["prefix"]["approximate_half_life_ms"],
+            60_000
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_workload_scoring_parameters() {
+        for routing in [
+            RoutingConfig {
+                prefill_weight: f64::NAN,
+                ..RoutingConfig::default()
+            },
+            RoutingConfig {
+                decode_weight: -1.0,
+                ..RoutingConfig::default()
+            },
+            RoutingConfig {
+                prefill_token_scale: 0,
+                ..RoutingConfig::default()
+            },
+            RoutingConfig {
+                decode_token_scale: 0,
+                ..RoutingConfig::default()
+            },
+            RoutingConfig {
+                prefix: PrefixConfig {
+                    approximate_half_life_ms: 0,
+                    ..PrefixConfig::default()
+                },
+                ..RoutingConfig::default()
+            },
+        ] {
+            assert!(
+                Settings {
+                    routing,
+                    ..Settings::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            Settings {
+                routing: RoutingConfig {
+                    prefill_weight: 0.0,
+                    decode_weight: 0.0,
+                    ..RoutingConfig::default()
+                },
+                ..Settings::default()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
 
     #[test]
     fn rejects_duplicate_nodes() {

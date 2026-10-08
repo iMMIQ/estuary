@@ -100,6 +100,14 @@ struct RoutingOverrides {
     latency_weight: Option<f64>,
     #[arg(long, env = "ESTUARY_ERROR_WEIGHT")]
     error_weight: Option<f64>,
+    #[arg(long, env = "ESTUARY_PREFILL_WEIGHT")]
+    prefill_weight: Option<f64>,
+    #[arg(long, env = "ESTUARY_DECODE_WEIGHT")]
+    decode_weight: Option<f64>,
+    #[arg(long, env = "ESTUARY_PREFILL_TOKEN_SCALE")]
+    prefill_token_scale: Option<usize>,
+    #[arg(long, env = "ESTUARY_DECODE_TOKEN_SCALE")]
+    decode_token_scale: Option<usize>,
     #[arg(long, env = "ESTUARY_TARGET_LATENCY_MS")]
     target_latency_ms: Option<f64>,
     #[arg(long, env = "ESTUARY_REQUEST_STATS_STALE_MS")]
@@ -117,6 +125,11 @@ struct PrefixOverrides {
         env = "ESTUARY_PREFIX_CACHE_THRESHOLD"
     )]
     cache_threshold: Option<f64>,
+    #[arg(
+        long = "prefix-approximate-half-life-ms",
+        env = "ESTUARY_PREFIX_APPROXIMATE_HALF_LIFE_MS"
+    )]
+    approximate_half_life_ms: Option<u64>,
     #[arg(
         long = "prefix-balance-abs-threshold",
         env = "ESTUARY_PREFIX_BALANCE_ABS_THRESHOLD"
@@ -411,6 +424,16 @@ mod tests {
             "42",
             "--request-stats-stale-ms",
             "30000",
+            "--prefill-weight",
+            "0.75",
+            "--decode-weight",
+            "0.5",
+            "--prefill-token-scale",
+            "8192",
+            "--decode-token-scale",
+            "2048",
+            "--prefix-approximate-half-life-ms",
+            "120000",
             "--retry-max-attempts",
             "2",
             "--retry-statuses",
@@ -426,6 +449,11 @@ mod tests {
         let settings = settings_from_overrides(&cli.runtime).unwrap();
         assert_eq!(settings.routing.queue_max_requests, 42);
         assert_eq!(settings.routing.request_stats_stale_ms, 30_000);
+        assert!((settings.routing.prefill_weight - 0.75).abs() < f64::EPSILON);
+        assert!((settings.routing.decode_weight - 0.5).abs() < f64::EPSILON);
+        assert_eq!(settings.routing.prefill_token_scale, 8_192);
+        assert_eq!(settings.routing.decode_token_scale, 2_048);
+        assert_eq!(settings.routing.prefix.approximate_half_life_ms, 120_000);
         assert_eq!(settings.retry.max_attempts, 2);
         assert_eq!(settings.retry.statuses, vec![429, 503]);
         assert!(!settings.routing.prefix.enabled);

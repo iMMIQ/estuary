@@ -57,30 +57,78 @@ Node `max_concurrency` is a hard per-process limit. Lower scores are preferred:
 observed_load = max(local_active, fresh_vllm_running + fresh_vllm_waiting)
 load = ((observed_load + 1) / max_concurrency) / weight
 
-latency = response_header_latency_ewma_ms / target_latency_ms
+prefill = (pending_prefill_tokens + incoming_uncached_tokens) / prefill_token_scale / weight
+decode = (pending_decode_tokens + incoming_output_tokens) / decode_token_scale / weight
+latency = recent_first_generation_latency_ms / target_latency_ms
 error = error_ewma + health_penalty
 
 score = load_weight * load
+      + prefill_weight * prefill
+      + decode_weight * decode
       + latency_weight * latency
       + error_weight * error
 ```
 
-Missing or stale latency/error observations contribute no penalty. Equal
-candidates rotate rather than falling back to a fixed node ID. A fresh vLLM
-waiting count at or above `provider.waiting_threshold` removes that node from
-admission until telemetry reports recovery.
+Fresh observed first-generation latency is preferred to response-header latency.
+When no fresh generation observation exists, recent header latency is the
+fallback. Missing or stale latency/error observations contribute no penalty.
+Equal candidates rotate rather than falling back to a fixed node ID. A fresh
+vLLM waiting count at or above `provider.waiting_threshold` removes that node
+from admission until telemetry reports recovery.
 
-Prefix preference is disabled when both load-imbalance conditions hold:
+Cache savings reduce incoming prefill work in this continuous score; a cache
+owner does not automatically outrank a less loaded node. Each worker's prefix
+is considered, including shorter matches on other workers. A reliable exact
+token match, including zero, takes precedence over historical character matches
+for that worker. Exact matches receive credit even below the approximate
+`prefix.cache_threshold` gate.
+
+Character matches above that gate receive at most 50% estimated token credit.
+Streaming history is recorded after observed generation rather than after
+metadata alone, with successful EOF as the fallback. Their confidence halves every `prefix.approximate_half_life_ms` (five minutes
+by default), measured since that worker's matching prefix was last recorded.
+Credit is capped by the bounded prefix actually indexed, so truncating a long
+request cannot make its unindexed suffix appear cached.
+
+Credit also decays smoothly as a worker's capacity- and weight-normalized load
+exceeds the least loaded eligible worker:
 
 ```text
-max_active - min_active > prefix.balance_abs_threshold
-max_active > min_active * prefix.balance_rel_threshold
+excess_requests = max(0, load - min_load) * max_concurrency * weight
+credit_divisor = 1 + excess_requests / max(1, prefix.balance_abs_threshold)
+                                    / prefix.balance_rel_threshold
+incoming_uncached_tokens = input_tokens - floor(cache_tokens * confidence / credit_divisor)
 ```
 
-Otherwise, Estuary first prefers the longest authoritative vLLM token match when
-available, then the owner of the longest approximate character match. A match
-must exceed `prefix.cache_threshold`; health, provider, circuit, and concurrency
-gates always take precedence.
+The balance settings now control this continuous decay rather than turning all
+cache affinity off when the pool crosses a global imbalance threshold.
+
+A lease records its assigned prefill and estimated output work. The first
+observed generation event clears prefill work while retaining concurrency and
+output accounting. EOF, failure, timeout, and cancellation release all remaining
+work automatically. The same accounting applies after queue admission; node
+FIFO semaphore fairness and first-available admission remain unchanged.
+
+Input work uses exact tokenization when available, otherwise a full-request
+text estimate (roughly four ASCII characters or one non-ASCII character per
+token). Encoded image, audio, video, and file blocks are excluded from the text
+estimate; their inference cost is not modeled. The estimate is independent of
+prefix truncation and remains enabled when cache affinity is disabled. Output work uses recent successful reported
+output lengths, normalized for `n`, capped by the request's output limit and
+multiplied by the completion count (`n`, and prompt batch size for Completions).
+Without fresh samples, the estimate is 256 tokens per completion. Embeddings and token-count requests receive no output reservation.
+These are token-based heuristics, not calibrated GPU-time predictions; model,
+hardware, multimodal inputs, and output-length variation require workload
+validation before tuning.
+
+Streaming observation is bounded to 64 KiB per SSE event and does not modify
+forwarded bytes. Role declarations, heartbeats, and metadata do not count as
+generation; text, reasoning, and tool output do. Oversized, unsupported, or
+unparseable events are skipped for observation, and subsequent events can
+still be observed. TTFT excludes gateway queueing; stream backpressure can
+influence the time at which an upstream event is observed. Reported usage is
+recorded at successful EOF, preserving each upstream protocol's input-token
+semantics. Missing usage does not invent token observations.
 
 ## Prefix State
 

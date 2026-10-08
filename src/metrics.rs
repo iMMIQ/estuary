@@ -53,6 +53,8 @@ pub struct Metrics {
     stream_cancellations: Family<NodeLabels, Counter>,
     stream_errors: Family<NodeLabels, Counter>,
     node_active: Family<NodeLabels, Gauge>,
+    node_pending_prefill_tokens: Family<NodeLabels, Gauge>,
+    node_pending_decode_tokens: Family<NodeLabels, Gauge>,
     node_health: Family<NodeLabels, Gauge>,
     node_accepting_requests: Family<NodeLabels, Gauge>,
     node_circuit_state: Family<NodeLabels, Gauge>,
@@ -75,6 +77,10 @@ pub struct Metrics {
     tokenization_duration: Histogram,
     prefix_match_chars: Histogram,
     prefix_match_tokens: Histogram,
+    first_token_duration: Histogram,
+    input_tokens: Histogram,
+    cached_tokens: Histogram,
+    output_tokens: Histogram,
     node_labels: Mutex<HashSet<NodeLabels>>,
     attempt_labels: Mutex<HashSet<AttemptLabels>>,
     retry_labels: Mutex<HashSet<AttemptLabels>>,
@@ -90,6 +96,8 @@ impl Metrics {
         let stream_cancellations = Family::default();
         let stream_errors = Family::default();
         let node_active = Family::default();
+        let node_pending_prefill_tokens = Family::default();
+        let node_pending_decode_tokens = Family::default();
         let node_health = Family::default();
         let node_accepting_requests = Family::default();
         let node_circuit_state = Family::default();
@@ -112,6 +120,10 @@ impl Metrics {
         let tokenization_duration = Histogram::new(exponential_buckets(0.000_5, 2.0, 18));
         let prefix_match_chars = Histogram::new(exponential_buckets(128.0, 2.0, 14));
         let prefix_match_tokens = Histogram::new(exponential_buckets(16.0, 2.0, 16));
+        let first_token_duration = Histogram::new(exponential_buckets(0.005, 2.0, 18));
+        let input_tokens = Histogram::new(exponential_buckets(16.0, 2.0, 16));
+        let cached_tokens = Histogram::new(exponential_buckets(16.0, 2.0, 16));
+        let output_tokens = Histogram::new(exponential_buckets(1.0, 2.0, 18));
 
         let mut registry = Registry::with_prefix("estuary");
         registry.register(
@@ -260,6 +272,32 @@ impl Metrics {
             prefix_match_tokens.clone(),
         );
 
+        registry.register(
+            "node_pending_prefill_tokens",
+            "Estimated uncached input work held by local leases.",
+            node_pending_prefill_tokens.clone(),
+        );
+        registry.register(
+            "node_pending_decode_tokens",
+            "Estimated output work held by local leases.",
+            node_pending_decode_tokens.clone(),
+        );
+        registry.register("upstream_first_token_duration_seconds", "Time from upstream dispatch to the first observed generation event, including reasoning and tool output.", first_token_duration.clone());
+        registry.register(
+            "inference_input_tokens",
+            "Upstream-reported input tokens for completed requests.",
+            input_tokens.clone(),
+        );
+        registry.register(
+            "inference_cached_tokens",
+            "Upstream-reported cached input tokens for completed requests.",
+            cached_tokens.clone(),
+        );
+        registry.register(
+            "inference_output_tokens",
+            "Upstream-reported output tokens for completed requests.",
+            output_tokens.clone(),
+        );
         Arc::new(Self {
             registry,
             requests,
@@ -269,6 +307,8 @@ impl Metrics {
             stream_cancellations,
             stream_errors,
             node_active,
+            node_pending_prefill_tokens,
+            node_pending_decode_tokens,
             node_health,
             node_accepting_requests,
             node_circuit_state,
@@ -291,6 +331,10 @@ impl Metrics {
             tokenization_duration,
             prefix_match_chars,
             prefix_match_tokens,
+            first_token_duration,
+            input_tokens,
+            cached_tokens,
+            output_tokens,
             node_labels: Mutex::new(HashSet::new()),
             attempt_labels: Mutex::new(HashSet::new()),
             retry_labels: Mutex::new(HashSet::new()),
@@ -369,6 +413,22 @@ impl Metrics {
         self.prefix_match_tokens.observe(tokens as f64);
     }
 
+    pub(crate) fn observe_first_token(&self, elapsed: std::time::Duration) {
+        self.first_token_duration.observe(elapsed.as_secs_f64());
+    }
+
+    pub(crate) fn observe_usage(&self, usage: crate::inference_stats::Usage) {
+        if let Some(tokens) = usage.input_tokens {
+            self.input_tokens.observe(tokens as f64);
+        }
+        if let Some(tokens) = usage.cached_tokens {
+            self.cached_tokens.observe(tokens as f64);
+        }
+        if let Some(tokens) = usage.output_tokens {
+            self.output_tokens.observe(tokens as f64);
+        }
+    }
+
     pub fn response_buffer_bytes(&self, bytes: usize) {
         self.response_buffer_bytes
             .set(bytes.try_into().unwrap_or(i64::MAX));
@@ -399,6 +459,8 @@ impl Metrics {
             self.stream_cancellations.remove(labels);
             self.stream_errors.remove(labels);
             self.node_active.remove(labels);
+            self.node_pending_prefill_tokens.remove(labels);
+            self.node_pending_decode_tokens.remove(labels);
             self.node_health.remove(labels);
             self.node_accepting_requests.remove(labels);
             self.node_circuit_state.remove(labels);
@@ -453,6 +515,18 @@ impl Metrics {
             };
             self.node_health.get_or_create(&labels).set(health);
             let snapshot = node.snapshot();
+            self.node_pending_prefill_tokens.get_or_create(&labels).set(
+                snapshot
+                    .pending_prefill_tokens
+                    .try_into()
+                    .unwrap_or(i64::MAX),
+            );
+            self.node_pending_decode_tokens.get_or_create(&labels).set(
+                snapshot
+                    .pending_decode_tokens
+                    .try_into()
+                    .unwrap_or(i64::MAX),
+            );
             self.node_accepting_requests
                 .get_or_create(&labels)
                 .set(i64::from(

@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     io::{self, Write},
     sync::Arc,
+    time::Instant,
 };
 
 use parking_lot::RwLock;
@@ -17,9 +18,82 @@ pub struct PrefixInput {
     text: String,
     char_count: usize,
     token_ids: Option<Arc<[u64]>>,
+    estimated_tokens: usize,
+    estimated_affinity_tokens: usize,
+    output_limit: Option<usize>,
+    generations: usize,
 }
 
 impl PrefixInput {
+    pub(crate) fn generations(&self) -> usize {
+        self.generations.max(1)
+    }
+    /// Input work, using exact tokenization when available and a text estimate otherwise.
+    pub fn input_tokens(&self) -> usize {
+        self.token_ids
+            .as_ref()
+            .map_or(self.estimated_tokens, |ids| ids.len())
+    }
+
+    pub(crate) fn affinity_tokens(&self) -> usize {
+        self.estimated_affinity_tokens.min(self.input_tokens())
+    }
+
+    pub(crate) fn output_tokens(&self, typical_output: usize) -> usize {
+        typical_output
+            .min(self.output_limit.unwrap_or(usize::MAX))
+            .saturating_mul(self.generations)
+    }
+
+    fn with_workload(mut self, endpoint: &str, body: Option<&Value>) -> Self {
+        let Some(body) = body else {
+            return self;
+        };
+        // Count the full prompt, even when the bounded affinity key is truncated or disabled.
+        let input_key = match endpoint {
+            "chat/completions" | "messages" => "messages",
+            "completions" => "prompt",
+            _ => "input",
+        };
+        for key in [
+            "system",
+            "instructions",
+            "tools",
+            "response_format",
+            input_key,
+        ] {
+            if let Some(value) = body.get(key) {
+                self.estimated_tokens =
+                    self.estimated_tokens.saturating_add(estimate_tokens(value));
+            }
+        }
+        self.estimated_affinity_tokens =
+            estimate_text_tokens(&self.text).min(self.estimated_tokens);
+        if matches!(
+            endpoint,
+            "chat/completions" | "completions" | "messages" | "responses"
+        ) {
+            self.generations = body
+                .get("n")
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(1)
+                .max(1);
+            if endpoint == "completions"
+                && let Some(prompts) = body.get("prompt").and_then(Value::as_array)
+                && prompts
+                    .first()
+                    .is_some_and(|prompt| prompt.is_string() || prompt.is_array())
+            {
+                self.generations = self.generations.saturating_mul(prompts.len());
+            }
+            self.output_limit = ["max_completion_tokens", "max_output_tokens", "max_tokens"]
+                .into_iter()
+                .find_map(|key| body.get(key).and_then(Value::as_u64))
+                .and_then(|n| usize::try_from(n).ok());
+        }
+        self
+    }
     pub fn char_count(&self) -> usize {
         self.char_count
     }
@@ -33,11 +107,67 @@ impl PrefixInput {
     }
 }
 
+fn estimate_tokens(value: &Value) -> usize {
+    match value {
+        Value::String(text) => estimate_text_tokens(text),
+        Value::Array(items) => items.iter().fold(0usize, |sum, item| {
+            sum.saturating_add(estimate_tokens(item))
+        }),
+        Value::Object(items) => {
+            // Encoded media length is not a text-token or GPU-work estimate.
+            if items
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "image"
+                            | "image_url"
+                            | "input_image"
+                            | "input_audio"
+                            | "audio"
+                            | "video"
+                            | "video_url"
+                            | "input_video"
+                            | "file"
+                            | "input_file"
+                    )
+                })
+            {
+                return 0;
+            }
+            items.values().fold(0usize, |sum, item| {
+                sum.saturating_add(estimate_tokens(item))
+            })
+        }
+        Value::Number(_) => 1,
+        _ => 0,
+    }
+}
+
+fn estimate_text_tokens(text: &str) -> usize {
+    if text.is_ascii() {
+        return text.len().div_ceil(4);
+    }
+    let (ascii, non_ascii) = text
+        .chars()
+        .fold((0usize, 0usize), |(ascii, non_ascii), ch| {
+            if ch.is_ascii() {
+                (ascii + 1, non_ascii)
+            } else {
+                (ascii, non_ascii + 1)
+            }
+        });
+    ascii.div_ceil(4).saturating_add(non_ascii)
+}
+
 #[derive(Debug, Default)]
 pub struct PrefixMatch {
     pub node_ids: Vec<String>,
     pub matched_chars: usize,
     pub input_chars: usize,
+    pub node_matches: HashMap<String, usize>,
+    pub node_age_seconds: HashMap<String, f64>,
 }
 
 #[derive(Debug, Default)]
@@ -47,6 +177,7 @@ struct RadixNode {
     children: HashMap<char, RadixNode>,
     tenant_last_access: HashMap<String, u64>,
     tenant_oldest_leaf: HashMap<String, u64>,
+    tenant_last_seen: HashMap<String, Instant>,
 }
 
 impl RadixNode {
@@ -58,6 +189,7 @@ impl RadixNode {
             children: HashMap::new(),
             tenant_last_access: HashMap::from([(tenant.to_owned(), epoch)]),
             tenant_oldest_leaf: HashMap::from([(tenant.to_owned(), epoch)]),
+            tenant_last_seen: HashMap::from([(tenant.to_owned(), Instant::now())]),
         }
     }
 }
@@ -94,6 +226,9 @@ impl RadixTree {
         let mut remaining = text;
         let mut matched_chars = 0;
         let mut tenants = Vec::new();
+        let mut node_matches = HashMap::new();
+        let mut node_age_seconds = HashMap::new();
+        let now = Instant::now();
 
         while let Some(first) = remaining.chars().next() {
             let Some(child) = current.children.get(&first) else {
@@ -102,6 +237,19 @@ impl RadixTree {
             let shared = shared_prefix_chars(remaining, &child.text);
             matched_chars += shared;
             tenants = child.tenant_last_access.keys().cloned().collect();
+            for (tenant, recorded) in &child.tenant_last_seen {
+                if let Some(matched) = node_matches.get_mut(tenant) {
+                    *matched = matched_chars;
+                } else {
+                    node_matches.insert(tenant.clone(), matched_chars);
+                }
+                let age = now.saturating_duration_since(*recorded).as_secs_f64();
+                if let Some(previous) = node_age_seconds.get_mut(tenant) {
+                    *previous = age;
+                } else {
+                    node_age_seconds.insert(tenant.clone(), age);
+                }
+            }
             if shared != child.char_count {
                 break;
             }
@@ -114,6 +262,8 @@ impl RadixTree {
             node_ids: tenants,
             matched_chars,
             input_chars,
+            node_matches,
+            node_age_seconds,
         }
     }
 
@@ -147,6 +297,7 @@ impl RadixTree {
 }
 
 fn clear_tenant_from_node(node: &mut RadixNode, tenant: &str) {
+    node.tenant_last_seen.remove(tenant);
     node.tenant_last_access.remove(tenant);
     node.tenant_oldest_leaf.remove(tenant);
     node.children.retain(|_, child| {
@@ -157,6 +308,8 @@ fn clear_tenant_from_node(node: &mut RadixNode, tenant: &str) {
 
 fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, count: &mut usize) {
     if remaining.is_empty() {
+        node.tenant_last_seen
+            .insert(tenant.to_owned(), Instant::now());
         node.tenant_last_access.insert(tenant.to_owned(), epoch);
         refresh_oldest_leaf(node, tenant);
         return;
@@ -176,6 +329,9 @@ fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, co
 
     let shared = shared_prefix_chars(remaining, &child.text);
     if shared == child.char_count {
+        child
+            .tenant_last_seen
+            .insert(tenant.to_owned(), Instant::now());
         if !child.tenant_last_access.contains_key(tenant) {
             *count = count.saturating_add(child.char_count);
             child.tenant_last_access.insert(tenant.to_owned(), 0);
@@ -203,6 +359,7 @@ fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, co
         .expect("radix suffix is not empty");
     let inherited_tenants = child.tenant_last_access.clone();
     let inherited_oldest = child.tenant_oldest_leaf.clone();
+    let inherited_seen = child.tenant_last_seen.clone();
 
     let mut branch = RadixNode {
         text: take_chars(remaining, shared).to_owned(),
@@ -210,7 +367,11 @@ fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, co
         children: HashMap::from([(child_key, child)]),
         tenant_last_access: inherited_tenants,
         tenant_oldest_leaf: inherited_oldest,
+        tenant_last_seen: inherited_seen,
     };
+    branch
+        .tenant_last_seen
+        .insert(tenant.to_owned(), Instant::now());
     if !branch.tenant_last_access.contains_key(tenant) {
         *count = count.saturating_add(shared);
         branch.tenant_last_access.insert(tenant.to_owned(), 0);
@@ -257,6 +418,7 @@ fn refresh_oldest_leaf(node: &mut RadixNode, tenant: &str) {
 fn remove_tenant_at_path(node: &mut RadixNode, tenant: &str, path: &[char], depth: usize) -> usize {
     if depth == path.len() {
         if node.tenant_last_access.remove(tenant).is_some() {
+            node.tenant_last_seen.remove(tenant);
             node.tenant_oldest_leaf.remove(tenant);
             return node.char_count;
         }
@@ -391,7 +553,7 @@ pub fn routing_text(
     config: &PrefixConfig,
 ) -> PrefixInput {
     if !config.enabled {
-        return PrefixInput::default();
+        return PrefixInput::default().with_workload(endpoint, body);
     }
 
     let tree_key = format!("{endpoint}\u{1f}{}", model.unwrap_or("<unspecified>"));
@@ -402,6 +564,7 @@ pub fn routing_text(
             text: String::new(),
             char_count: 0,
             token_ids: None,
+            ..PrefixInput::default()
         };
     };
 
@@ -450,7 +613,9 @@ pub fn routing_text(
         char_count,
         text,
         token_ids: None,
+        ..PrefixInput::default()
     }
+    .with_workload(endpoint, Some(body))
 }
 
 struct BoundedCanonical {
@@ -587,6 +752,81 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn workload_estimation_uses_the_full_input_even_without_affinity() {
+        let body = json!({"prompt": "x".repeat(16_384), "max_tokens": 32, "n": 2});
+        for config in [
+            PrefixConfig {
+                enabled: false,
+                ..PrefixConfig::default()
+            },
+            PrefixConfig {
+                max_request_chars: 32,
+                ..PrefixConfig::default()
+            },
+        ] {
+            let input = routing_text("completions", Some("model"), Some(&body), &config);
+            assert_eq!(input.input_tokens(), 4_096);
+            assert_eq!(input.output_tokens(256), 64);
+        }
+        let body = json!({"prompt": [1, 2, 3, 4], "max_tokens": 100});
+        let mut input = routing_text(
+            "completions",
+            Some("model"),
+            Some(&body),
+            &PrefixConfig::default(),
+        );
+        assert_eq!(input.input_tokens(), 4);
+        input.set_token_ids(vec![1, 2]);
+        assert_eq!(input.input_tokens(), 2);
+        let input = routing_text(
+            "embeddings",
+            Some("model"),
+            Some(&json!({"input":"text"})),
+            &PrefixConfig::default(),
+        );
+        assert_eq!(input.output_tokens(256), 0);
+        let batch = routing_text(
+            "completions",
+            Some("model"),
+            Some(&json!({"prompt":["first","second"],"n":2,"max_tokens":32})),
+            &PrefixConfig::default(),
+        );
+        assert_eq!(batch.output_tokens(256), 128);
+        let media = json!({"messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"image_url","image_url":{"url":"x".repeat(100_000)}}]}]});
+        let input = routing_text(
+            "chat/completions",
+            Some("model"),
+            Some(&media),
+            &PrefixConfig::default(),
+        );
+        assert!(input.input_tokens() < 10);
+    }
+
+    #[test]
+    fn per_worker_prefix_matches_keep_shorter_owners_and_age_separately() {
+        fn age(node: &mut RadixNode, timestamp: Instant) {
+            if let Some(seen) = node.tenant_last_seen.get_mut("short") {
+                *seen = timestamp;
+            }
+            for child in node.children.values_mut() {
+                age(child, timestamp);
+            }
+        }
+        let mut tree = RadixTree::default();
+        tree.insert("shared short", "short", 1_000);
+        tree.insert("shared short and long", "long", 1_000);
+        let old = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap();
+        age(&mut tree.root, old);
+        let matched = tree.prefix_match("shared short and long", 21);
+        assert_eq!(matched.node_matches["short"], 12);
+        assert_eq!(matched.node_matches["long"], 21);
+        assert!(matched.node_age_seconds["short"] >= 60.0);
+        assert!(matched.node_age_seconds["long"] < 1.0);
+    }
 
     #[test]
     fn shared_messages_produce_a_longest_prefix_match() {

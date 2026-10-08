@@ -1082,6 +1082,7 @@ async fn proxy_with_retries(
                 &response_mode,
                 request.public_model.as_deref().unwrap_or_default(),
                 request.record_prefix,
+                &state.metrics,
             )
             .await;
             match buffered {
@@ -1113,6 +1114,7 @@ async fn proxy_with_retries(
             request.prefix_input,
             state.settings.health.clone(),
             header_latency,
+            upstream_started,
             stream_idle_timeout,
             upstream_body_timeout,
             Duration::from_millis(state.settings.server.downstream_stall_timeout_ms),
@@ -1198,6 +1200,7 @@ async fn buffered_success_response(
     response_mode: &UpstreamResponseMode,
     public_model: &str,
     record_prefix: bool,
+    metrics: &Metrics,
 ) -> Result<Response, GatewayError> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
@@ -1259,6 +1262,11 @@ async fn buffered_success_response(
         );
         return Err(GatewayError::InvalidUpstreamResponse);
     }
+    let usage = crate::inference_stats::Usage::from_response(&upstream_body);
+    if let Some(tokens) = usage.output_tokens {
+        lease.record_output_tokens(tokens);
+    }
+    metrics.observe_usage(usage);
     drop(upstream_body);
     reservation.shrink_to(body.len());
     lease.record_success(header_latency);
@@ -1401,6 +1409,7 @@ fn streaming_response(
     prefix_input: PrefixInput,
     health_config: crate::config::HealthConfig,
     header_latency: Duration,
+    upstream_started: Instant,
     stream_idle_timeout: Duration,
     upstream_body_timeout: Duration,
     downstream_stall_timeout: Duration,
@@ -1427,6 +1436,7 @@ fn streaming_response(
             Arc::clone(&metrics),
             stream_node_id.clone(),
             header_latency,
+            upstream_started,
         );
         let needs_keepalive = is_anthropic;
         let keepalive_period = Duration::from_secs(10);
@@ -1554,7 +1564,8 @@ fn streaming_response(
             match item {
                 Some(Ok(input)) => {
                     idle_deadline = tokio::time::Instant::now() + stream_idle_timeout;
-                    if record_prefix && !indexed {
+                    guard.observe(&input);
+                    if record_prefix && !indexed && guard.first_token_observed {
                         prefix_directory.record(&stream_node_id, &prefix_input);
                         indexed = true;
                     }
@@ -1740,6 +1751,9 @@ struct BodyGuard {
     metrics: Arc<Metrics>,
     node_id: String,
     header_latency: Duration,
+    upstream_started: Instant,
+    observation: crate::inference_stats::StreamObservation,
+    first_token_observed: bool,
     terminal: bool,
 }
 
@@ -1749,21 +1763,44 @@ impl BodyGuard {
         metrics: Arc<Metrics>,
         node_id: String,
         header_latency: Duration,
+        upstream_started: Instant,
     ) -> Self {
         Self {
             lease: Some(lease),
             metrics,
             node_id,
             header_latency,
+            upstream_started,
+            observation: crate::inference_stats::StreamObservation::default(),
+            first_token_observed: false,
             terminal: false,
         }
     }
 
     fn completed(&mut self) {
         if let Some(lease) = &self.lease {
+            if let Some(tokens) = self.observation.usage.output_tokens {
+                lease.record_output_tokens(tokens);
+            }
             lease.record_success(self.header_latency);
         }
+        self.metrics.observe_usage(self.observation.usage);
         self.terminal = true;
+    }
+
+    fn observe(&mut self, input: &StreamingInput) {
+        match input {
+            StreamingInput::Raw(bytes) => self.observation.observe_bytes(bytes),
+            StreamingInput::Event(event) => self.observation.observe_json(event.data().as_bytes()),
+        }
+        if self.observation.has_output && !self.first_token_observed {
+            let elapsed = self.upstream_started.elapsed();
+            if let Some(lease) = &self.lease {
+                lease.record_first_token(elapsed);
+            }
+            self.metrics.observe_first_token(elapsed);
+            self.first_token_observed = true;
+        }
     }
 
     fn failed(&mut self, message: String, health_config: &crate::config::HealthConfig) {
