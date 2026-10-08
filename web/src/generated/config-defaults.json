@@ -1,0 +1,69 @@
+{
+  "node": {
+    "id": "",
+    "base_url": "",
+    "api_key": null,
+    "api_key_env": null,
+    "models": {},
+    "model_capabilities": {},
+    "max_concurrency": 1,
+    "weight": 1.0,
+    "draining": false,
+    "health_path": "/v1/models",
+    "headers": {},
+    "headers_from_env": {},
+    "provider": {
+      "type": "openai",
+      "anthropic_protocol": "auto",
+      "version_path": "/version",
+      "metrics_path": "/metrics",
+      "tokenize_path": "/tokenize",
+      "monitor_interval_ms": 1000,
+      "request_timeout_ms": 2000,
+      "telemetry_stale_ms": 5000,
+      "waiting_threshold": 8,
+      "tokenize_cache_entries": 4096,
+      "kv_events": null
+    }
+  },
+  "editor": {
+    "id": "",
+    "base_url": "http://127.0.0.1:8000/v1",
+    "api_key": null,
+    "api_key_env": null,
+    "models": {},
+    "model_capabilities": {},
+    "max_concurrency": 16,
+    "weight": 1.0,
+    "draining": false,
+    "health_path": "/v1/models",
+    "headers": {},
+    "headers_from_env": {},
+    "provider": {
+      "type": "vllm",
+      "anthropic_protocol": "auto",
+      "version_path": "/version",
+      "metrics_path": "/metrics",
+      "tokenize_path": "/tokenize",
+      "monitor_interval_ms": 1000,
+      "request_timeout_ms": 2000,
+      "telemetry_stale_ms": 5000,
+      "waiting_threshold": 8,
+      "tokenize_cache_entries": 4096,
+      "kv_events": null
+    }
+  },
+  "capability": {
+    "multimodal": true,
+    "family": "generic"
+  },
+  "kv_events": {
+    "endpoint": "tcp://127.0.0.1:5557",
+    "replay_endpoint": null,
+    "topic": "kv-events",
+    "reconnect_ms": 1000,
+    "max_blocks": 1000000,
+    "max_directory_bytes": 536870912,
+    "max_event_bytes": 16777216
+  }
+}

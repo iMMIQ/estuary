@@ -13,7 +13,9 @@
     "format": "biome format --write .",
     "format:check": "biome format .",
     "check": "biome check . --error-on-warnings",
-    "deadcode": "knip"
+    "deadcode": "knip",
+    "contract:generate": "bun scripts/config-contract.ts",
+    "contract:check": "bun scripts/config-contract.ts --check"
   },
   "dependencies": {
     "@mantine/core": "^9.5.1",

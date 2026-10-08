@@ -45,12 +45,21 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@v7
+      - name: Use official Cargo registry
+        run: rm ../.cargo/config.toml
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: config-contract
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.4.2"
       - name: Use official npm registry
         run: sed -i 's|https://repo.huaweicloud.com/repository/npm/|https://registry.npmjs.org/|g' bun.lock
       - run: bun install --frozen-lockfile --registry=https://registry.npmjs.org
+      - run: bun run contract:check
       - run: bun run check
       - run: bun run deadcode
       - run: bun run typecheck

@@ -8,10 +8,12 @@ import {
   Switch,
   TextInput,
 } from "@mantine/core";
-import { ArrowLeft, Check, FlaskConical, Info, LoaderCircle, Plus, Trash2, X } from "lucide-react";
+import { ArrowLeft, Check, FlaskConical, Info, LoaderCircle, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import * as api from "./api";
+import { configDefaults as defaults } from "./config-contract";
+import { integerBounds } from "./config-validation";
 import { mergeDraft } from "./draft-merge";
 import type { TranslationKey } from "./i18n";
 import type { DraftErrors } from "./node-config";
@@ -24,13 +26,12 @@ import {
   shouldClearApiKey,
   validateDraft,
 } from "./node-config";
+import { PairEditor } from "./PairEditor";
 import type {
   AnthropicProtocol,
   KvEventsConfig,
-  ModelCapabilityConfig,
   NodeDraft,
   NodeRecord,
-  Pair,
   PreflightResponse,
   ProviderKind,
 } from "./types";
@@ -41,152 +42,6 @@ export type EditorState =
 
 function numeric(value: string | number): number {
   return typeof value === "number" ? value : Number(value);
-}
-
-function PairEditor({
-  rows,
-  error,
-  onChange,
-  keyLabel,
-  valueLabel,
-  inherited,
-}: {
-  inherited?: ModelCapabilityConfig;
-  rows: Pair[];
-  error?: string;
-  onChange: (rows: Pair[]) => void;
-  keyLabel: string;
-  valueLabel: string;
-}) {
-  const { t } = useTranslation();
-  const rowKeys = useRef(new WeakMap<Pair, string>());
-  const nextRowKey = useRef(0);
-  const rowKey = (row: Pair) => {
-    let key = rowKeys.current.get(row);
-    if (!key) {
-      key = String(nextRowKey.current++);
-      rowKeys.current.set(row, key);
-    }
-    return key;
-  };
-  const updateRow = (row: Pair, change: Partial<Pair>): Pair => {
-    const updated = { ...row, ...change };
-    rowKeys.current.set(updated, rowKey(row));
-    return updated;
-  };
-  const update = (index: number, key: keyof Pair, value: string | boolean) => {
-    onChange(
-      rows.map((row, rowIndex) =>
-        rowIndex === index
-          ? updateRow(row, {
-              ...(row.inherit_capability && ["family", "multimodal"].includes(key)
-                ? {
-                    family: inherited?.family ?? "generic",
-                    multimodal: inherited?.multimodal ?? true,
-                  }
-                : {}),
-              [key]: value,
-              ...(["family", "multimodal"].includes(key) || (key === "key" && value === "*")
-                ? { inherit_capability: false }
-                : {}),
-            })
-          : row,
-      ),
-    );
-  };
-
-  return (
-    <div className="mapping-editor">
-      <div className="mapping-head">
-        <span>{keyLabel}</span>
-        <span>{valueLabel}</span>
-        <span>{t("editor.multimodal")}</span>
-        <span>{t("editor.modelFamily")}</span>
-        <span />
-      </div>
-      {rows.map((row, index) => (
-        <div className="mapping-row" key={rowKey(row)}>
-          <TextInput
-            aria-label={`${keyLabel} ${index + 1}`}
-            value={row.key}
-            error={Boolean(error)}
-            onChange={(event) => update(index, "key", event.target.value)}
-          />
-          <TextInput
-            aria-label={`${valueLabel} ${index + 1}`}
-            value={row.value}
-            error={Boolean(error)}
-            onChange={(event) => update(index, "value", event.target.value)}
-          />
-          <Switch
-            size="sm"
-            aria-label={`${t("editor.multimodal")} ${index + 1}`}
-            checked={
-              row.inherit_capability ? (inherited?.multimodal ?? true) : row.multimodal !== false
-            }
-            onChange={(event) => update(index, "multimodal", event.currentTarget.checked)}
-          />
-          <Select
-            aria-label={`${t("editor.modelFamily")} ${index + 1}`}
-            value={row.inherit_capability ? "inherit" : (row.family ?? "generic")}
-            data={[
-              {
-                value: "inherit",
-                label: t("editor.inheritedFamily", {
-                  family: t(`family.${inherited?.family ?? "generic"}`),
-                }),
-              },
-              { value: "generic", label: t("family.generic") },
-              { value: "deepseek", label: t("family.deepseek") },
-            ]}
-            onChange={(value) => {
-              if (value === "inherit")
-                onChange(
-                  rows.map((item, i) =>
-                    i === index
-                      ? updateRow(item, {
-                          inherit_capability: true,
-                          family: inherited?.family ?? "generic",
-                          multimodal: inherited?.multimodal ?? true,
-                        })
-                      : item,
-                  ),
-                );
-              else if (value) update(index, "family", value);
-            }}
-          />
-          <Button
-            variant="subtle"
-            color="gray"
-            px={6}
-            aria-label={t("editor.removeMapping", { count: index + 1 })}
-            onClick={() =>
-              onChange(
-                rows.length === 1
-                  ? [{ key: "", value: "" }]
-                  : rows.filter((_, rowIndex) => rowIndex !== index),
-              )
-            }
-          >
-            <Trash2 size={14} />
-          </Button>
-        </div>
-      ))}
-      {error && (
-        <span className="form-error" role="alert">
-          {t(error as TranslationKey)}
-        </span>
-      )}
-      <Button
-        variant="subtle"
-        size="compact-sm"
-        leftSection={<Plus size={14} />}
-        onClick={() => onChange([...rows, { key: "", value: "", multimodal: true }])}
-      >
-        {t("editor.addMapping")}
-      </Button>
-    </div>
-  );
 }
 
 function ReviewRow({ label, value }: { label: string; value: string | number }) {
@@ -338,13 +193,7 @@ export function NodeEditor({
         kv_events: current.provider.kv_events
           ? null
           : {
-              endpoint: "tcp://127.0.0.1:5557",
-              replay_endpoint: "tcp://127.0.0.1:5558",
-              topic: "kv-events",
-              reconnect_ms: 1000,
-              max_blocks: 1_000_000,
-              max_directory_bytes: 536_870_912,
-              max_event_bytes: 16_777_216,
+              ...structuredClone(defaults.kv_events),
             },
       },
     }));
@@ -484,7 +333,7 @@ export function NodeEditor({
                   <NumberInput
                     label={t("editor.maxConcurrency")}
                     required
-                    min={1}
+                    {...integerBounds("max_concurrency")}
                     value={draft.max_concurrency}
                     error={errorText(errors.max_concurrency)}
                     onChange={(value) =>
@@ -495,7 +344,6 @@ export function NodeEditor({
                     label={t("editor.schedulingWeight")}
                     description={t("editor.weightDescription")}
                     required
-                    min={0.01}
                     step={0.05}
                     value={draft.weight}
                     error={errorText(errors.weight)}
@@ -579,7 +427,7 @@ export function NodeEditor({
                       />
                       <NumberInput
                         label={t("editor.monitorInterval")}
-                        min={100}
+                        {...integerBounds("provider.monitor_interval_ms")}
                         value={draft.provider.monitor_interval_ms}
                         error={errorText(errors.monitor_interval_ms)}
                         onChange={(value) =>
@@ -591,7 +439,7 @@ export function NodeEditor({
                       />
                       <NumberInput
                         label={t("editor.requestTimeout")}
-                        min={1}
+                        {...integerBounds("provider.request_timeout_ms")}
                         value={draft.provider.request_timeout_ms}
                         error={errorText(errors.request_timeout_ms)}
                         onChange={(value) =>
@@ -603,7 +451,7 @@ export function NodeEditor({
                       />
                       <NumberInput
                         label={t("editor.telemetryStale")}
-                        min={1}
+                        {...integerBounds("provider.telemetry_stale_ms")}
                         value={draft.provider.telemetry_stale_ms}
                         error={errorText(errors.telemetry_stale_ms)}
                         onChange={(value) =>
@@ -615,7 +463,7 @@ export function NodeEditor({
                       />
                       <NumberInput
                         label={t("editor.waitingWatermark")}
-                        min={1}
+                        {...integerBounds("provider.waiting_threshold")}
                         value={draft.provider.waiting_threshold}
                         error={errorText(errors.waiting_threshold)}
                         onChange={(value) =>
@@ -627,8 +475,7 @@ export function NodeEditor({
                       />
                       <NumberInput
                         label={t("editor.tokenizeEntries")}
-                        min={1}
-                        max={65536}
+                        {...integerBounds("provider.tokenize_cache_entries")}
                         allowDecimal={false}
                         value={draft.provider.tokenize_cache_entries}
                         error={errorText(errors.tokenize_cache_entries)}
@@ -723,11 +570,13 @@ export function NodeEditor({
                       <TextInput
                         label={t("editor.publisherEndpoint")}
                         value={draft.provider.kv_events.endpoint}
+                        error={errorText(errors.kv_endpoint)}
                         onChange={(event) => updateKv("endpoint", event.target.value)}
                       />
                       <TextInput
                         label={t("editor.replayEndpoint")}
                         value={draft.provider.kv_events.replay_endpoint ?? ""}
+                        error={errorText(errors.kv_replay_endpoint)}
                         onChange={(event) =>
                           updateKv("replay_endpoint", event.target.value || null)
                         }
@@ -739,28 +588,28 @@ export function NodeEditor({
                       />
                       <NumberInput
                         label={t("editor.reconnect")}
-                        min={1}
+                        {...integerBounds("provider.kv_events.reconnect_ms")}
                         value={draft.provider.kv_events.reconnect_ms}
                         error={errorText(errors.kv_reconnect_ms)}
                         onChange={(value) => updateKv("reconnect_ms", numeric(value))}
                       />
                       <NumberInput
                         label={t("editor.maxBlocks")}
-                        min={1}
+                        {...integerBounds("provider.kv_events.max_blocks")}
                         value={draft.provider.kv_events.max_blocks}
                         error={errorText(errors.kv_max_blocks)}
                         onChange={(value) => updateKv("max_blocks", numeric(value))}
                       />
                       <NumberInput
                         label={t("editor.directoryBytes")}
-                        min={1}
+                        {...integerBounds("provider.kv_events.max_directory_bytes")}
                         value={draft.provider.kv_events.max_directory_bytes}
                         error={errorText(errors.kv_max_directory_bytes)}
                         onChange={(value) => updateKv("max_directory_bytes", numeric(value))}
                       />
                       <NumberInput
                         label={t("editor.maxEventBytes")}
-                        min={1}
+                        {...integerBounds("provider.kv_events.max_event_bytes")}
                         value={draft.provider.kv_events.max_event_bytes}
                         error={errorText(errors.kv_max_event_bytes)}
                         onChange={(value) => updateKv("max_event_bytes", numeric(value))}

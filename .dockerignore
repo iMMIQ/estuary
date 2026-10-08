@@ -12,3 +12,6 @@ data
 *.db-wal
 *.log
 tmp
+
+.cache
+.ruff_cache

@@ -1,0 +1,303 @@
+[
+  {
+    "path": "id",
+    "error_field": "id",
+    "error": "validation.nodeIdRequired",
+    "message": "must not be empty",
+    "condition": "always",
+    "rule": {
+      "kind": "not_blank"
+    }
+  },
+  {
+    "path": "base_url",
+    "error_field": "base_url",
+    "error": "validation.absoluteUrl",
+    "message": "must be an absolute HTTP(S) URL",
+    "condition": "always",
+    "rule": {
+      "kind": "http_url"
+    }
+  },
+  {
+    "path": "base_url",
+    "error_field": "base_url",
+    "error": "validation.urlParts",
+    "message": "must not contain credentials, query or fragment",
+    "condition": "always",
+    "rule": {
+      "kind": "url_without_parts"
+    }
+  },
+  {
+    "path": "api_key",
+    "error_field": "api_key",
+    "error": "validation.notBlank",
+    "message": "must not be empty when configured",
+    "condition": "always",
+    "rule": {
+      "kind": "not_blank"
+    }
+  },
+  {
+    "path": "api_key_env",
+    "error_field": "api_key_env",
+    "error": "validation.notBlank",
+    "message": "must not be empty when configured",
+    "condition": "always",
+    "rule": {
+      "kind": "not_blank"
+    }
+  },
+  {
+    "path": "health_path",
+    "error_field": "health_path",
+    "error": "validation.healthPathRequired",
+    "message": "must not be empty",
+    "condition": "always",
+    "rule": {
+      "kind": "not_blank"
+    }
+  },
+  {
+    "path": "max_concurrency",
+    "error_field": "max_concurrency",
+    "error": "validation.concurrency",
+    "message": "must be a positive integer within the runtime limit",
+    "condition": "always",
+    "rule": {
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 2305843009213693951
+    }
+  },
+  {
+    "path": "weight",
+    "error_field": "weight",
+    "error": "validation.weight",
+    "message": "must be finite and greater than zero",
+    "condition": "always",
+    "rule": {
+      "kind": "positive"
+    }
+  },
+  {
+    "path": "models",
+    "error_field": "models",
+    "error": "validation.modelRequired",
+    "message": "must declare non-empty model mappings",
+    "condition": "always",
+    "rule": {
+      "kind": "model_mappings"
+    }
+  },
+  {
+    "path": "model_capabilities",
+    "error_field": "models",
+    "error": "validation.capabilityMapping",
+    "message": "must refer to mapped models or a wildcard",
+    "condition": "always",
+    "rule": {
+      "kind": "capability_mappings"
+    }
+  },
+  {
+    "path": "headers",
+    "error_field": "headers",
+    "error": "validation.headerInvalid",
+    "message": "contains an invalid or reserved header name",
+    "condition": "always",
+    "rule": {
+      "kind": "headers"
+    }
+  },
+  {
+    "path": "headers_from_env",
+    "error_field": "headers_from_env",
+    "error": "validation.headerInvalid",
+    "message": "contains an invalid/reserved header name or an empty environment variable",
+    "condition": "always",
+    "rule": {
+      "kind": "environment_headers"
+    }
+  },
+  {
+    "path": "provider.kv_events",
+    "error_field": "kv_endpoint",
+    "error": "validation.kvProvider",
+    "message": "requires provider.type: vllm",
+    "condition": "always",
+    "rule": {
+      "kind": "kv_provider"
+    }
+  },
+  {
+    "path": "provider.version_path",
+    "error_field": "version_path",
+    "error": "validation.pathSlash",
+    "message": "must start with '/' and stay on the upstream origin without query or fragment",
+    "condition": "vllm",
+    "rule": {
+      "kind": "provider_path"
+    }
+  },
+  {
+    "path": "provider.metrics_path",
+    "error_field": "metrics_path",
+    "error": "validation.pathSlash",
+    "message": "must start with '/' and stay on the upstream origin without query or fragment",
+    "condition": "vllm",
+    "rule": {
+      "kind": "provider_path"
+    }
+  },
+  {
+    "path": "provider.tokenize_path",
+    "error_field": "tokenize_path",
+    "error": "validation.pathSlash",
+    "message": "must start with '/' and stay on the upstream origin without query or fragment",
+    "condition": "vllm",
+    "rule": {
+      "kind": "provider_path"
+    }
+  },
+  {
+    "path": "provider.monitor_interval_ms",
+    "error_field": "monitor_interval_ms",
+    "error": "validation.min100ms",
+    "message": "is outside the supported integer range",
+    "condition": "vllm",
+    "rule": {
+      "kind": "integer",
+      "minimum": 100,
+      "maximum": 18446744073709551615
+    }
+  },
+  {
+    "path": "provider.request_timeout_ms",
+    "error_field": "request_timeout_ms",
+    "error": "validation.min1ms",
+    "message": "is outside the supported integer range",
+    "condition": "vllm",
+    "rule": {
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    }
+  },
+  {
+    "path": "provider.telemetry_stale_ms",
+    "error_field": "telemetry_stale_ms",
+    "error": "validation.min1ms",
+    "message": "is outside the supported integer range",
+    "condition": "vllm",
+    "rule": {
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    }
+  },
+  {
+    "path": "provider.waiting_threshold",
+    "error_field": "waiting_threshold",
+    "error": "validation.min1",
+    "message": "is outside the supported integer range",
+    "condition": "vllm",
+    "rule": {
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    }
+  },
+  {
+    "path": "provider.tokenize_cache_entries",
+    "error_field": "tokenize_cache_entries",
+    "error": "validation.tokenizeEntries",
+    "message": "is outside the supported integer range",
+    "condition": "vllm",
+    "rule": {
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 65536
+    }
+  },
+  {
+    "path": "provider.telemetry_stale_ms",
+    "error_field": "telemetry_stale_ms",
+    "error": "validation.telemetryInterval",
+    "message": "must not be shorter than monitor_interval_ms",
+    "condition": "vllm",
+    "rule": {
+      "kind": "at_least_field",
+      "other": "provider.monitor_interval_ms"
+    }
+  },
+  {
+    "path": "provider.kv_events.endpoint",
+    "error_field": "kv_endpoint",
+    "error": "validation.tcpEndpoint",
+    "message": "must be a connectable tcp://host:port endpoint",
+    "condition": "kv_events",
+    "rule": {
+      "kind": "tcp_endpoint"
+    }
+  },
+  {
+    "path": "provider.kv_events.replay_endpoint",
+    "error_field": "kv_replay_endpoint",
+    "error": "validation.tcpEndpoint",
+    "message": "must be a connectable tcp://host:port endpoint",
+    "condition": "kv_events",
+    "rule": {
+      "kind": "tcp_endpoint"
+    }
+  },
+  {
+    "path": "provider.kv_events.reconnect_ms",
+    "error_field": "kv_reconnect_ms",
+    "error": "validation.min1ms",
+    "message": "must be a positive integer",
+    "condition": "kv_events",
+    "rule": {
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    }
+  },
+  {
+    "path": "provider.kv_events.max_blocks",
+    "error_field": "kv_max_blocks",
+    "error": "validation.min1",
+    "message": "must be a positive integer",
+    "condition": "kv_events",
+    "rule": {
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    }
+  },
+  {
+    "path": "provider.kv_events.max_directory_bytes",
+    "error_field": "kv_max_directory_bytes",
+    "error": "validation.min1byte",
+    "message": "must be a positive integer",
+    "condition": "kv_events",
+    "rule": {
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    }
+  },
+  {
+    "path": "provider.kv_events.max_event_bytes",
+    "error_field": "kv_max_event_bytes",
+    "error": "validation.min1byte",
+    "message": "must be a positive integer",
+    "condition": "kv_events",
+    "rule": {
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    }
+  }
+]

@@ -11,6 +11,7 @@ RUN registry="${NPM_REGISTRY%/}" \
     && sed -i -E "s#https://(repo.huaweicloud.com/repository/npm|registry.npmjs.org|registry.npmmirror.com)/#${registry}/#g" bun.lock \
     && bun install --frozen-lockfile --registry="${registry}"
 COPY web/ ./
+COPY tests/fixtures/ /build/tests/fixtures/
 RUN bun run build
 
 FROM ${RUST_IMAGE} AS rust-builder
@@ -28,6 +29,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
 COPY deploy/build-version.sh ./deploy/build-version.sh
 COPY src/ ./src/
+COPY examples/ ./examples/
 COPY benches/ ./benches/
 COPY --from=web-builder /build/web/dist ./web/dist/
 RUN if [ -n "${CARGO_REGISTRY}" ]; then \

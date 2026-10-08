@@ -169,6 +169,7 @@ The [documentation index](docs/README.md) links the maintained guides:
 
 - [Architecture](docs/architecture.md)
 - [Configuration and operations](docs/operations.md)
+- [Generated configuration contract and module boundaries](docs/config-contract.md)
 - [Native vLLM provider](docs/vllm.md)
 - [Deployment](deploy/README.md)
 - [Performance benchmark](docs/performance.md)
@@ -181,8 +182,11 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets
 cd web
 bun install --frozen-lockfile
-bun run test
+bun run contract:check
+bun run check
+bun run deadcode
 bun run build
+bun run test
 ```
 
 Browser tests additionally require Playwright Chromium:

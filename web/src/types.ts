@@ -1,54 +1,21 @@
-type ModelFamily = "generic" | "deepseek";
-export type ProviderKind = "openai" | "vllm";
-export type AnthropicProtocol = "auto" | "native" | "responses" | "chat";
+import type {
+  ModelCapabilityConfig,
+  ModelFamily,
+  NodeConfig,
+  ProviderKind,
+} from "./generated/config";
+
+export type {
+  AnthropicProtocol,
+  ModelCapabilityConfig,
+  NodeConfig,
+  ProviderKind,
+  VllmKvEventsConfig as KvEventsConfig,
+} from "./generated/config";
+
 type HealthState = "starting" | "healthy" | "degraded" | "unhealthy";
 type LifecycleState = "serving" | "draining";
 type CircuitState = "closed" | "open" | "half_open";
-
-export interface KvEventsConfig {
-  endpoint: string;
-  replay_endpoint: string | null;
-  topic: string;
-  reconnect_ms: number;
-  max_blocks: number;
-  max_directory_bytes: number;
-  max_event_bytes: number;
-}
-
-interface ProviderConfig {
-  type: ProviderKind;
-  anthropic_protocol: AnthropicProtocol;
-  version_path: string;
-  metrics_path: string;
-  tokenize_path: string;
-  monitor_interval_ms: number;
-  request_timeout_ms: number;
-  telemetry_stale_ms: number;
-  waiting_threshold: number;
-  tokenize_cache_entries: number;
-  kv_events: KvEventsConfig | null;
-}
-
-export interface ModelCapabilityConfig {
-  multimodal: boolean;
-  family?: ModelFamily;
-}
-
-export interface NodeConfig {
-  id: string;
-  base_url: string;
-  api_key: string | null;
-  api_key_env: string | null;
-  models: Record<string, string>;
-  model_capabilities: Record<string, ModelCapabilityConfig>;
-  max_concurrency: number;
-  weight: number;
-  draining: boolean;
-  health_path: string;
-  headers: Record<string, string>;
-  headers_from_env: Record<string, string>;
-  provider: ProviderConfig;
-}
 
 interface NodeRuntime {
   id: string;

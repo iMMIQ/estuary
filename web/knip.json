@@ -1,4 +1,7 @@
 {
   "$schema": "https://unpkg.com/knip@6/schema.json",
-  "project": ["src/**/*.{ts,tsx}", "e2e/**/*.ts", "*.ts"]
+  "project": ["src/**/*.{ts,tsx}", "e2e/**/*.ts", "*.ts", "scripts/**/*.ts"],
+  "ignoreIssues": {
+    "src/generated/config.ts": ["exports", "types"]
+  }
 }

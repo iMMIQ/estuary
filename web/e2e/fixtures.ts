@@ -1,4 +1,6 @@
 import type { Page } from "@playwright/test";
+import { configDefaults } from "../src/config-contract";
+import type { NodeConfig } from "../src/types";
 export function status(nodeCount: number) {
   return {
     status: nodeCount ? "ready" : "not_ready",
@@ -32,32 +34,12 @@ export function status(nodeCount: number) {
   };
 }
 
-export function nodeConfig(id = "vllm-a") {
+export function nodeConfig(id = "vllm-a"): NodeConfig {
   return {
+    ...structuredClone(configDefaults.editor),
     id,
     base_url: `http://${id}.internal:8000/v1`,
-    api_key: null,
-    api_key_env: null,
     models: { "gateway-chat": "model-a" },
-    max_concurrency: 16,
-    weight: 1,
-    draining: false,
-    health_path: "/v1/models",
-    headers: {},
-    headers_from_env: {},
-    provider: {
-      type: "vllm",
-      anthropic_protocol: "auto",
-      version_path: "/version",
-      metrics_path: "/metrics",
-      tokenize_path: "/tokenize",
-      monitor_interval_ms: 1000,
-      request_timeout_ms: 2000,
-      telemetry_stale_ms: 5000,
-      waiting_threshold: 8,
-      tokenize_cache_entries: 4096,
-      kv_events: null,
-    },
   };
 }
 

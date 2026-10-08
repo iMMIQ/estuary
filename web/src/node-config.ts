@@ -1,3 +1,5 @@
+import { configDefaults as defaults } from "./config-contract";
+import { validateNodeConfig } from "./config-validation";
 import type {
   ModelCapabilityConfig,
   NodeConfig,
@@ -8,10 +10,6 @@ import type {
 } from "./types";
 
 export type DraftErrors = Record<string, string>;
-
-function integerAtLeast(value: number, minimum: number): boolean {
-  return Number.isSafeInteger(value) && value >= minimum;
-}
 
 export function pairsToRecord(pairs: Pair[]): Record<string, string> {
   return Object.fromEntries(
@@ -29,7 +27,8 @@ export function recordToPairs(record: Record<string, string>): Pair[] {
 export function effectiveCapability(config: NodeConfig, model: string): ModelCapabilityConfig {
   return (
     config.model_capabilities?.[model] ??
-    config.model_capabilities?.["*"] ?? { multimodal: true, family: "generic" }
+    config.model_capabilities?.["*"] ??
+    structuredClone(defaults.capability)
   );
 }
 
@@ -76,39 +75,20 @@ function modelPairs(node: NodeRecord): Pair[] {
     key,
     value,
     multimodal: effectiveCapability(node.config, key).multimodal,
-    family: effectiveCapability(node.config, key).family ?? "generic",
+    family: effectiveCapability(node.config, key).family ?? defaults.capability.family,
     inherit_capability: !Object.hasOwn(node.config.model_capabilities ?? {}, key),
   }));
-  return pairs.length > 0 ? pairs : [{ key: "", value: "", multimodal: true }];
+  return pairs.length > 0 ? pairs : [{ key: "", value: "", ...defaults.capability }];
 }
 
 export function createDraft(kind: ProviderKind = "vllm"): NodeDraft {
   return {
-    id: "",
-    base_url: "http://127.0.0.1:8000/v1",
+    ...structuredClone(defaults.editor),
     api_key: "",
     preserve_api_key: false,
-    api_key_env: null,
     models: [{ key: "", value: "" }],
-    max_concurrency: 16,
-    weight: 1,
-    draining: false,
-    health_path: "/v1/models",
-    headers: {},
     headers_from_env: [{ key: "", value: "" }],
-    provider: {
-      type: kind,
-      anthropic_protocol: "auto",
-      version_path: "/version",
-      metrics_path: "/metrics",
-      tokenize_path: "/tokenize",
-      monitor_interval_ms: 1000,
-      request_timeout_ms: 2000,
-      telemetry_stale_ms: 5000,
-      waiting_threshold: 8,
-      tokenize_cache_entries: 4096,
-      kv_events: null,
-    },
+    provider: { ...structuredClone(defaults.editor.provider), type: kind },
   };
 }
 
@@ -117,7 +97,8 @@ export function recordToDraft(node: NodeRecord): NodeDraft {
     ...structuredClone(node.config),
     provider: {
       ...structuredClone(node.config.provider),
-      anthropic_protocol: node.config.provider.anthropic_protocol ?? "auto",
+      anthropic_protocol:
+        node.config.provider.anthropic_protocol ?? defaults.node.provider.anthropic_protocol,
     },
     api_key: "",
     preserve_api_key: node.credentials.api_key_source === "database",
@@ -157,7 +138,10 @@ export function draftToConfig(draft: NodeDraft): NodeConfig {
             (row) =>
               [
                 row.key.trim(),
-                { multimodal: row.multimodal !== false, family: row.family ?? "generic" },
+                {
+                  multimodal: row.multimodal ?? defaults.capability.multimodal,
+                  family: row.family ?? defaults.capability.family,
+                },
               ] as const,
           )
           .filter(([key]) => key.length > 0),
@@ -174,7 +158,10 @@ export function draftToConfig(draft: NodeDraft): NodeConfig {
 export function draftWildcardCapability(draft: NodeDraft): ModelCapabilityConfig | undefined {
   const row = draft.models.find((item) => item.key.trim() === "*" && !item.inherit_capability);
   return row
-    ? { family: row.family ?? "generic", multimodal: row.multimodal !== false }
+    ? {
+        family: row.family ?? defaults.capability.family,
+        multimodal: row.multimodal ?? defaults.capability.multimodal,
+      }
     : draft.wildcard_capability;
 }
 
@@ -183,27 +170,7 @@ export function shouldClearApiKey(draft: NodeDraft): boolean {
 }
 
 export function validateDraft(draft: NodeDraft): DraftErrors {
-  const errors: DraftErrors = {};
-  if (!draft.id.trim()) errors.id = "validation.nodeIdRequired";
-
-  try {
-    const url = new URL(draft.base_url);
-    if (!["http:", "https:"].includes(url.protocol) || !url.hostname) {
-      errors.base_url = "validation.absoluteUrl";
-    } else if (url.username || url.password || url.search || url.hash) {
-      errors.base_url = "validation.urlParts";
-    }
-  } catch {
-    errors.base_url = "validation.absoluteUrl";
-  }
-
-  if (!draft.health_path.trim()) errors.health_path = "validation.healthPathRequired";
-  if (!integerAtLeast(draft.max_concurrency, 1)) {
-    errors.max_concurrency = "validation.concurrency";
-  }
-  if (!Number.isFinite(draft.weight) || draft.weight <= 0) {
-    errors.weight = "validation.weight";
-  }
+  const errors: DraftErrors = validateNodeConfig(draftToConfig(draft));
 
   const completeModels = draft.models.filter((row) => row.key.trim() && row.value.trim());
   if (completeModels.length === 0) errors.models = "validation.modelRequired";
@@ -215,43 +182,6 @@ export function validateDraft(draft: NodeDraft): DraftErrors {
 
   if (draft.headers_from_env.some((row) => Boolean(row.key.trim()) !== Boolean(row.value.trim()))) {
     errors.headers_from_env = "validation.headerIncomplete";
-  }
-
-  if (draft.provider.type === "vllm") {
-    for (const [key, value] of [
-      ["version_path", draft.provider.version_path],
-      ["metrics_path", draft.provider.metrics_path],
-      ["tokenize_path", draft.provider.tokenize_path],
-    ] as const) {
-      if (!value.startsWith("/")) errors[key] = "validation.pathSlash";
-    }
-    if (!integerAtLeast(draft.provider.monitor_interval_ms, 100))
-      errors.monitor_interval_ms = "validation.min100ms";
-    if (!integerAtLeast(draft.provider.request_timeout_ms, 1))
-      errors.request_timeout_ms = "validation.min1ms";
-    if (!integerAtLeast(draft.provider.telemetry_stale_ms, 1)) {
-      errors.telemetry_stale_ms = "validation.min1ms";
-    } else if (draft.provider.telemetry_stale_ms < draft.provider.monitor_interval_ms) {
-      errors.telemetry_stale_ms = "validation.telemetryInterval";
-    }
-    if (!integerAtLeast(draft.provider.waiting_threshold, 1))
-      errors.waiting_threshold = "validation.min1";
-    if (
-      !integerAtLeast(draft.provider.tokenize_cache_entries, 1) ||
-      draft.provider.tokenize_cache_entries > 65536
-    ) {
-      errors.tokenize_cache_entries = "validation.tokenizeEntries";
-    }
-    if (draft.provider.kv_events) {
-      if (!integerAtLeast(draft.provider.kv_events.reconnect_ms, 1))
-        errors.kv_reconnect_ms = "validation.min1ms";
-      if (!integerAtLeast(draft.provider.kv_events.max_blocks, 1))
-        errors.kv_max_blocks = "validation.min1";
-      if (!integerAtLeast(draft.provider.kv_events.max_directory_bytes, 1))
-        errors.kv_max_directory_bytes = "validation.min1byte";
-      if (!integerAtLeast(draft.provider.kv_events.max_event_bytes, 1))
-        errors.kv_max_event_bytes = "validation.min1byte";
-    }
   }
 
   return errors;

@@ -163,3 +163,36 @@ test("keyboard menu actions keep the upstream list selected", async ({ page }) =
   await expect.poll(() => nodes[0].runtime.lifecycle).toBe("draining");
   await expect(page.getByRole("heading", { name: "Upstreams", exact: true })).toBeVisible();
 });
+
+test("editor applies backend provider-path and KV endpoint constraints", async ({ page }) => {
+  const config: NodeConfig = nodeConfig();
+  config.provider.kv_events = {
+    endpoint: "tcp://127.0.0.1:5557",
+    replay_endpoint: null,
+    topic: "kv-events",
+    reconnect_ms: 1000,
+    max_blocks: 1000,
+    max_directory_bytes: 1048576,
+    max_event_bytes: 1024,
+  };
+  await mockControlPlane(page, [record(config)]);
+  await openEdit(page);
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await page.getByLabel("Metrics path", { exact: true }).fill("//evil.example/metrics");
+  await page.getByLabel("Publisher endpoint", { exact: true }).fill("tcp://*:5557");
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(
+    page.getByText("Use a path starting with / on the upstream origin, without query or fragment", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Use a connectable tcp://host:port endpoint", { exact: true }),
+  ).toBeVisible();
+  await page.getByLabel("Metrics path", { exact: true }).fill("/metrics");
+  await page.getByLabel("Publisher endpoint", { exact: true }).fill("tcp://127.0.0.1:5557");
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Review Configuration", exact: true }),
+  ).toBeVisible();
+});

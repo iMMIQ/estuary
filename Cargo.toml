@@ -45,6 +45,7 @@ tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "rt-mu
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+ts-rs = { version = "12.0.1", features = ["no-serde-warnings"], optional = true }
 url = "2.5"
 uuid = { version = "1.24", features = ["v7"] }
 zeromq = { version = "0.6", default-features = false, features = ["tcp-transport", "tokio-runtime"] }
@@ -70,3 +71,10 @@ cast_precision_loss = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
+
+[features]
+config-contract = ["dep:ts-rs"]
+
+[[example]]
+name = "config_contract"
+required-features = ["config-contract"]

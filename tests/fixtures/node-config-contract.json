@@ -1,0 +1,467 @@
+{
+  "base": {
+    "id": "node-a",
+    "base_url": "http://127.0.0.1:8000/v1",
+    "models": {
+      "chat": "upstream"
+    },
+    "provider": {
+      "type": "vllm"
+    }
+  },
+  "cases": [
+    {
+      "name": "default vllm",
+      "changes": {},
+      "valid": true
+    },
+    {
+      "name": "default openai",
+      "changes": {
+        "provider.type": "openai"
+      },
+      "valid": true
+    },
+    {
+      "name": "max_concurrency below minimum",
+      "changes": {
+        "max_concurrency": 0
+      },
+      "valid": false
+    },
+    {
+      "name": "max_concurrency minimum",
+      "changes": {
+        "max_concurrency": 1
+      },
+      "valid": true
+    },
+    {
+      "name": "provider.monitor_interval_ms below minimum",
+      "changes": {
+        "provider.monitor_interval_ms": 99
+      },
+      "valid": false
+    },
+    {
+      "name": "provider.monitor_interval_ms minimum",
+      "changes": {
+        "provider.monitor_interval_ms": 100
+      },
+      "valid": true
+    },
+    {
+      "name": "provider.tokenize_cache_entries below minimum",
+      "changes": {
+        "provider.tokenize_cache_entries": 0
+      },
+      "valid": false
+    },
+    {
+      "name": "provider.tokenize_cache_entries minimum",
+      "changes": {
+        "provider.tokenize_cache_entries": 1
+      },
+      "valid": true
+    },
+    {
+      "name": "provider.tokenize_cache_entries maximum",
+      "changes": {
+        "provider.tokenize_cache_entries": 65536
+      },
+      "valid": true
+    },
+    {
+      "name": "provider.tokenize_cache_entries above maximum",
+      "changes": {
+        "provider.tokenize_cache_entries": 65537
+      },
+      "valid": false
+    },
+    {
+      "name": "provider.waiting_threshold below minimum",
+      "changes": {
+        "provider.waiting_threshold": 0
+      },
+      "valid": false
+    },
+    {
+      "name": "provider.waiting_threshold minimum",
+      "changes": {
+        "provider.waiting_threshold": 1
+      },
+      "valid": true
+    },
+    {
+      "name": "provider.request_timeout_ms below minimum",
+      "changes": {
+        "provider.request_timeout_ms": 0
+      },
+      "valid": false
+    },
+    {
+      "name": "provider.request_timeout_ms minimum",
+      "changes": {
+        "provider.request_timeout_ms": 1
+      },
+      "valid": true
+    },
+    {
+      "name": "fractional concurrency",
+      "changes": {
+        "max_concurrency": 1.5
+      },
+      "valid": false
+    },
+    {
+      "name": "zero weight",
+      "changes": {
+        "weight": 0
+      },
+      "valid": false
+    },
+    {
+      "name": "negative weight",
+      "changes": {
+        "weight": -1
+      },
+      "valid": false
+    },
+    {
+      "name": "relative base url",
+      "changes": {
+        "base_url": "localhost:8000"
+      },
+      "valid": false
+    },
+    {
+      "name": "ftp base url",
+      "changes": {
+        "base_url": "ftp://models.example/v1"
+      },
+      "valid": false
+    },
+    {
+      "name": "credentials base url",
+      "changes": {
+        "base_url": "http://user:secret@models.example/v1"
+      },
+      "valid": false
+    },
+    {
+      "name": "query base url",
+      "changes": {
+        "base_url": "http://models.example/v1?x=1"
+      },
+      "valid": false
+    },
+    {
+      "name": "empty query base url",
+      "changes": {
+        "base_url": "http://models.example/v1?"
+      },
+      "valid": false
+    },
+    {
+      "name": "fragment base url",
+      "changes": {
+        "base_url": "http://models.example/v1#"
+      },
+      "valid": false
+    },
+    {
+      "name": "blank id",
+      "changes": {
+        "id": " "
+      },
+      "valid": false
+    },
+    {
+      "name": "empty models",
+      "changes": {
+        "models": {}
+      },
+      "valid": false
+    },
+    {
+      "name": "empty upstream model",
+      "changes": {
+        "models": {
+          "chat": " "
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "unmapped capability",
+      "changes": {
+        "model_capabilities": {
+          "missing": {
+            "multimodal": true
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "wildcard capability",
+      "changes": {
+        "model_capabilities": {
+          "*": {
+            "multimodal": true
+          }
+        }
+      },
+      "valid": true
+    },
+    {
+      "name": "mapped inherited capability",
+      "changes": {
+        "models": {
+          "*": "*"
+        },
+        "model_capabilities": {
+          "other": {
+            "multimodal": true
+          }
+        }
+      },
+      "valid": true
+    },
+    {
+      "name": "empty api key",
+      "changes": {
+        "api_key": " "
+      },
+      "valid": false
+    },
+    {
+      "name": "empty environment key",
+      "changes": {
+        "api_key_env": " "
+      },
+      "valid": false
+    },
+    {
+      "name": "reserved header case insensitive",
+      "changes": {
+        "headers": {
+          "HOST": "example"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "invalid header",
+      "changes": {
+        "headers": {
+          "invalid header": "x"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "blank header environment",
+      "changes": {
+        "headers_from_env": {
+          "X-Key": " "
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "valid header",
+      "changes": {
+        "headers": {
+          "X-Custom": "value"
+        }
+      },
+      "valid": true
+    },
+    {
+      "name": "relative provider path",
+      "changes": {
+        "provider.metrics_path": "metrics"
+      },
+      "valid": false
+    },
+    {
+      "name": "other origin provider path",
+      "changes": {
+        "provider.metrics_path": "//evil.example/metrics"
+      },
+      "valid": false
+    },
+    {
+      "name": "query provider path",
+      "changes": {
+        "provider.metrics_path": "/metrics?x=1"
+      },
+      "valid": false
+    },
+    {
+      "name": "empty query provider path",
+      "changes": {
+        "provider.metrics_path": "/metrics?"
+      },
+      "valid": false
+    },
+    {
+      "name": "fragment provider path",
+      "changes": {
+        "provider.metrics_path": "/metrics#"
+      },
+      "valid": false
+    },
+    {
+      "name": "long freshness interval",
+      "changes": {
+        "provider.monitor_interval_ms": 5001,
+        "provider.telemetry_stale_ms": 5000
+      },
+      "valid": false
+    },
+    {
+      "name": "equal freshness interval",
+      "changes": {
+        "provider.monitor_interval_ms": 5000,
+        "provider.telemetry_stale_ms": 5000
+      },
+      "valid": true
+    },
+    {
+      "name": "inactive provider limits",
+      "changes": {
+        "provider.type": "openai",
+        "provider.monitor_interval_ms": 0,
+        "provider.metrics_path": "unused"
+      },
+      "valid": true
+    },
+    {
+      "name": "valid kv endpoint",
+      "changes": {
+        "provider.kv_events": {
+          "endpoint": "tcp://127.0.0.1:5557"
+        }
+      },
+      "valid": true
+    },
+    {
+      "name": "openai kv events",
+      "changes": {
+        "provider.type": "openai",
+        "provider.kv_events": {}
+      },
+      "valid": false
+    },
+    {
+      "name": "wildcard kv endpoint",
+      "changes": {
+        "provider.kv_events": {
+          "endpoint": "tcp://*:5557"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "no port kv endpoint",
+      "changes": {
+        "provider.kv_events": {
+          "endpoint": "tcp://localhost"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "http kv endpoint",
+      "changes": {
+        "provider.kv_events": {
+          "endpoint": "http://localhost:5557"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "path kv endpoint",
+      "changes": {
+        "provider.kv_events": {
+          "endpoint": "tcp://localhost:5557/events"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "credentials kv endpoint",
+      "changes": {
+        "provider.kv_events": {
+          "endpoint": "tcp://user@localhost:5557"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "query kv endpoint",
+      "changes": {
+        "provider.kv_events": {
+          "endpoint": "tcp://localhost:5557?"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "out of range kv endpoint",
+      "changes": {
+        "provider.kv_events": {
+          "endpoint": "tcp://localhost:65536"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "invalid replay endpoint",
+      "changes": {
+        "provider.kv_events": {
+          "replay_endpoint": "tcp://*:5558"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "zero kv reconnect_ms",
+      "changes": {
+        "provider.kv_events": {
+          "reconnect_ms": 0
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "zero kv max_blocks",
+      "changes": {
+        "provider.kv_events": {
+          "max_blocks": 0
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "zero kv max_directory_bytes",
+      "changes": {
+        "provider.kv_events": {
+          "max_directory_bytes": 0
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "zero kv max_event_bytes",
+      "changes": {
+        "provider.kv_events": {
+          "max_event_bytes": 0
+        }
+      },
+      "valid": false
+    }
+  ]
+}
