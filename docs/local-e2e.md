@@ -1,4 +1,4 @@
-# Local Claude Code end-to-end tests
+# Local coding-agent end-to-end tests
 
 [Documentation index](README.md) | [Native vLLM provider](vllm.md) |
 [Session logging](session-logging.md)
@@ -24,6 +24,7 @@ target/claude-llama-cpu-e2e/llama-b11516/llama-server \
   --alias qwen35-cpu --host 127.0.0.1 --port 18000 \
   --ctx-size 16384 --parallel 1 --threads 2 --threads-batch 2 \
   --seed 1 --temp 0 \
+  --predict 256 \
   --jinja --reasoning off \
   --chat-template-file tests/fixtures/qwen35-inline-system.jinja
 ```
@@ -50,6 +51,36 @@ Select provider type `openai`, with `anthropic_protocol` explicitly set to
 avoids vLLM's version, tokenization, metrics, and KV event interfaces. The test
 therefore validates Estuary's generic gateway paths and real Qwen3.5 GGUF
 inference; it does not validate vLLM AWQ kernels or exact KV event routing.
+
+## Codex Responses
+
+The separate Codex test uses the real CLI and Responses API, with isolated
+settings, a small replacement instruction file, and the same random-nonce MCP
+fixture. Run against the llama.cpp server above:
+
+```bash
+python3 tests/codex_cpu_e2e.py \
+  --upstream http://127.0.0.1:18000/v1 --model qwen35-cpu \
+  --flatten-namespaces --output target/codex-llama-cpu-e2e/runs
+```
+
+Current Codex versions send MCP tools inside Responses `namespace` tool groups.
+llama.cpp `b11516` skips those groups. Set the node's
+`provider.flatten_codex_namespaces` to `true`, or enable **Codex namespace tool
+compatibility** in the editor for an OpenAI-compatible provider. Estuary flattens
+function definitions and replayed calls, collision-checks their names, and
+restores the namespace and function name in both JSON and streamed responses.
+The option defaults to `false` for generic providers; vLLM already performs this
+conversion automatically. It does not impose vLLM's other tool restrictions on
+generic backends.
+
+The script checks streamed text, actual MCP execution and replayed tool output,
+the exact nonce in the final answer, Responses protocol attribution, captured
+payloads and usage/timing, logger health, and released reservations. It disables
+web search and shell tools to keep this a local protocol test. The CLI settings
+preapprove only the fixed local nonce tool for unattended execution, using the
+official per-tool approval setting. The provider configuration
+follows the official [custom-provider configuration](https://learn.chatgpt.com/docs/config-file/config-advanced).
 
 ## Ollama
 

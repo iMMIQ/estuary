@@ -15,6 +15,7 @@
     "provider": {
       "type": "openai",
       "anthropic_protocol": "auto",
+      "flatten_codex_namespaces": false,
       "version_path": "/version",
       "metrics_path": "/metrics",
       "tokenize_path": "/tokenize",
@@ -42,6 +43,7 @@
     "provider": {
       "type": "vllm",
       "anthropic_protocol": "auto",
+      "flatten_codex_namespaces": false,
       "version_path": "/version",
       "metrics_path": "/metrics",
       "tokenize_path": "/tokenize",

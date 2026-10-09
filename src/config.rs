@@ -395,6 +395,7 @@ pub struct ProviderConfig {
     #[serde(rename = "type")]
     pub kind: ProviderKind,
     pub anthropic_protocol: AnthropicProtocol,
+    pub flatten_codex_namespaces: bool,
     pub version_path: String,
     pub metrics_path: String,
     pub tokenize_path: String,
@@ -411,6 +412,7 @@ impl Default for ProviderConfig {
         Self {
             kind: ProviderKind::Openai,
             anthropic_protocol: AnthropicProtocol::Auto,
+            flatten_codex_namespaces: false,
             version_path: "/version".to_owned(),
             metrics_path: "/metrics".to_owned(),
             tokenize_path: "/tokenize".to_owned(),

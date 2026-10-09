@@ -64,13 +64,34 @@ pub(crate) fn is_request(headers: &http::HeaderMap, body: Option<&Value>) -> boo
 pub(crate) fn normalize_vllm_request(
     body: &mut Value,
 ) -> Result<Option<Arc<NamespaceMap>>, GatewayError> {
+    normalize_request(body, true)
+}
+
+pub(crate) fn normalize_namespace_request(
+    body: &mut Value,
+) -> Result<Option<Arc<NamespaceMap>>, GatewayError> {
+    normalize_request(body, false)
+}
+
+fn normalize_request(
+    body: &mut Value,
+    restrict_vllm_features: bool,
+) -> Result<Option<Arc<NamespaceMap>>, GatewayError> {
     let object = body.as_object_mut().ok_or_else(|| {
         GatewayError::InvalidRequest("Responses request body must be an object".to_owned())
     })?;
     let mut namespaces = NamespaceMap::default();
 
-    normalize_input(object.get_mut("input"), &mut namespaces)?;
-    normalize_tools(object.get_mut("tools"), &mut namespaces)?;
+    normalize_input(
+        object.get_mut("input"),
+        &mut namespaces,
+        restrict_vllm_features,
+    )?;
+    normalize_tools(
+        object.get_mut("tools"),
+        &mut namespaces,
+        restrict_vllm_features,
+    )?;
 
     Ok((!namespaces.is_empty()).then(|| Arc::new(namespaces)))
 }
@@ -78,6 +99,7 @@ pub(crate) fn normalize_vllm_request(
 fn normalize_input(
     input: Option<&mut Value>,
     namespaces: &mut NamespaceMap,
+    restrict_vllm_features: bool,
 ) -> Result<(), GatewayError> {
     let Some(items) = input.and_then(Value::as_array_mut) else {
         return Ok(());
@@ -86,6 +108,12 @@ fn normalize_input(
         let Some(object) = item.as_object_mut() else {
             continue;
         };
+        if !restrict_vllm_features {
+            if object.get("type").and_then(Value::as_str) == Some("function_call") {
+                normalize_function_call(object, namespaces)?;
+            }
+            continue;
+        }
         match object.get("type").and_then(Value::as_str) {
             Some("additional_tools") => {
                 return Err(GatewayError::InvalidRequest(
@@ -144,6 +172,7 @@ fn normalize_function_call(
 fn normalize_tools(
     tools: Option<&mut Value>,
     namespaces: &mut NamespaceMap,
+    restrict_vllm_features: bool,
 ) -> Result<(), GatewayError> {
     let Some(tools) = tools else {
         return Ok(());
@@ -199,7 +228,7 @@ fn normalize_tools(
                     })?;
                     if flattened_tool.get("type").and_then(Value::as_str) != Some("function") {
                         return Err(GatewayError::InvalidRequest(
-                            "vLLM 0.25 supports only function tools inside a Codex namespace"
+                            "Codex namespace flattening supports only function tools inside a namespace"
                                 .to_owned(),
                         ));
                     }
@@ -219,7 +248,7 @@ fn normalize_tools(
                     normalized.push(Value::Object(flattened_tool));
                 }
             }
-            "web_search" => {
+            "web_search" if restrict_vllm_features => {
                 return Err(GatewayError::InvalidRequest(
                     "Codex `web_search` has no vLLM 0.25 backend; set `web_search = \"disabled\"` in Codex config"
                         .to_owned(),
@@ -228,6 +257,7 @@ fn normalize_tools(
             "web_search_preview" | "code_interpreter" | "container" => {
                 normalized.push(tool);
             }
+            _ if !restrict_vllm_features => normalized.push(tool),
             unsupported => {
                 return Err(GatewayError::InvalidRequest(format!(
                     "Codex tool type `{unsupported}` is not supported by the vLLM 0.25 Harmony path; use a non-Responses-Lite model profile"
@@ -344,6 +374,33 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn namespace_only_compatibility_preserves_other_responses_features() {
+        let mut request = json!({
+            "tools": [
+                {"type":"custom","name":"patch","format":{"type":"text"}},
+                {"type":"web_search"},
+                {"type":"namespace","name":"mcp__nonce","tools":[
+                    {"type":"function","name":"read","parameters":{"type":"object"}}
+                ]}
+            ],
+            "input": [
+                {"type":"custom_tool_call","call_id":"a","name":"patch","input":"data"},
+                {"type":"function_call","call_id":"b","namespace":"mcp__nonce","name":"read","arguments":"{}"}
+            ]
+        });
+        let original = request.clone();
+        let namespaces = normalize_namespace_request(&mut request).unwrap().unwrap();
+        assert_eq!(request["tools"][0], original["tools"][0]);
+        assert_eq!(request["tools"][1], original["tools"][1]);
+        assert_eq!(request["input"][0], original["input"][0]);
+        assert_eq!(request["tools"][2]["name"], "mcp__nonce__read");
+        assert_eq!(request["input"][1]["name"], "mcp__nonce__read");
+        assert!(request["input"][1].get("namespace").is_none());
+        assert!(!namespaces.is_empty());
+        assert!(normalize_vllm_request(&mut original.clone()).is_err());
+    }
 
     async fn rewrite_stream(chunks: Vec<&[u8]>, namespaces: Arc<NamespaceMap>) -> String {
         let events = sse::parse_chunks(chunks.into_iter().map(Bytes::copy_from_slice).collect())

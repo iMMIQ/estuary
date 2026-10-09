@@ -1229,6 +1229,49 @@ async fn codex_namespace_tools_round_trip_through_vllm_responses() {
     assert!(upstream_body["input"][1].get("namespace").is_none());
 }
 
+#[tokio::test]
+async fn generic_codex_namespace_compatibility_is_explicit_and_roundtrips_history() {
+    for flatten in [false, true] {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let upstream = TestServer::spawn(
+            Router::new()
+                .route("/v1/responses", post(codex_namespace_response))
+                .with_state(CodexCapture { sender }),
+        )
+        .await;
+        let mut config = node(
+            "generic-codex",
+            &upstream,
+            [("gpt-oss-public", "gpt-oss-internal")],
+        );
+        config.provider.flatten_codex_namespaces = flatten;
+        let gateway = spawn_gateway(vec![config]).await;
+        let response = test_client()
+            .post(gateway.url("/v1/responses"))
+            .header("user-agent", "codex_exec/0.161.0")
+            .json(&codex_namespace_request(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = response.json().await.unwrap();
+        let sent = receiver.recv().await.unwrap();
+        if flatten {
+            assert_eq!(sent["tools"][1]["type"], "function");
+            assert_eq!(sent["tools"][1]["name"], "multi_agent_v1__spawn_agent");
+            assert_eq!(sent["input"][1]["name"], "multi_agent_v1__spawn_agent");
+            assert!(sent["input"][1].get("namespace").is_none());
+            assert_eq!(response["output"][0]["name"], "spawn_agent");
+            assert_eq!(response["output"][0]["namespace"], "multi_agent_v1");
+        } else {
+            assert_eq!(sent["tools"][1]["type"], "namespace");
+            assert_eq!(sent["input"][1]["namespace"], "multi_agent_v1");
+            assert_eq!(response["output"][0]["name"], "multi_agent_v1__spawn_agent");
+            assert!(response["output"][0].get("namespace").is_none());
+        }
+    }
+}
+
 async fn codex_namespace_sse(Json(_body): Json<Value>) -> Response {
     static SSE: &[u8] = concat!(
         "event: response.output_item.added\r\n",

@@ -248,6 +248,9 @@ const en = {
   "editor.baseUrlDescription": "Include http(s) and port when needed.",
   "editor.provider": "Provider",
   "editor.anthropicProtocol": "Anthropic upstream protocol",
+  "editor.flattenCodexNamespaces": "Codex namespace tool compatibility",
+  "editor.flattenCodexNamespacesDescription":
+    "Enable for backends such as llama.cpp that accept function tools but do not support Codex namespaces.",
   "editor.anthropicDescription": "Adapter used for public /v1/messages requests.",
   "editor.maxConcurrency": "Max concurrency",
   "editor.schedulingWeight": "Scheduling weight",
@@ -653,6 +656,9 @@ const zhCN: Record<keyof typeof en, string> = {
   "editor.baseUrlDescription": "按需包含 http(s) 协议和端口。",
   "editor.provider": "提供方",
   "editor.anthropicProtocol": "Anthropic 上游协议",
+  "editor.flattenCodexNamespaces": "Codex 命名空间工具兼容",
+  "editor.flattenCodexNamespacesDescription":
+    "用于 llama.cpp 等支持函数工具、但不支持 Codex 命名空间的后端。",
   "editor.anthropicDescription": "用于公共 /v1/messages 请求的适配器。",
   "editor.maxConcurrency": "最大并发",
   "editor.schedulingWeight": "调度权重",

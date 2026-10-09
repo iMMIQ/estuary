@@ -330,6 +330,20 @@ export function NodeEditor({
                       }))
                     }
                   />
+                  {draft.provider.type === "openai" && (
+                    <Switch
+                      label={t("editor.flattenCodexNamespaces")}
+                      description={t("editor.flattenCodexNamespacesDescription")}
+                      checked={draft.provider.flatten_codex_namespaces}
+                      onChange={(event) => {
+                        const checked = event.currentTarget.checked;
+                        update((current) => ({
+                          ...current,
+                          provider: { ...current.provider, flatten_codex_namespaces: checked },
+                        }));
+                      }}
+                    />
+                  )}
                   <NumberInput
                     label={t("editor.maxConcurrency")}
                     required

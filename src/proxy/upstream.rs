@@ -158,6 +158,9 @@ pub(super) async fn proxy_with_retries(
             && selected_protocol.is_none()
             && node.provider().kind == crate::config::ProviderKind::Vllm
             && upstream_endpoint == "responses";
+        let flatten_codex_namespaces = request.codex_request
+            && node.provider().flatten_codex_namespaces
+            && upstream_endpoint == "responses";
         let upstream_endpoint_log = upstream_endpoint.to_owned();
         let (upstream_body, thinking_budget_approximated, codex_namespaces) = mapped_body(
             upstream_original,
@@ -166,6 +169,7 @@ pub(super) async fn proxy_with_retries(
             request.public_model.as_deref(),
             native_vllm_messages,
             vllm_codex_responses,
+            flatten_codex_namespaces,
         )?;
         let expose_thinking = request
             .anthropic_payloads
@@ -454,6 +458,7 @@ pub(super) fn mapped_body(
     public_model: Option<&str>,
     native_vllm_messages: bool,
     vllm_codex_responses: bool,
+    flatten_codex_namespaces: bool,
 ) -> Result<(Bytes, bool, Option<Arc<codex::NamespaceMap>>), GatewayError> {
     let rewrite_native_thinking = native_vllm_messages
         && parsed
@@ -466,6 +471,7 @@ pub(super) fn mapped_body(
     if !rewrite_native_thinking
         && !remove_empty_native_tools
         && !vllm_codex_responses
+        && !flatten_codex_namespaces
         && (upstream_model == public_model || upstream_model.is_none())
     {
         return Ok((original.clone(), false, None));
@@ -487,6 +493,8 @@ pub(super) fn mapped_body(
     }
     let codex_namespaces = if vllm_codex_responses {
         codex::normalize_vllm_request(&mut value)?
+    } else if flatten_codex_namespaces {
+        codex::normalize_namespace_request(&mut value)?
     } else {
         None
     };

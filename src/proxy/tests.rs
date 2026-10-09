@@ -328,6 +328,7 @@ fn native_vllm_request_reuses_an_unchanged_body() {
         Some("model"),
         true,
         false,
+        false,
     )
     .unwrap();
 
@@ -345,8 +346,16 @@ fn native_vllm_empty_tools_do_not_require_a_tool_parser() {
             request["tool_choice"] = choice;
         }
         let original = Bytes::from(serde_json::to_vec(&request).unwrap());
-        let (body, _, _) =
-            mapped_body(&original, Some(&request), Some("m"), Some("m"), true, false).unwrap();
+        let (body, _, _) = mapped_body(
+            &original,
+            Some(&request),
+            Some("m"),
+            Some("m"),
+            true,
+            false,
+            false,
+        )
+        .unwrap();
         let mapped: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(mapped.get("tools").is_none());
         assert!(mapped.get("tool_choice").is_none());
@@ -356,6 +365,7 @@ fn native_vllm_empty_tools_do_not_require_a_tool_parser() {
             Some(&request),
             Some("m"),
             Some("m"),
+            false,
             false,
             false,
         )
@@ -371,7 +381,7 @@ fn native_vllm_empty_tools_do_not_require_a_tool_parser() {
     ] {
         let original = Bytes::from(serde_json::to_vec(&request).unwrap());
         let (mapped, _, _) =
-            mapped_body(&original, Some(&request), None, None, true, false).unwrap();
+            mapped_body(&original, Some(&request), None, None, true, false, false).unwrap();
         assert_eq!(mapped.as_ptr(), original.as_ptr());
     }
 }

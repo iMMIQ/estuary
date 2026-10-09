@@ -101,12 +101,14 @@ describe("node config mapping", () => {
     const config = draftToConfig(createDraft("openai"));
     const legacyProvider = { ...config.provider } as Partial<typeof config.provider>;
     delete legacyProvider.anthropic_protocol;
+    delete legacyProvider.flatten_codex_namespaces;
     const record = {
       config: { ...config, provider: legacyProvider },
       credentials: { api_key_source: "none" },
     };
     const draft = recordToDraft(record as Parameters<typeof recordToDraft>[0]);
     expect(draft.provider.anthropic_protocol).toBe("auto");
+    expect(draft.provider.flatten_codex_namespaces).toBeFalse();
   });
 
   test("stores a directly entered Bearer key and drops the legacy fallback", () => {

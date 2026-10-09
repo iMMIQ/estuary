@@ -96,6 +96,7 @@ export function recordToDraft(node: NodeRecord): NodeDraft {
   return {
     ...structuredClone(node.config),
     provider: {
+      ...structuredClone(defaults.node.provider),
       ...structuredClone(node.config.provider),
       anthropic_protocol:
         node.config.provider.anthropic_protocol ?? defaults.node.provider.anthropic_protocol,

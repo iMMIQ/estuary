@@ -318,6 +318,8 @@ async fn overlapping_writers_share_content_without_losing_or_overwriting_records
     assert!(rows.requests.iter().all(|r| r.outcome == "success"));
     assert_eq!(first.status().committed, 50);
     assert_eq!(second.status().committed, 50);
+    assert_eq!(first.status().write_errors, 0);
+    assert_eq!(second.status().write_errors, 0);
     for row in rows.requests {
         let detail = first.detail(row.id).await.unwrap().unwrap();
         assert!(

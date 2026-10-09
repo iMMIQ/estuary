@@ -208,6 +208,10 @@ namespace tools, then restores namespace and name fields in buffered and SSE
 responses. Standard functions, structured output, image input, full-history
 replay, and `prompt_cache_key` retain their Responses shapes.
 
+Generic OpenAI-compatible backends can opt into the same namespace conversion
+with `provider.flatten_codex_namespaces: true`, for example when using llama.cpp.
+This flag does not enable vLLM telemetry or apply its other tool restrictions.
+
 Responses Lite custom calls, tool-search items, `additional_tools`, and web
 search are rejected because vLLM's Harmony path cannot represent them. These
 checks apply only to detected Codex requests routed to vLLM; other Responses

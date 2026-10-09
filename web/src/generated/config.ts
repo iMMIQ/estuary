@@ -111,6 +111,7 @@ export type NodeConfig = {
 export type ProviderConfig = {
   type: ProviderKind;
   anthropic_protocol: AnthropicProtocol;
+  flatten_codex_namespaces: boolean;
   version_path: string;
   metrics_path: string;
   tokenize_path: string;
