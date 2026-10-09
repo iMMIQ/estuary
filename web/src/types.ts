@@ -1,9 +1,4 @@
-import type {
-  ModelCapabilityConfig,
-  ModelFamily,
-  NodeConfig,
-  ProviderKind,
-} from "./generated/config";
+import type { ModelCapabilityConfig, NodeConfig, ProviderKind } from "./generated/config";
 
 export type {
   AnthropicProtocol,
@@ -142,7 +137,6 @@ export interface Pair {
   key: string;
   value: string;
   multimodal?: boolean;
-  family?: ModelFamily;
   inherit_capability?: boolean;
 }
 

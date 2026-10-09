@@ -61,7 +61,7 @@ Each node contains:
 | `id` | Unique stable identifier. |
 | `base_url` | Absolute HTTP(S) OpenAI-compatible base URL. Credentials, query strings, and fragments are rejected. |
 | `models` | Public-to-upstream model mappings. A value of `*` preserves the requested model; a public key of `*` matches unlisted models. |
-| `model_capabilities` | Per-public-model capabilities, with `*` as the fallback. Set `multimodal: false` for text-only models and `family: "deepseek"` for the DeepSeek recipe. Without either an exact entry or a fallback, models use the generic recipe and accept images. |
+| `model_capabilities` | Per-public-model capabilities, with `*` as the fallback. Set `multimodal: false` for text-only models. Without either an exact entry or a fallback, models accept images. |
 | `max_concurrency` | Hard in-flight limit in this gateway process. |
 | `weight` | Positive scheduling weight. |
 | `health_path` | Authenticated active-probe path, default `/v1/models`. |
@@ -70,6 +70,13 @@ Each node contains:
 | `provider.type` | `openai` or `vllm`. |
 | `provider.anthropic_protocol` | `auto`, `native`, `responses`, or `chat`. |
 | `provider.kv_events` | Optional vLLM ZMQ KV-event connection and memory limits. |
+
+Model capability `family` selectors are retired. Existing SQLite records and
+imported configurations still accept this field, but ignore it and omit it when
+saved. Model names do not select protocol adapters. Backends used by Codex must
+provide a Responses endpoint; Messages can use the node's configured Chat,
+Responses, or native protocol. There is no model-specific Responses-to-Chat
+conversion.
 
 Create and update operations validate the complete document and probe the
 candidate before changing the active scheduler. Updates and deletes drain the
@@ -140,9 +147,9 @@ by field name, and choosing the merge retains local values for those fields.
 Review the resulting configuration before saving again.
 
 The Models tab and save preview show each model's effective Responses and
-Messages conversion paths. A DeepSeek recipe takes precedence over the node's
-Anthropic protocol setting. Connection tests validate configuration and probe
-health/provider compatibility; they do not run an inference request or verify
+Messages conversion paths. Responses use the upstream Responses endpoint;
+Messages use the node's Anthropic protocol setting. Connection tests validate
+configuration and probe health/provider compatibility; they do not run an inference request or verify
 generation protocol conversion. Editing the draft invalidates the previous
 connection-test result.
 

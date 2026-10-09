@@ -679,8 +679,8 @@ impl BoundedCanonical {
     }
 }
 
-// recipe enables serde_json/preserve_order for the dependency graph. Routing
-// keys must remain independent of the client's JSON object insertion order.
+// Routing keys must remain independent of the client's JSON object insertion
+// order, including when dependencies enable serde_json/preserve_order.
 struct CanonicalValue<'a>(&'a Value);
 
 impl serde::Serialize for CanonicalValue<'_> {

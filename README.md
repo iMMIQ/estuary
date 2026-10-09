@@ -148,9 +148,6 @@ including namespace tools. Responses Lite custom calls, tool search, additional
 tools, and web search are rejected rather than silently changed. See the
 [vLLM provider guide](docs/vllm.md) for protocol details.
 
-For models configured as DeepSeek, [recipe protocol conversion](docs/deepseek.md)
-bridges Codex Responses and Claude Code Messages through Chat Completions.
-
 ## Production Notes
 
 - The public inference listener does not authenticate callers. Keep it on a

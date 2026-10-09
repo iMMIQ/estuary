@@ -78,9 +78,6 @@ pub(super) async fn buffered_success_response(
     }
     let body = match response_mode {
         UpstreamResponseMode::Passthrough => Ok(upstream_body.clone()),
-        UpstreamResponseMode::Deepseek(prepared) => {
-            prepared.complete(&upstream_body, public_model).await
-        }
         UpstreamResponseMode::Codex { namespaces } => {
             codex::rewrite_response(&upstream_body, namespaces)
         }

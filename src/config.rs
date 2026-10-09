@@ -332,29 +332,37 @@ impl Default for NodeConfig {
 }
 
 #[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ModelCapabilityConfig {
     pub multimodal: bool,
-    pub family: ModelFamily,
 }
 
 impl Default for ModelCapabilityConfig {
     fn default() -> Self {
-        Self {
-            multimodal: true,
-            family: ModelFamily::Generic,
-        }
+        Self { multimodal: true }
     }
 }
 
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelFamily {
-    #[default]
-    Generic,
-    Deepseek,
+impl<'de> Deserialize<'de> for ModelCapabilityConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Existing SQLite records and imported configs may contain the retired
+        // family selector. Accept it only as input; it cannot affect routing.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Input {
+            #[serde(default = "default_multimodal")]
+            multimodal: bool,
+            #[serde(default, rename = "family")]
+            _retired_family: Option<serde::de::IgnoredAny>,
+        }
+        fn default_multimodal() -> bool {
+            ModelCapabilityConfig::default().multimodal
+        }
+        let input = Input::deserialize(deserializer)?;
+        Ok(Self {
+            multimodal: input.multimodal,
+        })
+    }
 }
 
 #[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]

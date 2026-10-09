@@ -123,9 +123,7 @@ export type ProviderConfig = {
   kv_events: VllmKvEventsConfig | null;
 };
 
-export type ModelCapabilityConfig = { multimodal: boolean; family: ModelFamily };
-
-export type ModelFamily = "generic" | "deepseek";
+export type ModelCapabilityConfig = { multimodal: boolean };
 
 export type ProviderKind = "openai" | "vllm";
 

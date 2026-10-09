@@ -153,39 +153,20 @@ Claude Code tool calls require a tool-capable model and vLLM's
 are omitted in native requests and converted payloads, so text-only calls do not
 require a tool parser.
 
-An opt-in real Claude Code/CPU test runs against an already started local server:
-
-See [Local end-to-end tests](local-e2e.md) for prebuilt llama.cpp and Ollama
-alternatives when local vLLM kernels are unavailable.
+See [Local end-to-end tests](local-e2e.md) for reusable Claude Code, Codex,
+and OpenCode checks, including prebuilt llama.cpp and Ollama alternatives.
+For a running vLLM CPU server, build Estuary and use the default `vllm` provider:
 
 ```bash
 cargo build --locked
 python3 tests/claude_vllm_cpu_e2e.py \
-  --upstream http://127.0.0.1:18000/v1 --model qwen-cpu
+  --upstream http://127.0.0.1:18000/v1 --model MODEL
 ```
 
-The test uses isolated CLI settings and fresh control/log databases under
-`target/`, checks native and Chat conversion, reads a random JSON nonce through
-a local stdio MCP tool executed by Claude Code, and verifies logging and released
-reservations. Use `--tool-mode read` for its built-in `Read` tool; small models
-can generate invalid optional arguments or return a tool call as plain text.
-Use a sufficient context window for the CLI's environment and tool definitions;
-the test replaces the main system prompt to keep CPU inference practical.
-Use `--protocols native chat responses` to also verify the explicit rejection of
+The model needs enough context for the CLI's environment and tool definitions.
+Use `--protocols native chat responses` to also check the explicit rejection of
 Claude Code's `output_config.effort` in the Responses adapter. Its semantics
-cannot be represented losslessly; use native or Chat for current CLI requests. On
-the local AVX2 CPU with vLLM `0.31.0+cpu`, the default V2 runner stalled on the
-first Qwen2.5 inference; `VLLM_USE_V2_MODEL_RUNNER=0` and two CPU threads allowed
-this test to complete. This is a tested local workaround, not a compatibility
-requirement for every vLLM version or CPU.
-
-Qwen3.5's smallest official model is `0.8B` (`0.6B` belongs to Qwen3).
-Its tool parser is `qwen3_coder`; use the model's official chat template if a
-quantized repository omits it. A local test of Qwen3.5-0.8B AWQ INT4 with
-vLLM `0.31.0+cpu` loaded successfully but crashed on its first inference because
-the AVX2 extension does not register `cpu_gemm_wna16`. Thus a successful health
-check does not establish INT4 inference support on an AVX2-only CPU. The real
-Claude test must pass before treating that model/backend combination as working.
+cannot be represented losslessly; use native or Chat for these requests.
 
 ## Codex Responses
 

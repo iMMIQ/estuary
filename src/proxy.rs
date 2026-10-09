@@ -311,12 +311,7 @@ async fn proxy_inner(
         let salted = parsed
             .get("cache_salt")
             .is_some_and(|value| !value.is_null());
-        let exact_cache_available = state.vllm.has_exact_cache_for_model(model)
-            && !state
-                .scheduler
-                .nodes()
-                .iter()
-                .any(|node| node.model_family(model) == crate::config::ModelFamily::Deepseek);
+        let exact_cache_available = state.vllm.has_exact_cache_for_model(model);
         let prefix_worth_tokenizing = exact_cache_available
             && state
                 .scheduler
@@ -434,7 +429,6 @@ enum ClientProtocol {
 #[derive(Clone, Debug)]
 enum UpstreamResponseMode {
     Passthrough,
-    Deepseek(Arc<crate::deepseek::Prepared>),
     Codex {
         namespaces: Arc<codex::NamespaceMap>,
     },
@@ -454,8 +448,6 @@ impl UpstreamResponseMode {
     fn name(&self) -> &'static str {
         match self {
             Self::Passthrough => "passthrough",
-            Self::Deepseek(prepared) if prepared.is_messages() => "deepseek_messages",
-            Self::Deepseek(_) => "deepseek_responses",
             Self::Codex { .. } => "codex_responses",
             Self::ChatToAnthropic { .. } => "chat_to_anthropic",
             Self::ResponsesToAnthropic { .. } => "responses_to_anthropic",
@@ -464,9 +456,6 @@ impl UpstreamResponseMode {
     }
 
     fn is_anthropic(&self) -> bool {
-        if let Self::Deepseek(prepared) = self {
-            return prepared.is_messages();
-        }
         matches!(
             self,
             Self::ChatToAnthropic { .. }

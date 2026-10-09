@@ -56,8 +56,7 @@
     }
   },
   "capability": {
-    "multimodal": true,
-    "family": "generic"
+    "multimodal": true
   },
   "kv_events": {
     "endpoint": "tcp://127.0.0.1:5557",

@@ -6,7 +6,7 @@ const request = {
   external_request_id: "external",
   session_id: "agent-1",
   session_source: "explicit_header",
-  model: "deepseek",
+  model: "gateway-chat",
   endpoint: "/v1/responses",
   protocol: "openai_responses",
   streaming: true,
@@ -67,9 +67,9 @@ test("explores session logs, details, payloads and pagination", async ({ page })
             {
               number: 1,
               node: "upstream-a",
-              endpoint: "chat/completions",
-              model: "ds-chat",
-              adapter: "deepseek_recipe",
+              endpoint: "responses",
+              model: "upstream-chat",
+              adapter: "passthrough",
               outcome: "success",
               http_status: 200,
               timings_us: { total: 15000 },
@@ -95,7 +95,7 @@ test("explores session logs, details, payloads and pagination", async ({ page })
     .filter({ hasText: /^Session logs$/ })
     .click();
   await expect(page.getByRole("heading", { name: "Session logs", exact: true })).toBeVisible();
-  await expect(page.getByRole("cell", { name: "deepseek openai_responses" })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "gateway-chat openai_responses" })).toBeVisible();
   await page.getByLabel("Request details request-a").click();
   await expect(page.getByText("#1 · upstream-a · success")).toBeVisible();
   await expect(page.getByText("investigate this code")).toHaveCount(0);

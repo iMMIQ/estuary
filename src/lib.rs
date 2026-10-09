@@ -3,7 +3,6 @@ mod anthropic_responses;
 mod codex;
 pub mod config;
 mod connection_drain;
-mod deepseek;
 pub mod error;
 pub mod health;
 mod inference_stats;

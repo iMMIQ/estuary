@@ -34,7 +34,6 @@ use super::{MAX_SSE_EVENT_BYTES, UpstreamResponseMode};
 use super::response::set_thinking_budget_warning;
 
 pub(super) enum ResponseStreamAdapter {
-    Deepseek(Box<crate::deepseek::Converter>),
     Codex(codex::StreamRewriter),
     Chat(anthropic::StreamConverter),
     Responses(anthropic_responses::StreamConverter),
@@ -42,12 +41,11 @@ pub(super) enum ResponseStreamAdapter {
 }
 
 impl ResponseStreamAdapter {
-    pub(super) async fn push_event(
+    pub(super) fn push_event(
         &mut self,
         event: sse::Event,
     ) -> Result<Vec<sse::Event>, GatewayError> {
         match self {
-            Self::Deepseek(converter) => converter.push_event(&event).await,
             Self::Codex(rewriter) => rewriter.push_event(event),
             Self::Chat(converter) => converter.push_event(&event),
             Self::Responses(converter) => converter.push_event(&event),
@@ -55,9 +53,8 @@ impl ResponseStreamAdapter {
         }
     }
 
-    pub(super) async fn finish(&mut self) -> Result<Vec<sse::Event>, GatewayError> {
+    pub(super) fn finish(&mut self) -> Result<Vec<sse::Event>, GatewayError> {
         match self {
-            Self::Deepseek(converter) => converter.finish().await,
             Self::Codex(_) | Self::Native(_) => Ok(Vec::new()),
             Self::Chat(converter) => converter.finish(),
             Self::Responses(converter) => converter.finish(),
@@ -222,20 +219,6 @@ pub(super) fn streaming_response(
         let mut idle_deadline = tokio::time::Instant::now() + stream_idle_timeout;
         let mut stream_adapter = match response_mode {
             UpstreamResponseMode::Passthrough => None,
-            UpstreamResponseMode::Deepseek(prepared) => {
-                match prepared.converter(&public_model, false) {
-                    Ok(converter) => Some(ResponseStreamAdapter::Deepseek(Box::new(converter))),
-                    Err(error) => {
-                        fail_response_stream(
-                            &pump_failure,
-                            &health_config,
-                            &mut guard,
-                            StreamFailure::upstream(error.to_string()),
-                        );
-                        return;
-                    }
-                }
-            }
             UpstreamResponseMode::Codex { namespaces } => Some(ResponseStreamAdapter::Codex(
                 codex::StreamRewriter::new(namespaces),
             )),
@@ -366,7 +349,7 @@ pub(super) fn streaming_response(
                     let output = match (input, stream_adapter.as_mut()) {
                         (StreamingInput::Raw(bytes), None) => Ok(StreamingOutput::Raw(bytes)),
                         (StreamingInput::Event(event), Some(adapter)) => {
-                            adapter.push_event(event).await.map(StreamingOutput::Events)
+                            adapter.push_event(event).map(StreamingOutput::Events)
                         }
                         _ => Err(GatewayError::InvalidUpstreamResponse),
                     };
@@ -395,7 +378,7 @@ pub(super) fn streaming_response(
                 }
                 None => {
                     if let Some(adapter) = stream_adapter.as_mut() {
-                        match adapter.finish().await {
+                        match adapter.finish() {
                             Ok(events) if !events.is_empty() => {
                                 permit.send(StreamingOutput::Events(events));
                             }

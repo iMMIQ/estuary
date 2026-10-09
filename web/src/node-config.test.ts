@@ -15,43 +15,37 @@ import type { NodeRecord } from "./types";
 describe("node config mapping", () => {
   test("round trips wildcard and explicit model capabilities without materializing inherited values", () => {
     const config = draftToConfig(createDraft("openai"));
-    config.models = { ds: "deepseek-chat", plain: "other" };
+    config.models = { text: "text-model", plain: "other" };
     config.model_capabilities = {
-      "*": { family: "deepseek", multimodal: false },
-      plain: { family: "generic", multimodal: true },
+      "*": { multimodal: false },
+      plain: { multimodal: true },
     };
     const draft = recordToDraft({ config, credentials: { api_key_source: "none" } } as NodeRecord);
-    expect(draft.models[0]).toMatchObject({
-      family: "deepseek",
-      multimodal: false,
-      inherit_capability: true,
-    });
+    expect(draft.models[0]).toMatchObject({ multimodal: false, inherit_capability: true });
     expect(draftToConfig(draft).model_capabilities).toEqual(config.model_capabilities);
-    expect(effectiveCapability(config, "ds").family).toBe("deepseek");
-    expect(protocolPaths(config, "ds").responses).toBe("Responses → Chat Completions → Responses");
-    expect(protocolPaths(config, "plain").responses).toBe("Responses → Responses");
-    draft.models[0] = { ...draft.models[0], inherit_capability: false, family: "generic" };
-    expect(draftToConfig(draft).model_capabilities.ds.family).toBe("generic");
-    expect(draftToConfig(draft).model_capabilities["*"].family).toBe("deepseek");
+    expect(effectiveCapability(config, "text").multimodal).toBeFalse();
+    draft.models[0] = { ...draft.models[0], inherit_capability: false, multimodal: true };
+    expect(draftToConfig(draft).model_capabilities.text.multimodal).toBeTrue();
+    expect(draftToConfig(draft).model_capabilities["*"].multimodal).toBeFalse();
   });
 
   test("generic protocol paths resolve provider defaults and explicit settings", () => {
     const config = draftToConfig(createDraft("vllm"));
-    expect(protocolPaths(config, "x").messages).toBe("Messages → Messages");
+    expect(protocolPaths(config).messages).toBe("Messages → Messages");
     config.provider.type = "openai";
-    expect(protocolPaths(config, "x").messages).toBe("Messages → Chat Completions → Messages");
+    expect(protocolPaths(config).messages).toBe("Messages → Chat Completions → Messages");
     config.provider.anthropic_protocol = "responses";
-    expect(protocolPaths(config, "x").messages).toBe("Messages → Responses → Messages");
+    expect(protocolPaths(config).messages).toBe("Messages → Responses → Messages");
   });
 
   test("catch-all model mapping retains capabilities for individual public aliases", () => {
     const config = draftToConfig(createDraft("openai"));
     config.models = { "*": "*" };
-    config.model_capabilities = { ds: { family: "deepseek", multimodal: false } };
+    config.model_capabilities = { text: { multimodal: false } };
     const draft = recordToDraft({ config, credentials: { api_key_source: "none" } } as NodeRecord);
     expect(draftToConfig(draft).model_capabilities).toEqual(config.model_capabilities);
-    draft.models = [{ key: "ds", value: "upstream" }];
-    expect(draftToConfig(draft).model_capabilities.ds.family).toBe("generic");
+    draft.models = [{ key: "text", value: "upstream" }];
+    expect(draftToConfig(draft).model_capabilities.text.multimodal).toBeTrue();
   });
   test("drops blank key-value rows", () => {
     expect(
@@ -77,15 +71,15 @@ describe("node config mapping", () => {
     expect(draftToConfig(draft).provider.anthropic_protocol).toBe("responses");
   });
 
-  test("keeps model families independent on a mixed node", () => {
+  test("keeps image capabilities independent on a mixed node", () => {
     const draft = createDraft("openai");
     draft.models = [
-      { key: "ds", value: "deepseek-chat", family: "deepseek" },
-      { key: "qwen", value: "qwen" },
+      { key: "text", value: "text-model", multimodal: false },
+      { key: "vision", value: "vision-model" },
     ];
     const config = draftToConfig(draft);
-    expect(config.model_capabilities.ds.family).toBe("deepseek");
-    expect(config.model_capabilities.qwen.family).toBe("generic");
+    expect(config.model_capabilities.text.multimodal).toBeFalse();
+    expect(config.model_capabilities.vision.multimodal).toBeTrue();
   });
 
   test("serializes per-model image capability", () => {
@@ -93,7 +87,7 @@ describe("node config mapping", () => {
     draft.id = "node-a";
     draft.models = [{ key: "text", value: "internal-text", multimodal: false }];
     expect(draftToConfig(draft).model_capabilities).toEqual({
-      text: { multimodal: false, family: "generic" },
+      text: { multimodal: false },
     });
   });
 

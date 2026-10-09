@@ -44,15 +44,7 @@ export function effectiveModelMappings(config: NodeConfig): [string, string][] {
   return entries;
 }
 
-export function protocolPaths(
-  config: NodeConfig,
-  model: string,
-): { responses: string; messages: string } {
-  if (effectiveCapability(config, model).family === "deepseek")
-    return {
-      responses: "Responses → Chat Completions → Responses",
-      messages: "Messages → Chat Completions → Messages",
-    };
+export function protocolPaths(config: NodeConfig): { responses: string; messages: string } {
   const protocol =
     config.provider.anthropic_protocol === "auto"
       ? config.provider.type === "vllm"
@@ -75,7 +67,6 @@ function modelPairs(node: NodeRecord): Pair[] {
     key,
     value,
     multimodal: effectiveCapability(node.config, key).multimodal,
-    family: effectiveCapability(node.config, key).family ?? defaults.capability.family,
     inherit_capability: !Object.hasOwn(node.config.model_capabilities ?? {}, key),
   }));
   return pairs.length > 0 ? pairs : [{ key: "", value: "", ...defaults.capability }];
@@ -141,7 +132,6 @@ export function draftToConfig(draft: NodeDraft): NodeConfig {
                 row.key.trim(),
                 {
                   multimodal: row.multimodal ?? defaults.capability.multimodal,
-                  family: row.family ?? defaults.capability.family,
                 },
               ] as const,
           )
@@ -160,7 +150,6 @@ export function draftWildcardCapability(draft: NodeDraft): ModelCapabilityConfig
   const row = draft.models.find((item) => item.key.trim() === "*" && !item.inherit_capability);
   return row
     ? {
-        family: row.family ?? defaults.capability.family,
         multimodal: row.multimodal ?? defaults.capability.multimodal,
       }
     : draft.wildcard_capability;

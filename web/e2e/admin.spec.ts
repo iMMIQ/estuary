@@ -94,8 +94,7 @@ test("creates an upstream through the management workflow", async ({ page }) => 
   await page.getByLabel("Base URL").fill("http://vllm-a.internal:8000/v1");
   await page.getByLabel("Public model 1").fill("gateway-chat");
   await page.getByLabel("Upstream model 1").fill("model-a");
-  await page.getByRole("combobox", { name: "Model family 1", exact: true }).click();
-  await page.getByRole("option", { name: "DeepSeek (recipe)", exact: true }).click();
+  await page.getByRole("switch", { name: "Image input 1", exact: true }).uncheck();
   await page.getByRole("button", { name: "Next" }).click();
   await page.getByRole("button", { name: "Next" }).click();
   await page.getByRole("button", { name: "Add Node" }).click();
@@ -103,7 +102,7 @@ test("creates an upstream through the management workflow", async ({ page }) => 
   await expect(page.getByText("vllm-a").first()).toBeVisible();
   await expect(page.getByText("Node added")).toBeVisible();
   expect(nodes[0].config.model_capabilities).toMatchObject({
-    "gateway-chat": { family: "deepseek" },
+    "gateway-chat": { multimodal: false },
   });
 });
 

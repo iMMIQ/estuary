@@ -679,8 +679,8 @@ export function NodeEditor({
                 {effectiveModelMappings(draftToConfig(draft)).map(([model]) => (
                   <div className="protocol-review" key={model}>
                     <strong>{model}</strong>
-                    <span>Codex: {protocolPaths(draftToConfig(draft), model).responses}</span>
-                    <span>Claude: {protocolPaths(draftToConfig(draft), model).messages}</span>
+                    <span>Codex: {protocolPaths(draftToConfig(draft)).responses}</span>
+                    <span>Claude: {protocolPaths(draftToConfig(draft)).messages}</span>
                   </div>
                 ))}
                 <ReviewRow label={t("editor.healthPath")} value={draft.health_path} />

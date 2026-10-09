@@ -427,7 +427,6 @@ export function NodeDetails({
                   <th>{t("details.publicModel")}</th>
                   <th>{t("details.upstreamModel")}</th>
                   <th>{t("details.multimodal")}</th>
-                  <th>{t("editor.modelFamily")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -440,11 +439,6 @@ export function NodeDetails({
                         ? t("common.enabled")
                         : t("common.disabled")}
                     </td>
-                    <td>
-                      {t(
-                        `family.${effectiveCapability(node.config, publicModel).family ?? "generic"}`,
-                      )}
-                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -452,18 +446,12 @@ export function NodeDetails({
           </section>
           <section className="protocol-panel">
             <h3>{t("protocol.effective")}</h3>
-            <p>{t("protocol.recipeOverride")}</p>
+            <p>{t("protocol.routing")}</p>
             {modelMappings.map(([model]) => (
               <div className="protocol-review" key={model}>
                 <strong>{model}</strong>
-                <small>
-                  {Object.hasOwn(node.config.model_capabilities ?? {}, model)
-                    ? t("editor.modelFamily")
-                    : t("protocol.inherited")}
-                  : {t(`family.${effectiveCapability(node.config, model).family ?? "generic"}`)}
-                </small>
-                <span>Codex: {protocolPaths(node.config, model).responses}</span>
-                <span>Claude: {protocolPaths(node.config, model).messages}</span>
+                <span>Codex: {protocolPaths(node.config).responses}</span>
+                <span>Claude: {protocolPaths(node.config).messages}</span>
               </div>
             ))}
           </section>

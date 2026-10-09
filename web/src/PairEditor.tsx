@@ -42,14 +42,8 @@ export function PairEditor({
       rows.map((row, rowIndex) =>
         rowIndex === index
           ? updateRow(row, {
-              ...(row.inherit_capability && ["family", "multimodal"].includes(key)
-                ? {
-                    family: inherited?.family ?? defaults.capability.family,
-                    multimodal: inherited?.multimodal ?? defaults.capability.multimodal,
-                  }
-                : {}),
               [key]: value,
-              ...(["family", "multimodal"].includes(key) || (key === "key" && value === "*")
+              ...(key === "multimodal" || (key === "key" && value === "*")
                 ? { inherit_capability: false }
                 : {}),
             })
@@ -64,7 +58,7 @@ export function PairEditor({
         <span>{keyLabel}</span>
         <span>{valueLabel}</span>
         <span>{t("editor.multimodal")}</span>
-        <span>{t("editor.modelFamily")}</span>
+        <span>{t("editor.capabilitySource")}</span>
         <span />
       </div>
       {rows.map((row, index) => (
@@ -92,17 +86,11 @@ export function PairEditor({
             onChange={(event) => update(index, "multimodal", event.currentTarget.checked)}
           />
           <Select
-            aria-label={`${t("editor.modelFamily")} ${index + 1}`}
-            value={row.inherit_capability ? "inherit" : (row.family ?? defaults.capability.family)}
+            aria-label={`${t("editor.capabilitySource")} ${index + 1}`}
+            value={row.inherit_capability ? "inherit" : "override"}
             data={[
-              {
-                value: "inherit",
-                label: t("editor.inheritedFamily", {
-                  family: t(`family.${inherited?.family ?? defaults.capability.family}`),
-                }),
-              },
-              { value: "generic", label: t("family.generic") },
-              { value: "deepseek", label: t("family.deepseek") },
+              { value: "inherit", label: t("editor.inheritCapability") },
+              { value: "override", label: t("editor.overrideCapability") },
             ]}
             onChange={(value) => {
               if (value === "inherit")
@@ -111,13 +99,17 @@ export function PairEditor({
                     i === index
                       ? updateRow(item, {
                           inherit_capability: true,
-                          family: inherited?.family ?? defaults.capability.family,
                           multimodal: inherited?.multimodal ?? defaults.capability.multimodal,
                         })
                       : item,
                   ),
                 );
-              else if (value) update(index, "family", value);
+              else if (value === "override")
+                update(
+                  index,
+                  "multimodal",
+                  inherited?.multimodal ?? defaults.capability.multimodal,
+                );
             }}
           />
           <Button

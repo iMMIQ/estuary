@@ -276,3 +276,28 @@ fn rejects_kv_events_on_generic_provider() {
     };
     assert!(settings.validate().is_err());
 }
+
+#[test]
+fn retired_family_is_input_only_and_other_capability_fields_stay_strict() {
+    for family in ["generic", "deepseek"] {
+        let capability: ModelCapabilityConfig =
+            serde_json::from_value(serde_json::json!({"family":family,"multimodal":false}))
+                .unwrap();
+        assert!(!capability.multimodal);
+        assert_eq!(
+            serde_json::to_value(capability).unwrap(),
+            serde_json::json!({"multimodal":false})
+        );
+        let capability: ModelCapabilityConfig =
+            serde_json::from_value(serde_json::json!({"family":family})).unwrap();
+        assert!(capability.multimodal);
+    }
+    assert!(
+        serde_json::from_value::<ModelCapabilityConfig>(serde_json::json!({"unknown":true}))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ModelCapabilityConfig>(serde_json::json!({"multimodal":null}))
+            .is_err()
+    );
+}

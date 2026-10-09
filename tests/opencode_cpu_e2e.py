@@ -23,7 +23,7 @@ from collections import Counter
 from pathlib import Path
 
 from claude_vllm_cpu_e2e import wait_for
-from deepseek_e2e import free_port, http
+from e2e_helpers import free_port, http
 
 
 def audit_storage(path):

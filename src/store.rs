@@ -377,6 +377,48 @@ mod tests {
     }
 
     #[test]
+    fn reads_retired_family_from_persisted_records_and_drops_it_on_save() {
+        let store = NodeStore::memory().unwrap();
+        store.insert(&node()).unwrap();
+        let mut legacy = serde_json::to_value(node()).unwrap();
+        legacy["model_capabilities"] =
+            serde_json::json!({"*":{"family":"deepseek","multimodal":false}});
+        store
+            .connection
+            .lock()
+            .execute(
+                "UPDATE node_configs SET config_json = ?1 WHERE id = 'node-a'",
+                [legacy.to_string()],
+            )
+            .unwrap();
+        let stored = store.list().unwrap().remove(0);
+        assert!(!stored.config.model_capabilities["*"].multimodal);
+        store
+            .update("node-a", stored.revision, &stored.config)
+            .unwrap()
+            .unwrap();
+        let encoded: String = store
+            .connection
+            .lock()
+            .query_row(
+                "SELECT config_json FROM node_configs WHERE id = 'node-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!encoded.contains("family"));
+        assert!(
+            !store
+                .get("node-a")
+                .unwrap()
+                .unwrap()
+                .config
+                .model_capabilities["*"]
+                .multimodal
+        );
+    }
+
+    #[test]
     fn survives_database_reopen() {
         let path = std::env::temp_dir().join(format!("estuary-store-{}.db", uuid::Uuid::now_v7()));
         {

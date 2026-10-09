@@ -26,7 +26,7 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-from deepseek_e2e import free_port, http
+from e2e_helpers import free_port, http
 
 
 def wait_for(predicate, seconds=30):

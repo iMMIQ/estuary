@@ -116,7 +116,11 @@ jobs:
           echo "$RUNNER_TEMP/quality-tools/bin" >> "$GITHUB_PATH"
       - run: ruff check tests
       - run: ruff format --check tests
-      - run: python3 tests/deepseek_e2e.py --help
+      - name: Check coding-agent test entry points
+        run: |
+          python3 tests/claude_vllm_cpu_e2e.py --help
+          python3 tests/codex_cpu_e2e.py --help
+          python3 tests/opencode_cpu_e2e.py --help
       - run: actionlint
       - run: shellcheck deploy/*.sh
       - run: shfmt -d -i 4 -ci deploy/*.sh

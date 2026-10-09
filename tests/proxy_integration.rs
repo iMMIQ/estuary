@@ -349,10 +349,7 @@ async fn text_only_model_omits_openai_images_before_forwarding() {
     );
     upstream_node.model_capabilities.insert(
         "text-model".to_owned(),
-        ModelCapabilityConfig {
-            multimodal: false,
-            ..ModelCapabilityConfig::default()
-        },
+        ModelCapabilityConfig { multimodal: false },
     );
     let gateway = spawn_gateway(vec![upstream_node]).await;
 
@@ -2229,39 +2226,33 @@ async fn streaming_body_failure_never_switches_nodes_after_headers() {
 }
 
 #[tokio::test]
-async fn deepseek_responses_does_not_leak_anthropic_upstream_error_envelopes() {
-    use estuary::config::ModelFamily;
-    let upstream = TestServer::spawn(Router::new().route(
-        "/v1/chat/completions",
-        post(|Json(body): Json<Value>| async move {
-            assert_eq!(body["model"], "deepseek-chat");
-            assert!(body["messages"].is_array());
-            Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .header(CONTENT_TYPE, "application/json")
-                .header("retry-after", "2")
-                .body(Body::from(
-                    json!({"type":"error", "error":{"type":"rate_limit_error", "message":"upstream is busy"}, "request_id":"anthropic-request"}).to_string(),
-                ))
-                .unwrap()
-        }),
-    ))
+async fn responses_does_not_leak_anthropic_upstream_error_envelopes() {
+    async fn upstream_error(Json(body): Json<Value>) -> Response {
+        assert_eq!(body["model"], "upstream-chat");
+        assert!(body["messages"].is_array() || body["input"].is_string());
+        Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(CONTENT_TYPE, "application/json")
+            .header("retry-after", "2")
+            .body(Body::from(
+                json!({"type":"error", "error":{"type":"rate_limit_error", "message":"upstream is busy"}, "request_id":"anthropic-request"}).to_string(),
+            ))
+            .unwrap()
+    }
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(upstream_error))
+            .route("/v1/chat/completions", post(upstream_error)),
+    )
     .await;
-    let mut config = node("deepseek", &upstream, [("public-ds", "deepseek-chat")]);
-    config.provider.anthropic_protocol = AnthropicProtocol::Native;
-    config.model_capabilities.insert(
-        "public-ds".into(),
-        ModelCapabilityConfig {
-            family: ModelFamily::Deepseek,
-            ..ModelCapabilityConfig::default()
-        },
-    );
+    let mut config = node("openai", &upstream, [("public-chat", "upstream-chat")]);
+    config.provider.anthropic_protocol = AnthropicProtocol::Chat;
     let gateway = spawn_gateway(vec![config]).await;
     for streaming in [false, true] {
         let response = test_client()
             .post(gateway.url("/v1/responses"))
             .header("user-agent", "codex_cli_rs/1.0")
-            .json(&json!({"model":"public-ds", "input":"hello", "stream":streaming}))
+            .json(&json!({"model":"public-chat", "input":"hello", "stream":streaming}))
             .send()
             .await
             .unwrap();
@@ -2280,7 +2271,7 @@ async fn deepseek_responses_does_not_leak_anthropic_upstream_error_envelopes() {
 
         let response = test_client()
             .post(gateway.url("/v1/messages"))
-            .json(&json!({"model":"public-ds", "max_tokens":32,
+            .json(&json!({"model":"public-chat", "max_tokens":32,
                           "messages":[{"role":"user","content":"hello"}], "stream":streaming}))
             .send()
             .await
@@ -2295,127 +2286,7 @@ async fn deepseek_responses_does_not_leak_anthropic_upstream_error_envelopes() {
 }
 
 #[tokio::test]
-async fn deepseek_recipe_routes_both_client_protocols_through_chat() {
-    use estuary::config::ModelFamily;
-    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
-    let upstream = TestServer::spawn(Router::new().route("/v1/chat/completions", post({
-        let captured = Arc::clone(&captured);
-        move |Json(body): Json<Value>| {
-            let captured = Arc::clone(&captured);
-            async move {
-                captured.lock().unwrap().push(body.clone());
-                assert_eq!(body["model"], "deepseek-chat");
-                assert!(body.get("prompt").is_none());
-                let wire = body["tools"][0]["function"]["name"].as_str().unwrap();
-                let tool = json!({"index":0,"id":"upstream-call","type":"function","function":{"name":wire,"arguments":"{\"path\":\"README.md\"}"}});
-                let usage = json!({"prompt_tokens":12,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":4}});
-                if body["stream"] == true {
-                    let chunks = vec![
-                        json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"Checking."},"finish_reason":null}]}),
-                        json!({"choices":[{"index":0,"delta":{"tool_calls":[tool]},"finish_reason":"tool_calls"}]}),
-                        json!({"choices":[],"usage":usage}),
-                    ];
-                    let mut text = String::new();
-                    for chunk in chunks {
-                        use std::fmt::Write;
-                        write!(text, "data: {chunk}\n\n").unwrap();
-                    }
-                    text.push_str("data: [DONE]\n\n");
-                    Response::builder().header(CONTENT_TYPE,"text/event-stream").body(Body::from(text)).unwrap()
-                } else {
-                    let value = json!({"id":"upstream","choices":[{"index":0,"message":{"role":"assistant","content":"Checking.","tool_calls":[tool]},"finish_reason":"tool_calls"}],"usage":usage});
-                    Response::builder().header(CONTENT_TYPE,"application/json").body(Body::from(value.to_string())).unwrap()
-                }
-            }
-        }
-    }))).await;
-    let mut config = node("deepseek", &upstream, [("public-ds", "deepseek-chat")]);
-    config.provider.anthropic_protocol = AnthropicProtocol::Native;
-    config.model_capabilities.insert(
-        "public-ds".into(),
-        ModelCapabilityConfig {
-            family: ModelFamily::Deepseek,
-            ..ModelCapabilityConfig::default()
-        },
-    );
-    let gateway = spawn_gateway(vec![config]).await;
-    let mut requests = Vec::new();
-    for endpoint in ["messages", "responses"] {
-        for streaming in [false, true] {
-            let mut body = if endpoint == "messages" {
-                json!({"model":"public-ds","max_tokens":128,"messages":[{"role":"user","content":"Read the file"}],"tools":[{"name":"read_file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]})
-            } else {
-                json!({"model":"public-ds","input":"Read the file","tools":[{"type":"namespace","name":"files","tools":[{"type":"function","name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]}]})
-            };
-            body["stream"] = json!(streaming);
-            let request = test_client()
-                .post(gateway.url(&format!("/v1/{endpoint}")))
-                .header(
-                    "user-agent",
-                    if endpoint == "messages" {
-                        "codex_cli_rs/1.0"
-                    } else {
-                        "claude-code/1.0"
-                    },
-                )
-                .header("anthropic-version", "2023-06-01")
-                .json(&body)
-                .build()
-                .unwrap();
-            requests.push(async move {
-                let response = test_client().execute(request).await.unwrap();
-                let status = response.status();
-                let text = response.text().await.unwrap();
-                assert_eq!(status, StatusCode::OK, "{text}");
-                assert_deepseek_tool_response(endpoint, streaming, &text);
-            });
-        }
-    }
-    futures_util::future::join_all(requests).await;
-    assert_eq!(captured.lock().unwrap().len(), 4);
-}
-
-fn assert_deepseek_tool_response(endpoint: &str, streaming: bool, text: &str) {
-    if streaming {
-        for line in text.lines().filter_map(|line| line.strip_prefix("event: ")) {
-            assert_eq!(
-                line.starts_with("response."),
-                endpoint == "responses",
-                "{text}"
-            );
-        }
-        assert!(
-            text.contains(if endpoint == "messages" {
-                "event: message_stop"
-            } else {
-                "event: response.completed"
-            }),
-            "{text}"
-        );
-        assert!(text.contains("read_file"), "{text}");
-        assert!(!text.contains("recipe_tool_"), "{text}");
-    } else {
-        let result: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(result["model"], "public-ds");
-        assert_eq!(result["usage"]["output_tokens"], 7);
-        if endpoint == "messages" {
-            assert_eq!(result["type"], "message");
-            assert!(result.get("output").is_none());
-            assert_eq!(result["stop_reason"], "tool_use");
-            assert_eq!(result["content"][1]["name"], "read_file");
-            assert_eq!(result["content"][1]["input"]["path"], "README.md");
-        } else {
-            assert_eq!(result["object"], "response");
-            assert!(result.get("content").is_none());
-            assert_eq!(result["output"][1]["name"], "read_file");
-            assert_eq!(result["output"][1]["namespace"], "files");
-        }
-    }
-}
-
-#[tokio::test]
-async fn generic_model_on_mixed_node_keeps_responses_forwarding() {
-    use estuary::config::ModelFamily;
+async fn retired_model_family_does_not_override_responses_forwarding() {
     let upstream = TestServer::spawn(Router::new().route(
         "/v1/responses",
         post(|Json(body): Json<Value>| async move {
@@ -2425,22 +2296,15 @@ async fn generic_model_on_mixed_node_keeps_responses_forwarding() {
         }),
     ))
     .await;
-    let mut config = node(
-        "mixed",
-        &upstream,
-        [("ds", "deepseek-chat"), ("generic", "generic-upstream")],
-    );
-    config.model_capabilities.insert(
-        "ds".into(),
-        ModelCapabilityConfig {
-            family: ModelFamily::Deepseek,
-            ..ModelCapabilityConfig::default()
-        },
-    );
+    let config = node("openai", &upstream, [("public-chat", "generic-upstream")]);
+    let mut legacy = serde_json::to_value(config).unwrap();
+    legacy["model_capabilities"] = json!({"public-chat":{"family":"deepseek","multimodal":false}});
+    let config: NodeConfig = serde_json::from_value(legacy).unwrap();
     let gateway = spawn_gateway(vec![config]).await;
     let response = test_client()
         .post(gateway.url("/v1/responses"))
-        .json(&json!({"model":"generic", "input":"hello"}))
+        .header("user-agent", "claude-code/1.0")
+        .json(&json!({"model":"public-chat", "input":"hello"}))
         .send()
         .await
         .unwrap();

@@ -1,6 +1,6 @@
 # Session logging
 
-[Documentation index](README.md) | [Research and design](session-logging-design.md)
+[Documentation index](README.md) | [Configuration and operations](operations.md)
 
 Session logging stores inference requests in a **separate local SQLite database**.
 It is disabled until a database path is configured. Both the direct worker and
@@ -161,8 +161,8 @@ requests; `truncated` counts stage/attempt payloads rather than whole requests.
 
 Coverage includes real HTTP requests through the gateway for growing history,
 reused request IDs, retries, stream usage, missing terminal markers, client drops,
-DeepSeek's Responses and Messages recipes, partial content and protected admin
-reads. Storage tests cover branches, compaction, unknown JSON fields, sensitive
+Responses passthrough and Messages conversion, partial content and protected
+admin reads. Storage tests cover branches, compaction, unknown JSON fields, sensitive
 fields in partial JSON, reference-counted retention, saturated capture budgets,
 recovery and overlapping writers. Desktop/mobile browser tests exercise the
 session page, filtering, pagination and content expansion.
@@ -173,9 +173,7 @@ The opt-in 1,000-turn storage fixture is reproducible with:
 cargo test --lib thousand_turn_history -- --ignored --nocapture
 ```
 
-One local debug-profile run reconstructed the final input, stored 1,001 sequence
-nodes and 435,687 bytes of compressed blobs for 37,470,495 bytes of cumulative
-input JSON. These figures exclude request metadata, sequence row/index storage,
-SQLite page and WAL overhead; this fixture measures content sharing and
-transaction-local encoding, not production request latency or model throughput.
-Gateway latency/CPU/RSS still need deployment-specific load measurements.
+The fixture checks final-input reconstruction and measures content sharing and
+transaction-local encoding. Its output excludes request metadata, sequence
+row/index storage, and SQLite page/WAL overhead. Use deployment-specific load
+measurements for gateway latency, CPU, RSS, and model throughput.

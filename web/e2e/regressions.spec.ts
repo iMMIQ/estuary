@@ -110,11 +110,11 @@ test("revision conflict merges local edits and saves with the current revision",
   expect(saved?.max_concurrency).toBe(32);
 });
 
-test("editing preserves inherited DeepSeek and image capability", async ({ page }) => {
+test("editing preserves inherited image capability", async ({ page }) => {
   const initial = record({
     ...nodeConfig(),
     model_capabilities: {
-      "*": { family: "deepseek", multimodal: false },
+      "*": { multimodal: false },
     },
   });
   await mockControlPlane(page, [initial]);
@@ -124,14 +124,23 @@ test("editing preserves inherited DeepSeek and image capability", async ({ page 
     await route.fulfill({ json: initial });
   });
   await openEdit(page);
-  await expect(page.getByRole("combobox", { name: "Model family 1", exact: true })).toHaveValue(
-    "Inherited: DeepSeek (recipe)",
-  );
+  await expect(
+    page.getByRole("combobox", { name: "Capability source 1", exact: true }),
+  ).toHaveValue("Use default");
+  await expect(page.getByRole("switch", { name: "Image input 1", exact: true })).not.toBeChecked();
+  await expect(page.getByRole("combobox", { name: "Model family 1", exact: true })).toHaveCount(0);
+  await page.getByRole("switch", { name: "Image input 1", exact: true }).check();
+  await expect(
+    page.getByRole("combobox", { name: "Capability source 1", exact: true }),
+  ).toHaveValue("Override");
+  await page.getByRole("combobox", { name: "Capability source 1", exact: true }).click();
+  await page.getByRole("option", { name: "Use default", exact: true }).click();
+  await expect(page.getByRole("switch", { name: "Image input 1", exact: true })).not.toBeChecked();
   await page.getByRole("button", { name: "Next", exact: true }).click();
   await page.getByRole("button", { name: "Next", exact: true }).click();
   await page.getByRole("button", { name: "Save Changes", exact: true }).click();
   await expect.poll(() => saved !== undefined).toBe(true);
-  expect(saved?.model_capabilities).toEqual({ "*": { family: "deepseek", multimodal: false } });
+  expect(saved?.model_capabilities).toEqual({ "*": { multimodal: false } });
 });
 
 test("failed IP limit retains the input for retry", async ({ page }) => {

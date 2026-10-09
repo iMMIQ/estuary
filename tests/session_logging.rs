@@ -339,28 +339,46 @@ async fn disabled_content_still_records_usage_and_unavailable_database_does_not_
     assert!(logs.status().write_errors > 0);
 }
 
-#[tokio::test]
-async fn deepseek_recipe_records_both_client_protocols_and_mapped_upstream() {
-    use estuary::config::{AnthropicProtocol, ModelCapabilityConfig, ModelFamily};
-    let upstream = Server::spawn(Router::new().route("/v1/chat/completions", post(|Json(body): Json<Value>| async move {
+fn generic_protocol_upstream() -> Router {
+    async fn chat(Json(body): Json<Value>) -> axum::response::Response {
         assert_eq!(body["model"], "upstream-m");
+        assert!(body["messages"].is_array());
         let usage = json!({"prompt_tokens":12,"completion_tokens":3});
         if body["stream"] == true {
             ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}]}),json!({"choices":[],"usage":usage}))).into_response()
         } else {
             Json(json!({"id":"upstream","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":usage})).into_response()
         }
-    }))).await;
+    }
+    async fn responses(Json(body): Json<Value>) -> axum::response::Response {
+        assert_eq!(body["model"], "upstream-m");
+        assert_eq!(body["input"], "hello");
+        let response = json!({"id":"upstream", "object":"response", "status":"completed", "model":"upstream-m", "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}], "usage":{"input_tokens":12,"output_tokens":3}});
+        if body["stream"] == true {
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                format!(
+                    "event: response.completed\ndata: {}\n\n",
+                    json!({"type":"response.completed", "response":response})
+                ),
+            )
+                .into_response()
+        } else {
+            Json(response).into_response()
+        }
+    }
+    Router::new()
+        .route("/v1/chat/completions", post(chat))
+        .route("/v1/responses", post(responses))
+}
+
+#[tokio::test]
+async fn records_client_protocols_and_generic_upstream_paths() {
+    use estuary::config::AnthropicProtocol;
+    let upstream = Server::spawn(generic_protocol_upstream()).await;
     let db = Database::new();
-    let mut config = node("deepseek", &upstream.url);
-    config.provider.anthropic_protocol = AnthropicProtocol::Native;
-    config.model_capabilities.insert(
-        "m".to_owned(),
-        ModelCapabilityConfig {
-            family: ModelFamily::Deepseek,
-            ..ModelCapabilityConfig::default()
-        },
-    );
+    let mut config = node("openai", &upstream.url);
+    config.provider.anthropic_protocol = AnthropicProtocol::Chat;
     let (public, _, logs) = logged_gateway(settings(&db, vec![config])).await;
     for endpoint in ["messages", "responses"] {
         for streaming in [false, true] {
@@ -413,12 +431,21 @@ async fn deepseek_recipe_records_both_client_protocols_and_mapped_upstream() {
         assert_eq!(
             detail.request.attempts[0].adapter,
             if detail.request.protocol == "openai_responses" {
-                "deepseek_responses"
+                "passthrough"
             } else {
-                "deepseek_messages"
+                "chat_to_anthropic"
             }
         );
-        assert_eq!(detail.request.attempts[0].endpoint, "chat/completions");
+        assert_eq!(
+            detail.request.attempts[0].endpoint,
+            if detail.request.protocol == "openai_responses" {
+                "responses"
+            } else {
+                "chat/completions"
+            }
+        );
+        assert_eq!(detail.request.usage["input_tokens"], 12);
+        assert_eq!(detail.request.usage["output_tokens"], 3);
         let payload = detail
             .payloads
             .iter()

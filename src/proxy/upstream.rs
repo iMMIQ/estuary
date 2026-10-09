@@ -17,7 +17,6 @@ use crate::{codex, config::AnthropicProtocol, error::GatewayError, server::AppSt
 use super::headers::{
     connection_header_names, should_forward_protocol_header, should_forward_request_header,
 };
-use super::payload::prepared_payload;
 use super::request_compat::apply_vllm_native_thinking_compat;
 use super::response::{buffered_success_response, proxy_error_response};
 use super::streaming::streaming_response;
@@ -55,38 +54,12 @@ pub(super) async fn proxy_with_retries(
             .observe_prefix_match_tokens(selection.prefix_match_tokens);
 
         let node = Arc::clone(&selection.node);
-        let recipe = if matches!(request.endpoint.as_str(), "messages" | "responses")
-            && node.model_family(request.public_model.as_deref().unwrap_or_default())
-                == crate::config::ModelFamily::Deepseek
-        {
-            let (mut payload, prepared) = crate::deepseek::Prepared::new(
-                &request.endpoint,
-                request.parsed_body.as_ref().expect("inference JSON"),
-            )?;
-            if node.provider().kind == crate::config::ProviderKind::Vllm {
-                apply_vllm_native_thinking_compat(
-                    payload.as_object_mut().expect("recipe chat object"),
-                )?;
-            }
-            Some((
-                prepared_payload("chat/completions", payload),
-                Arc::new(prepared),
-            ))
-        } else {
-            None
-        };
-        let selected_protocol = request
-            .anthropic_payloads
-            .as_ref()
-            .filter(|_| recipe.is_none())
-            .map(|_| {
-                node.provider()
-                    .anthropic_protocol
-                    .resolve(node.provider().kind)
-            });
-        let selected_payload = if let Some((payload, _)) = &recipe {
-            Some(payload)
-        } else if let Some(protocol) = selected_protocol {
+        let selected_protocol = request.anthropic_payloads.as_ref().map(|_| {
+            node.provider()
+                .anthropic_protocol
+                .resolve(node.provider().kind)
+        });
+        let selected_payload = if let Some(protocol) = selected_protocol {
             let source = request
                 .parsed_body
                 .as_ref()
@@ -175,40 +148,27 @@ pub(super) async fn proxy_with_retries(
             .anthropic_payloads
             .as_ref()
             .is_some_and(|payloads| payloads.expose_thinking);
-        let response_mode = if let Some((_, prepared)) = recipe {
-            UpstreamResponseMode::Deepseek(prepared)
-        } else {
-            match selected_protocol {
-                None => codex_namespaces.map_or(UpstreamResponseMode::Passthrough, |namespaces| {
-                    UpstreamResponseMode::Codex { namespaces }
-                }),
-                Some(AnthropicProtocol::Native) => UpstreamResponseMode::NativeAnthropic {
-                    expose_thinking: native_vllm_messages || expose_thinking,
-                    thinking_budget_approximated,
-                },
-                Some(AnthropicProtocol::Responses) => {
-                    UpstreamResponseMode::ResponsesToAnthropic { expose_thinking }
-                }
-                Some(AnthropicProtocol::Chat) => {
-                    UpstreamResponseMode::ChatToAnthropic { expose_thinking }
-                }
-                Some(AnthropicProtocol::Auto) => {
-                    unreachable!("Anthropic protocol must be resolved")
-                }
+        let response_mode = match selected_protocol {
+            None => codex_namespaces.map_or(UpstreamResponseMode::Passthrough, |namespaces| {
+                UpstreamResponseMode::Codex { namespaces }
+            }),
+            Some(AnthropicProtocol::Native) => UpstreamResponseMode::NativeAnthropic {
+                expose_thinking: native_vllm_messages || expose_thinking,
+                thinking_budget_approximated,
+            },
+            Some(AnthropicProtocol::Responses) => {
+                UpstreamResponseMode::ResponsesToAnthropic { expose_thinking }
             }
+            Some(AnthropicProtocol::Chat) => {
+                UpstreamResponseMode::ChatToAnthropic { expose_thinking }
+            }
+            Some(AnthropicProtocol::Auto) => unreachable!("Anthropic protocol must be resolved"),
         };
         let mut upstream_headers = HeaderMap::new();
         let connection_headers = connection_header_names(&request.headers);
         for (name, value) in &request.headers {
             if should_forward_request_header(name)
-                && should_forward_protocol_header(
-                    name,
-                    if matches!(&response_mode, UpstreamResponseMode::Deepseek(_)) {
-                        Some(AnthropicProtocol::Chat)
-                    } else {
-                        selected_protocol
-                    },
-                )
+                && should_forward_protocol_header(name, selected_protocol)
                 && !connection_headers.contains(name)
             {
                 upstream_headers.append(name, value.clone());

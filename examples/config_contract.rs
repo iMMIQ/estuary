@@ -3,9 +3,9 @@ use std::{fmt::Write as _, fs, path::PathBuf};
 
 use anyhow::Result;
 use estuary::config::{
-    AnthropicProtocol, CircuitBreakerConfig, HealthConfig, ModelCapabilityConfig, ModelFamily,
-    NodeConfig, PrefixConfig, ProviderConfig, ProviderKind, RetryConfig, RoutingConfig,
-    ServerConfig, SessionLogConfig, Settings, VllmKvEventsConfig,
+    AnthropicProtocol, CircuitBreakerConfig, HealthConfig, ModelCapabilityConfig, NodeConfig,
+    PrefixConfig, ProviderConfig, ProviderKind, RetryConfig, RoutingConfig, ServerConfig,
+    SessionLogConfig, Settings, VllmKvEventsConfig,
     contract::{
         NodeValidationRule, RESERVED_UPSTREAM_HEADERS, RuleCondition, RuleKind,
         editor_node_defaults, node_validation_rules,
@@ -51,7 +51,6 @@ fn main() -> Result<()> {
         NodeConfig,
         ProviderConfig,
         ModelCapabilityConfig,
-        ModelFamily,
         ProviderKind,
         AnthropicProtocol,
         VllmKvEventsConfig,
