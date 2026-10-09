@@ -213,6 +213,8 @@ fn usage(value: &Value, anthropic: bool) -> Value {
         .and_then(Value::as_u64);
     let write = raw
         .get("cache_creation_input_tokens")
+        .or_else(|| raw.pointer("/prompt_tokens_details/created_cache_tokens"))
+        .or_else(|| raw.pointer("/input_tokens_details/created_cache_tokens"))
         .and_then(Value::as_u64);
     let total_input = input.map(|n| {
         if anthropic {

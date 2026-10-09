@@ -103,43 +103,20 @@ fn flush(connection: &mut Option<rusqlite::Connection>, batch: &mut Vec<Command>
         batch.clear();
         return;
     };
-    let result = (|| -> anyhow::Result<()> {
-        let tx = db.transaction()?;
-        let mut cache = super::content::Cache::new();
-        for command in batch.iter_mut() {
-            match command {
-                Command::Start(record) => store::write_record(&tx, record)?,
-                Command::Finish(record, payloads) => {
-                    // Request exists before FK-bound payload rows; final metadata
-                    // is written again after usage extraction.
-                    store::write_record(&tx, record)?;
-                    store::write_payloads(&tx, record, payloads, &mut cache)?;
-                    let mut metadata = record.clone();
-                    metadata.attempts.clear();
-                    metadata.events.clear();
-                    let mut value = serde_json::to_value(metadata)?;
-                    super::inspect::redact(&mut value);
-                    tx.execute(
-                        "UPDATE requests SET data=?1 WHERE id=?2",
-                        rusqlite::params![serde_json::to_string(&value)?, record.id],
-                    )?;
-                    for attempt in &record.attempts {
-                        tx.execute(
-                            "UPDATE attempts SET data=?1 WHERE request_id=?2 AND number=?3",
-                            rusqlite::params![
-                                store::redacted_json(attempt)?,
-                                record.id,
-                                attempt.number
-                            ],
-                        )?;
-                    }
-                }
-                Command::Flush(_) => unreachable!(),
-            }
+    let mut result = write_batch(db, batch);
+    // WAL writers serialize. Give a short-lived competing batch a bounded
+    // chance to commit before dropping content or declaring the logger failed.
+    for _ in 1..4 {
+        let busy = result.as_ref().err().is_some_and(|error| {
+            matches!(error.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+        });
+        if !busy {
+            break;
         }
-        tx.commit()?;
-        Ok(())
-    })();
+        result = write_batch(db, batch);
+    }
     if let Err(error) = result {
         stats.write_errors.fetch_add(1, Ordering::Relaxed);
         stats.available.store(false, Ordering::Relaxed);
@@ -172,6 +149,44 @@ fn flush(connection: &mut Option<rusqlite::Connection>, batch: &mut Vec<Command>
         record_committed(batch, stats);
     }
     batch.clear();
+}
+
+fn write_batch(db: &mut rusqlite::Connection, batch: &mut [Command]) -> anyhow::Result<()> {
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut cache = super::content::Cache::new();
+    for command in batch.iter_mut() {
+        match command {
+            Command::Start(record) => store::write_record(&tx, record)?,
+            Command::Finish(record, payloads) => {
+                // Request exists before FK-bound payload rows; final metadata
+                // is written again after usage extraction.
+                store::write_record(&tx, record)?;
+                store::write_payloads(&tx, record, payloads, &mut cache)?;
+                let mut metadata = record.clone();
+                metadata.attempts.clear();
+                metadata.events.clear();
+                let mut value = serde_json::to_value(metadata)?;
+                super::inspect::redact(&mut value);
+                tx.execute(
+                    "UPDATE requests SET data=?1 WHERE id=?2",
+                    rusqlite::params![serde_json::to_string(&value)?, record.id],
+                )?;
+                for attempt in &record.attempts {
+                    tx.execute(
+                        "UPDATE attempts SET data=?1 WHERE request_id=?2 AND number=?3",
+                        rusqlite::params![
+                            store::redacted_json(attempt)?,
+                            record.id,
+                            attempt.number
+                        ],
+                    )?;
+                }
+            }
+            Command::Flush(_) => unreachable!(),
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn record_committed(batch: &[Command], stats: &Stats) {

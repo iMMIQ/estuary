@@ -118,6 +118,10 @@ complete observation. Body drops record cancellation separately. Crash recovery
 on Linux checks host boot identity, PID and process start time; it does not mark
 still-running overlapping workers interrupted. On other platforms, only clean
 writer shutdown marks its own unfinished requests; crash liveness stays unknown.
+The `streaming` flag remains true when streaming was requested, including errors
+returned as JSON; an observed SSE response also sets the flag.
+Final upstream HTTP errors use the `upstream` phase and `upstream_status` class.
+A failed attempt followed by a successful retry does not mark the request failed.
 
 Capture omits authorization/cookie headers, redacts common credential fields and
 embedded `sk-`, `sk_`, and `Bearer` token formats before hashing/storage, and
@@ -137,9 +141,11 @@ transaction attempts a metadata-only fallback with `capture_state=storage_error`
 
 SQLite uses WAL, `synchronous=NORMAL`, a 250 ms busy timeout, schema/application
 identification, and short write transactions. Overlapping workers can share the
-local log database. Shutdown flush runs within the existing remaining drain
-budget. Logging is best effort: process termination can lose queued records and
-power loss can lose recent NORMAL-mode commits. It is not an audit guarantee.
+local log database. The background writer retries transient write-lock failures
+up to four attempts (about one second of SQLite busy waits) before its normal
+metadata fallback; it does not block inference tasks. Shutdown flush runs within
+the existing remaining drain budget. Logging is best effort: process termination
+can lose queued records and power loss can lose recent NORMAL-mode commits. It is not an audit guarantee.
 No durable spool, external collector, multi-tenant namespaces, inference-based
 session grouping, CDC, full-text search, deletion UI or offline agent-loop analysis
 is implemented in this first release.

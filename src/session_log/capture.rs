@@ -230,7 +230,9 @@ impl Observation {
     pub(crate) fn headers(&self, status: u16, streaming: bool) {
         let mut pending = self.pending.lock();
         pending.record.http_status = Some(status);
-        pending.record.streaming = streaming;
+        // A streaming request can fail with a JSON error response. Preserve the
+        // requested mode so those failures remain visible in stream diagnostics.
+        pending.record.streaming |= streaming;
         pending.record.timings_us.insert(
             "headers_ready".to_owned(),
             super::micros(self.started.elapsed()),

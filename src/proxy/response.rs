@@ -184,6 +184,7 @@ pub(super) async fn proxy_error_response(
     let body = &buffered.bytes;
     if let Some(log) = &mut log_attempt {
         log.capture(body, false, false);
+        log.terminal_error("upstream", "upstream_status");
         log.finish("error", Some("upstream_status"));
     }
     if client_protocol == ClientProtocol::Anthropic {

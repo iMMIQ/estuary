@@ -337,6 +337,46 @@ fn native_vllm_request_reuses_an_unchanged_body() {
 }
 
 #[test]
+fn native_vllm_empty_tools_do_not_require_a_tool_parser() {
+    for choice in [None, Some(json!(null)), Some(json!({"type":"auto"}))] {
+        let mut request =
+            json!({"model":"m","tools":[],"messages":[{"role":"user","content":"hello"}]});
+        if let Some(choice) = choice {
+            request["tool_choice"] = choice;
+        }
+        let original = Bytes::from(serde_json::to_vec(&request).unwrap());
+        let (body, _, _) =
+            mapped_body(&original, Some(&request), Some("m"), Some("m"), true, false).unwrap();
+        let mapped: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(mapped.get("tools").is_none());
+        assert!(mapped.get("tool_choice").is_none());
+        assert_eq!(mapped["messages"], request["messages"]);
+        let (passthrough, _, _) = mapped_body(
+            &original,
+            Some(&request),
+            Some("m"),
+            Some("m"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(passthrough.as_ptr(), original.as_ptr());
+    }
+    for request in [
+        json!({"tools":[],"tool_choice":{"type":"any"}}),
+        json!({"tools":[],"tool_choice":{"type":"tool","name":"Read"}}),
+        json!({"tools":[],"tool_choice":{"type":"none"}}),
+        json!({"tools":[{"name":"Read"}]}),
+        json!({"tools":"invalid"}),
+    ] {
+        let original = Bytes::from(serde_json::to_vec(&request).unwrap());
+        let (mapped, _, _) =
+            mapped_body(&original, Some(&request), None, None, true, false).unwrap();
+        assert_eq!(mapped.as_ptr(), original.as_ptr());
+    }
+}
+
+#[test]
 fn maps_anthropic_thinking_to_vllm_template_control() {
     let mut enabled = json!({
         "max_tokens": 32000,

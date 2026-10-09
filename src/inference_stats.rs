@@ -53,7 +53,12 @@ impl Usage {
                 );
                 merge(
                     &mut usage.cache_write_tokens,
-                    reported.cache_creation_input_tokens,
+                    reported.cache_creation_input_tokens.or_else(|| {
+                        reported
+                            .prompt_tokens_details
+                            .or(reported.input_tokens_details)
+                            .and_then(|details| details.created_cache_tokens)
+                    }),
                 );
                 merge(
                     &mut usage.reasoning_tokens,
@@ -94,7 +99,13 @@ impl Usage {
             );
             merge(
                 &mut self.cache_write_tokens,
-                count(usage, "cache_creation_input_tokens"),
+                count(usage, "cache_creation_input_tokens").or_else(|| {
+                    usage
+                        .pointer("/prompt_tokens_details/created_cache_tokens")
+                        .or_else(|| usage.pointer("/input_tokens_details/created_cache_tokens"))
+                        .and_then(Value::as_u64)
+                        .and_then(|n| usize::try_from(n).ok())
+                }),
             );
             merge(
                 &mut self.reasoning_tokens,
@@ -149,9 +160,10 @@ struct ReasoningUsage {
     reasoning_tokens: Option<usize>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, Copy, serde::Deserialize)]
 struct CacheUsage {
     cached_tokens: Option<usize>,
+    created_cache_tokens: Option<usize>,
 }
 
 fn count(value: &Value, key: &str) -> Option<usize> {
@@ -407,5 +419,19 @@ mod tests {
         assert_eq!(usage.cached_tokens, Some(16));
         assert_eq!(usage.output_tokens, Some(5));
         assert_eq!(Usage::from_response(b"invalid").output_tokens, None);
+    }
+
+    #[test]
+    fn vllm_cache_creation_is_observed_in_buffered_and_streamed_usage() {
+        let value = serde_json::json!({"usage":{"prompt_tokens":100,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":40,"created_cache_tokens":32}}});
+        let buffered = Usage::from_response(&serde_json::to_vec(&value).unwrap());
+        let mut streamed = Usage::default();
+        streamed.observe(&value);
+        for usage in [buffered, streamed] {
+            assert_eq!(usage.input_tokens, Some(100));
+            assert_eq!(usage.cached_tokens, Some(40));
+            assert_eq!(usage.cache_write_tokens, Some(32));
+            assert_eq!(usage.log_value(false)["input_tokens"], 100);
+        }
     }
 }

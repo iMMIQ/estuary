@@ -9,6 +9,7 @@ use. The maintained technical documentation is organized by task:
 | [Configuration and operations](operations.md) | Runtime settings, node configuration, security, health checks, management endpoints, and metrics. |
 | [DeepSeek protocol conversion](deepseek.md) | Model family configuration and recipe adapters for Codex and Claude Code. |
 | [Native vLLM provider](vllm.md) | vLLM version requirements, telemetry, tokenization, KV events, and client compatibility. |
+| [Local end-to-end tests](local-e2e.md) | Real Claude Code tests with local vLLM, prebuilt llama.cpp, or an existing Ollama server. |
 | [Deployment](../deploy/README.md) | Static binary installation, Docker, zero-downtime rollout, rollback, and persistent paths. |
 | [Performance benchmark](performance.md) | Reproducible gateway-overhead benchmark commands and output. |
 | [Generated configuration contract](config-contract.md) | Canonical config types, defaults, validation rules, shared cases, and module boundaries. |

@@ -459,7 +459,12 @@ pub(super) fn mapped_body(
         && parsed
             .and_then(|value| value.get("thinking"))
             .is_some_and(|value| !value.is_null());
+    let remove_empty_native_tools = native_vllm_messages
+        && parsed
+            .and_then(Value::as_object)
+            .is_some_and(crate::anthropic::empty_tools_are_noop);
     if !rewrite_native_thinking
+        && !remove_empty_native_tools
         && !vllm_codex_responses
         && (upstream_model == public_model || upstream_model.is_none())
     {
@@ -474,6 +479,12 @@ pub(super) fn mapped_body(
     } else {
         false
     };
+    if remove_empty_native_tools {
+        // vLLM treats tools: [] as auto tool choice and requires a parser even
+        // for a text-only Claude Code request. Omitting both keeps its meaning.
+        object.remove("tools");
+        object.remove("tool_choice");
+    }
     let codex_namespaces = if vllm_codex_responses {
         codex::normalize_vllm_request(&mut value)?
     } else {

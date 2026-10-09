@@ -55,9 +55,14 @@ pub(crate) fn convert_request(body: &Value) -> Result<Value, GatewayError> {
         output.insert("stop".to_owned(), stop.clone());
     }
     if let Some(tools) = source.get("tools") {
-        output.insert("tools".to_owned(), convert_tools(tools)?);
+        let tools = convert_tools(tools)?;
+        if tools.as_array().is_some_and(|tools| !tools.is_empty()) {
+            output.insert("tools".to_owned(), tools);
+        }
     }
-    if let Some(choice) = source.get("tool_choice") {
+    if let Some(choice) = source.get("tool_choice")
+        && !crate::anthropic::empty_tools_are_noop(source)
+    {
         let (choice, parallel) = convert_tool_choice(choice)?;
         output.insert("tool_choice".to_owned(), choice);
         if let Some(parallel) = parallel {
@@ -109,9 +114,21 @@ fn convert_messages(messages: &[Value]) -> Result<Vec<Value>, GatewayError> {
     for message in messages {
         let object = object(message, "Anthropic message")?;
         let role = required_string(object, "role")?;
+        if !matches!(role, "user" | "assistant" | "system") {
+            return Err(GatewayError::InvalidRequest(format!(
+                "unsupported Anthropic message role '{role}'"
+            )));
+        }
         let content = object.get("content").ok_or_else(|| {
             GatewayError::InvalidRequest("Anthropic message is missing 'content'".to_owned())
         })?;
+        if role == "system" {
+            output.push(json!({
+                "type": "message", "role": "system",
+                "content": [{"type": "input_text", "text": convert_system(content)?}]
+            }));
+            continue;
+        }
         if let Some(text) = content.as_str() {
             output.push(json!({
                 "type": "message", "role": role,
@@ -580,7 +597,11 @@ fn response_usage(value: Option<&Value>) -> Value {
         .and_then(|value| value.get("output_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    json!({"input_tokens": total.saturating_sub(cached), "output_tokens": output, "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached})
+    let created = value
+        .and_then(|value| value.pointer("/input_tokens_details/created_cache_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    json!({"input_tokens": total.saturating_sub(cached).saturating_sub(created), "output_tokens": output, "cache_creation_input_tokens": created, "cache_read_input_tokens": cached})
 }
 
 fn anthropic_id(id: Option<&str>) -> String {
@@ -1013,6 +1034,61 @@ fn emit(output: &mut Vec<sse::Event>, name: &str, value: Value) -> Result<(), Ga
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responses_cache_creation_is_not_double_counted() {
+        let converted = response_usage(Some(
+            &json!({"input_tokens":100,"output_tokens":4,"input_tokens_details":{"cached_tokens":40,"created_cache_tokens":32}}),
+        ));
+        assert_eq!(converted["input_tokens"], 28);
+        assert_eq!(converted["cache_read_input_tokens"], 40);
+        assert_eq!(converted["cache_creation_input_tokens"], 32);
+    }
+
+    #[test]
+    fn empty_tools_are_omitted_without_masking_required_tool_choice() {
+        for choice in [None, Some(json!(null)), Some(json!({"type":"auto"}))] {
+            let mut source = json!({"model":"m","max_tokens":64,"tools":[],"messages":[{"role":"user","content":"hello"}]});
+            if let Some(choice) = choice {
+                source["tool_choice"] = choice;
+            }
+            let converted = convert_request(&source).unwrap();
+            assert!(converted.get("tools").is_none());
+            assert!(converted.get("tool_choice").is_none());
+        }
+        let converted = convert_request(&json!({"model":"m","max_tokens":64,"tools":[],"tool_choice":{"type":"any"},"messages":[{"role":"user","content":"hello"}]})).unwrap();
+        assert_eq!(converted["tool_choice"], "required");
+    }
+
+    #[test]
+    fn inline_system_context_keeps_its_role_and_position() {
+        for content in [
+            json!("environment"),
+            json!([{"type":"text","text":"environment","cache_control":{"type":"ephemeral"}}]),
+        ] {
+            let converted = convert_request(&json!({
+                "model":"m", "max_tokens":64, "system":"instructions",
+                "messages":[{"role":"user","content":"task"},{"role":"system","content":content},{"role":"assistant","content":"answer"}]
+            })).unwrap();
+            assert_eq!(converted["instructions"], "instructions");
+            assert_eq!(converted["input"][0]["role"], "user");
+            assert_eq!(
+                converted["input"][1],
+                json!({"type":"message","role":"system","content":[{"type":"input_text","text":"environment"}]})
+            );
+            assert_eq!(converted["input"][2]["role"], "assistant");
+        }
+        for (role, content) in [
+            ("unknown", json!("bad")),
+            ("unknown", json!([])),
+            (
+                "system",
+                json!([{"type":"tool_use","id":"t","name":"Read","input":{}}]),
+            ),
+        ] {
+            assert!(convert_request(&json!({"model":"m","max_tokens":64,"messages":[{"role":role,"content":content}]})).is_err());
+        }
+    }
 
     #[test]
     fn responses_request_preserves_multimodal_tool_results() {

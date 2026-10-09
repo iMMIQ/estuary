@@ -427,7 +427,10 @@ async fn anthropic_messages_maps_request_response_and_claude_code_system() {
                 {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.220.8a5; cc_entrypoint=sdk-cli;"},
                 {"type": "text", "text": "Use tools carefully", "cache_control": {"type": "ephemeral"}}
             ],
-            "messages": [{"role": "user", "content": "hello"}],
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "system", "content": [{"type":"text","text":"CLI environment","cache_control":{"type":"ephemeral"}}]}
+            ],
             "tools": [{"name": "Read", "input_schema": {"type": "object", "properties": {}}}]
         }))
         .send()
@@ -468,6 +471,10 @@ async fn anthropic_messages_maps_request_response_and_claude_code_system() {
         json!({"role": "system", "content": "Use tools carefully"})
     );
     assert_eq!(upstream_body["messages"][1]["role"], "user");
+    assert_eq!(
+        upstream_body["messages"][2],
+        json!({"role":"system","content":"CLI environment"})
+    );
     assert_eq!(upstream_body["tools"][0]["function"]["name"], "Read");
     assert_eq!(upstream_body["max_completion_tokens"], 128);
     assert!(upstream_body.get("max_tokens").is_none());
@@ -511,7 +518,7 @@ async fn anthropic_messages_use_configured_responses_adapter() {
         .json(&json!({
             "model":"claude", "max_tokens":512,
             "system":"be concise",
-            "messages":[{"role":"user","content":"hello"}],
+            "messages":[{"role":"user","content":"hello"},{"role":"system","content":[{"type":"text","text":"CLI environment"}]}],
             "tools":[{"name":"Read","description":"read a file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]
         }))
         .send()
@@ -540,6 +547,10 @@ async fn anthropic_messages_use_configured_responses_adapter() {
     assert_eq!(request["store"], false);
     assert_eq!(request["max_output_tokens"], 512);
     assert_eq!(request["instructions"], "be concise");
+    assert_eq!(
+        request["input"][1],
+        json!({"type":"message","role":"system","content":[{"type":"input_text","text":"CLI environment"}]})
+    );
     assert_eq!(request["tools"][0]["type"], "function");
 }
 
@@ -895,6 +906,7 @@ async fn vllm_native_anthropic_supports_hello_messages_and_count_tokens() {
                 "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
             },
             "output_config": {"effort": "high"},
+            "tools": [],
             "future_claude_code_field": {"preserved": true}
         }))
         .send()
@@ -922,6 +934,7 @@ async fn vllm_native_anthropic_supports_hello_messages_and_count_tokens() {
     assert_eq!(captured["future_claude_code_field"]["preserved"], true);
     assert_eq!(captured["system"].as_array().unwrap().len(), 1);
     assert_eq!(captured["messages"][0]["role"], "system");
+    assert!(captured.get("tools").is_none());
 
     let count = client
         .post(format!(

@@ -235,6 +235,57 @@ async fn bounded_capture_and_full_queue_leave_finalization_capacity() {
 }
 
 #[tokio::test]
+async fn transient_writer_contention_keeps_content_and_logger_available() {
+    let db = Database::new();
+    let sink = LogSink::new(SessionLogConfig {
+        database: Some(db.0.clone()),
+        ..SessionLogConfig::default()
+    });
+    assert!(sink.flush(Duration::from_secs(3)).await);
+    let (ready, locked) = std::sync::mpsc::channel();
+    let path = db.0.clone();
+    let competing = std::thread::spawn(move || {
+        let mut connection = store::open(&path).unwrap();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        ready.send(()).unwrap();
+        // Longer than the configured 250 ms busy timeout, within the writer's
+        // bounded retry budget. No request task waits on the SQLite lock.
+        std::thread::sleep(Duration::from_millis(350));
+        tx.commit().unwrap();
+    });
+    locked.recv_timeout(Duration::from_secs(3)).unwrap();
+    let log = sink
+        .begin("/v1/chat/completions", &HeaderMap::new(), "locked")
+        .unwrap();
+    log.request_body(
+        br#"{"model":"m","messages":[{"role":"user","content":"retained"}]}"#,
+        0,
+    );
+    log.headers(200, false);
+    log.downstream_done(true);
+    assert!(sink.flush(Duration::from_secs(3)).await);
+    competing.join().unwrap();
+    let status = sink.status();
+    assert!(status.available);
+    assert_eq!(status.write_errors, 0);
+    assert_eq!(status.dropped, 0);
+    let row = sink
+        .list(None, None, 0, 10)
+        .await
+        .unwrap()
+        .requests
+        .remove(0);
+    let detail = sink.detail(row.id).await.unwrap().unwrap();
+    assert_eq!(detail.request.capture_state, "captured");
+    assert_eq!(
+        detail.payloads[0].content["messages"][0]["content"],
+        "retained"
+    );
+}
+
+#[tokio::test]
 async fn overlapping_writers_share_content_without_losing_or_overwriting_records() {
     let db = Database::new();
     let config = SessionLogConfig {

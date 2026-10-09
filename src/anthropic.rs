@@ -52,6 +52,17 @@ pub(crate) fn thinking_requested(body: &Value) -> bool {
         })
 }
 
+pub(crate) fn empty_tools_are_noop(object: &Map<String, Value>) -> bool {
+    object
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+        && match object.get("tool_choice") {
+            None | Some(Value::Null) => true,
+            Some(choice) => choice.get("type").and_then(Value::as_str) == Some("auto"),
+        }
+}
+
 fn convert_request_inner(body: &Value, generation: bool) -> Result<Value, GatewayError> {
     let object = body.as_object().ok_or_else(|| {
         GatewayError::InvalidRequest("JSON request body must be an object".to_owned())
@@ -122,9 +133,14 @@ fn convert_request_inner(body: &Value, generation: bool) -> Result<Value, Gatewa
         output.insert("stream_options".to_owned(), json!({"include_usage": true}));
     }
     if let Some(tools) = object.get("tools") {
-        output.insert("tools".to_owned(), convert_tools(tools)?);
+        let tools = convert_tools(tools)?;
+        if tools.as_array().is_some_and(|tools| !tools.is_empty()) {
+            output.insert("tools".to_owned(), tools);
+        }
     }
-    if let Some(choice) = object.get("tool_choice") {
+    if let Some(choice) = object.get("tool_choice")
+        && !empty_tools_are_noop(object)
+    {
         let (choice, parallel) = convert_tool_choice(choice)?;
         output.insert("tool_choice".to_owned(), choice);
         if let Some(parallel) = parallel {
@@ -275,7 +291,7 @@ fn convert_message(message: &Value, output: &mut Vec<Value>) -> Result<(), Gatew
         GatewayError::InvalidRequest("Anthropic messages must be objects".to_owned())
     })?;
     let role = required_string(object, "role")?;
-    if !matches!(role, "user" | "assistant") {
+    if !matches!(role, "user" | "assistant" | "system") {
         return Err(GatewayError::InvalidRequest(format!(
             "unsupported Anthropic message role '{role}'"
         )));
@@ -283,6 +299,10 @@ fn convert_message(message: &Value, output: &mut Vec<Value>) -> Result<(), Gatew
     let content = object.get("content").ok_or_else(|| {
         GatewayError::InvalidRequest("Anthropic message is missing 'content'".to_owned())
     })?;
+    if role == "system" {
+        output.push(json!({"role": "system", "content": text_content(content, "system")?}));
+        return Ok(());
+    }
     if let Some(text) = content.as_str() {
         output.push(json!({"role": role, "content": text}));
         return Ok(());
@@ -675,10 +695,14 @@ fn usage(value: Option<&Value>) -> Value {
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let created = value
+        .and_then(|usage| usage.pointer("/prompt_tokens_details/created_cache_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     json!({
-        "input_tokens": input.saturating_sub(cached),
+        "input_tokens": input.saturating_sub(cached).saturating_sub(created),
         "output_tokens": output,
-        "cache_creation_input_tokens": 0,
+        "cache_creation_input_tokens": created,
         "cache_read_input_tokens": cached
     })
 }
@@ -1207,6 +1231,61 @@ pub(crate) fn set_anthropic_content_type(response: &mut Response, streaming: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_cache_creation_is_not_double_counted_in_anthropic_usage() {
+        let converted = usage(Some(
+            &json!({"prompt_tokens":100,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":40,"created_cache_tokens":32}}),
+        ));
+        assert_eq!(converted["input_tokens"], 28);
+        assert_eq!(converted["cache_read_input_tokens"], 40);
+        assert_eq!(converted["cache_creation_input_tokens"], 32);
+        assert_eq!(converted["output_tokens"], 4);
+    }
+
+    #[test]
+    fn empty_tools_are_omitted_without_masking_required_tool_choice() {
+        for choice in [None, Some(json!(null)), Some(json!({"type":"auto"}))] {
+            let mut source = json!({"model":"m","max_tokens":64,"tools":[],"messages":[{"role":"user","content":"hello"}]});
+            if let Some(choice) = choice {
+                source["tool_choice"] = choice;
+            }
+            let converted = convert_request(&source).unwrap();
+            assert!(converted.get("tools").is_none());
+            assert!(converted.get("tool_choice").is_none());
+        }
+        let converted = convert_request(&json!({"model":"m","max_tokens":64,"tools":[],"tool_choice":{"type":"any"},"messages":[{"role":"user","content":"hello"}]})).unwrap();
+        assert_eq!(converted["tool_choice"], "required");
+    }
+
+    #[test]
+    fn inline_system_context_keeps_its_role_and_position() {
+        for content in [
+            json!("environment"),
+            json!([{"type":"text","text":"environment","cache_control":{"type":"ephemeral"}}]),
+        ] {
+            let converted = convert_request(&json!({
+                "model":"m", "max_tokens":64, "system":"instructions",
+                "messages":[{"role":"user","content":"task"},{"role":"system","content":content},{"role":"assistant","content":"answer"}]
+            })).unwrap();
+            assert_eq!(
+                converted["messages"][0],
+                json!({"role":"system","content":"instructions"})
+            );
+            assert_eq!(converted["messages"][1]["role"], "user");
+            assert_eq!(
+                converted["messages"][2],
+                json!({"role":"system","content":"environment"})
+            );
+            assert_eq!(converted["messages"][3]["role"], "assistant");
+        }
+        for content in [
+            json!([{"type":"tool_result","tool_use_id":"t","content":"bad"}]),
+            json!([{"type":"image","source":{"type":"url","url":"https://example.test/a.png"}}]),
+        ] {
+            assert!(convert_request(&json!({"model":"m","max_tokens":64,"messages":[{"role":"system","content":content}]})).is_err());
+        }
+    }
 
     async fn rewrite_native_chunks(chunks: Vec<&[u8]>, expose_thinking: bool) -> String {
         let events = sse::parse_chunks(chunks.into_iter().map(Bytes::copy_from_slice).collect())

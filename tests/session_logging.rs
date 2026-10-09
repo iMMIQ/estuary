@@ -205,6 +205,8 @@ async fn retry_keeps_failed_attempt_and_final_success() {
         .unwrap();
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert_eq!(detail.request.outcome, "success");
+    assert_eq!(detail.request.error_phase, None);
+    assert_eq!(detail.request.error_class, None);
     assert_eq!(detail.request.attempts.len(), 2);
     assert_eq!(detail.request.attempts[0].http_status, Some(503));
     assert_eq!(
@@ -428,6 +430,66 @@ async fn deepseek_recipe_records_both_client_protocols_and_mapped_upstream() {
         } else if !detail.request.streaming {
             assert_eq!(payload.content["type"], "message");
         }
+    }
+}
+
+#[tokio::test]
+async fn vllm_cache_creation_is_logged_with_and_without_content_capture() {
+    let upstream = Server::spawn(Router::new().route("/v1/chat/completions", post(|| async {
+        Json(json!({"choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":40,"created_cache_tokens":32}}}))
+    }))).await;
+    for capture_content in [true, false] {
+        let db = Database::new();
+        let mut config = settings(&db, vec![node("n", &upstream.url)]);
+        config.session_log.capture_content = capture_content;
+        let (public, _, logs) = logged_gateway(config).await;
+        let response = client()
+            .post(format!("{}/v1/chat/completions", public.url))
+            .json(&json!({"model":"m","messages":[{"role":"user","content":"hello"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        assert!(logs.flush(Duration::from_secs(3)).await);
+        let page = logs.list(None, None, 0, 10).await.unwrap();
+        let usage = &page.requests[0].usage;
+        assert_eq!(usage["input_tokens"], 100);
+        assert_eq!(usage["cache_read_tokens"], 40);
+        assert_eq!(usage["cache_write_tokens"], 32);
+        assert_eq!(usage["output_tokens"], 4);
+    }
+}
+
+#[tokio::test]
+async fn streaming_request_errors_keep_the_requested_mode() {
+    let upstream = Server::spawn(Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":{"message":"invalid request"}})),
+            )
+        }),
+    ))
+    .await;
+    let db = Database::new();
+    let (public, _, logs) = logged_gateway(settings(&db, vec![node("n", &upstream.url)])).await;
+    for streaming in [false, true] {
+        let response = client()
+            .post(format!("{}/v1/chat/completions", public.url))
+            .json(&json!({"model":"m","stream":streaming,"messages":[{"role":"user","content":"hello"}]}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        response.bytes().await.unwrap();
+        assert!(logs.flush(Duration::from_secs(3)).await);
+        let page = logs.list(None, None, 0, 10).await.unwrap();
+        let request = &page.requests[0];
+        assert_eq!(request.streaming, streaming);
+        assert_eq!(request.outcome, "error");
+        assert_eq!(request.http_status, Some(400));
+        assert_eq!(request.error_phase.as_deref(), Some("upstream"));
+        assert_eq!(request.error_class.as_deref(), Some("upstream_status"));
     }
 }
 
