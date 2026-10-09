@@ -82,6 +82,55 @@ preapprove only the fixed local nonce tool for unattended execution, using the
 official per-tool approval setting. The provider configuration
 follows the official [custom-provider configuration](https://learn.chatgpt.com/docs/config-file/config-advanced).
 
+## OpenCode v2 Chat and Responses
+
+Use the real OpenCode v2 CLI with the same llama.cpp server:
+
+```bash
+python3 tests/opencode_cpu_e2e.py \
+  --upstream http://127.0.0.1:18000/v1 --model qwen35-cpu \
+  --output target/opencode-llama-cpu-e2e/runs
+```
+
+The script starts its own loopback OpenCode server and connects the CLI with
+`run --server`. It waits for agent and MCP readiness before submitting a prompt,
+using fresh XDG configuration/data/cache/state paths and a small custom agent.
+It removes inherited `PWD` because OpenCode
+2.0.24 prefers that variable over the subprocess working directory. Only the
+fixed local `nonce_read` MCP tool is allowed; shell, web and subagents are denied.
+The MCP server has `codemode: false` to expose its tool directly to the model.
+On the tested 2.0.24 cold `run --standalone` path, the first model request omitted
+tools despite a successful MCP connection. Waiting for the owned server's
+agent/MCP APIs before `run --server` produced the actual nonce roundtrip; retain
+these readiness checks instead of treating a fabricated model answer as success.
+See the official [v2 provider](https://opencode.ai/v2/docs/providers),
+[MCP](https://opencode.ai/v2/docs/mcp-servers), and
+[permission](https://opencode.ai/v2/docs/permissions) configuration.
+
+Chat uses `@opencode/ai/providers/openai-compatible`; Responses uses the bundled
+`@opencode/ai/providers/openai/responses`. OpenCode 2.0.24 does not bundle the
+`openai-compatible/responses` entry point even though current documentation
+lists it, so that package path fails before sending a request.
+
+Both protocols must stream `CPU_OK`, execute exactly one MCP call, replay its
+fresh random nonce upstream, and return that exact nonce. The nonce is absent
+from the initial prompt. The script verifies protocol attribution, four payload
+stages, token usage and timing, logger health, released reservations, SQLite
+integrity, exact payload DAG reference counts, and shared message prefixes.
+This isolates protocol behavior; it does not assess general coding ability or
+OpenCode Code Mode. Use `--protocols chat` or `--protocols responses`
+to isolate a path while diagnosing a failure.
+
+With the tested Qwen3.5-0.8B Q4_0 and llama.cpp b11516 combination, consecutive
+Chat/Responses runs passed Chat text and the real nonce roundtrip, Responses
+text, logger health, scheduler release and payload DAG integrity. The Responses
+nonce case sometimes returned an empty JSON object field as ordinary text
+instead of calling the tool, despite correct captured function definitions.
+Replaying the same request directly on a fresh backend produced the function
+call with both omitted and explicit `tool_choice: auto`; this does not establish
+a gateway or default-tool-choice bug. Keep the failing CLI transcripts and do
+not count this case as passed merely because the API returned HTTP 200.
+
 ## Ollama
 
 For an existing Ollama server with a tool-capable model, use its loopback
