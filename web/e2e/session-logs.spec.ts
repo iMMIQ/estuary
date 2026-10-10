@@ -72,7 +72,13 @@ test("explores session logs, details, payloads and pagination", async ({ page })
               adapter: "passthrough",
               outcome: "success",
               http_status: 200,
-              timings_us: { total: 15000 },
+              timings_us: {
+                total: 15000,
+                engine_time_to_first_token: 12500,
+                engine_generation_time: 30000,
+                engine_queue_time: 0,
+                engine_mean_itl: 1250,
+              },
               route: { score: 0.5 },
             },
           ],
@@ -98,6 +104,12 @@ test("explores session logs, details, payloads and pagination", async ({ page })
   await expect(page.getByRole("cell", { name: "gateway-chat openai_responses" })).toBeVisible();
   await page.getByLabel("Request details request-a").click();
   await expect(page.getByText("#1 · upstream-a · success")).toBeVisible();
+  const attempt = page.locator(".log-attempt");
+  await expect(attempt.getByText("Engine queue", { exact: true })).toBeVisible();
+  await expect(attempt.getByText("0.0 ms", { exact: true })).toBeVisible();
+  await expect(attempt.getByText("Engine first token", { exact: true })).toBeVisible();
+  await expect(attempt.getByText("12.5 ms", { exact: true })).toBeVisible();
+  await expect(attempt.getByText("Engine mean token interval", { exact: true })).toBeVisible();
   await expect(page.getByText("investigate this code")).toHaveCount(0);
   await page.getByRole("button", { name: "Expand", exact: true }).click();
   await expect(page.locator("pre").filter({ hasText: "investigate this code" })).toBeVisible();

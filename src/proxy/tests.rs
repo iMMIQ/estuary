@@ -1,7 +1,7 @@
 use super::headers::{connection_header_names, should_forward_request_header};
 use super::request_compat::apply_vllm_native_thinking_compat;
 use super::streaming::{LimitedSseInput, SseInputError};
-use super::upstream::mapped_body;
+use super::upstream::{NativeMessagesCompat, mapped_body};
 use axum::http::{HeaderName, HeaderValue};
 use std::io;
 
@@ -326,7 +326,7 @@ fn native_vllm_request_reuses_an_unchanged_body() {
         Some(&parsed),
         Some("model"),
         Some("model"),
-        true,
+        NativeMessagesCompat::Legacy,
         false,
         false,
     )
@@ -351,7 +351,7 @@ fn native_vllm_empty_tools_do_not_require_a_tool_parser() {
             Some(&request),
             Some("m"),
             Some("m"),
-            true,
+            NativeMessagesCompat::Legacy,
             false,
             false,
         )
@@ -365,7 +365,7 @@ fn native_vllm_empty_tools_do_not_require_a_tool_parser() {
             Some(&request),
             Some("m"),
             Some("m"),
-            false,
+            NativeMessagesCompat::None,
             false,
             false,
         )
@@ -380,8 +380,16 @@ fn native_vllm_empty_tools_do_not_require_a_tool_parser() {
         json!({"tools":"invalid"}),
     ] {
         let original = Bytes::from(serde_json::to_vec(&request).unwrap());
-        let (mapped, _, _) =
-            mapped_body(&original, Some(&request), None, None, true, false, false).unwrap();
+        let (mapped, _, _) = mapped_body(
+            &original,
+            Some(&request),
+            None,
+            None,
+            NativeMessagesCompat::Legacy,
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(mapped.as_ptr(), original.as_ptr());
     }
 }

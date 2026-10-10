@@ -1,6 +1,8 @@
 //! Bounded, observational SSE inspection. It never changes or rejects upstream bytes.
 
-use serde_json::Value;
+use std::{collections::BTreeMap, time::Duration};
+
+use serde_json::{Value, value::RawValue};
 
 const MAX_OBSERVATION_BYTES: usize = 64 * 1024;
 
@@ -57,7 +59,9 @@ impl Usage {
                         reported
                             .prompt_tokens_details
                             .or(reported.input_tokens_details)
-                            .and_then(|details| details.created_cache_tokens)
+                            .and_then(|details| {
+                                details.cache_write_tokens.or(details.created_cache_tokens)
+                            })
                     }),
                 );
                 merge(
@@ -101,7 +105,8 @@ impl Usage {
                 &mut self.cache_write_tokens,
                 count(usage, "cache_creation_input_tokens").or_else(|| {
                     usage
-                        .pointer("/prompt_tokens_details/created_cache_tokens")
+                        .pointer("/input_tokens_details/cache_write_tokens")
+                        .or_else(|| usage.pointer("/prompt_tokens_details/created_cache_tokens"))
                         .or_else(|| usage.pointer("/input_tokens_details/created_cache_tokens"))
                         .and_then(Value::as_u64)
                         .and_then(|n| usize::try_from(n).ok())
@@ -161,9 +166,90 @@ struct ReasoningUsage {
 }
 
 #[derive(Clone, Copy, serde::Deserialize)]
+#[allow(clippy::struct_field_names)]
 struct CacheUsage {
     cached_tokens: Option<usize>,
     created_cache_tokens: Option<usize>,
+    cache_write_tokens: Option<usize>,
+}
+
+/// Only the fixed duration fields are retained; upstream milliseconds become
+/// microseconds under separate engine_* keys, never replacing gateway timers.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProviderTimings {
+    values: [Option<u64>; 4],
+}
+
+const PROVIDER_TIMING_FIELDS: [(&str, &str); 4] = [
+    ("time_to_first_token_ms", "engine_time_to_first_token"),
+    ("generation_time_ms", "engine_generation_time"),
+    ("queue_time_ms", "engine_queue_time"),
+    ("mean_itl_ms", "engine_mean_itl"),
+];
+
+impl ProviderTimings {
+    pub fn from_response(bytes: &[u8]) -> Self {
+        let mut timings = Self::default();
+        // Borrow metrics without allocating response content or unbounded metric
+        // objects. Unknown, malformed and oversized metrics are observational.
+        if let Ok(envelope) = serde_json::from_slice::<TimingEnvelope<'_>>(bytes) {
+            for raw in [envelope.metrics, envelope.response.and_then(|r| r.metrics)]
+                .into_iter()
+                .flatten()
+            {
+                if raw.get().len() <= MAX_OBSERVATION_BYTES
+                    && let Ok(value) = serde_json::from_str(raw.get())
+                {
+                    timings.observe_metrics(&value);
+                }
+            }
+        }
+        timings
+    }
+
+    pub fn observe(&mut self, value: &Value) {
+        for metrics in [value.get("metrics"), value.pointer("/response/metrics")]
+            .into_iter()
+            .flatten()
+        {
+            self.observe_metrics(metrics);
+        }
+    }
+
+    fn observe_metrics(&mut self, metrics: &Value) {
+        for (slot, (source, _)) in self.values.iter_mut().zip(PROVIDER_TIMING_FIELDS) {
+            if let Some(micros) = metrics
+                .get(source)
+                .and_then(Value::as_f64)
+                .and_then(|ms| Duration::try_from_secs_f64(ms / 1000.0).ok())
+                .and_then(|duration| u64::try_from(duration.as_micros()).ok())
+            {
+                *slot = Some(micros);
+            }
+        }
+    }
+
+    pub fn write_to(self, timings: &mut BTreeMap<String, u64>) {
+        for (value, (_, name)) in self.values.into_iter().zip(PROVIDER_TIMING_FIELDS) {
+            if let Some(value) = value {
+                timings.insert(name.to_owned(), value);
+            }
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TimingEnvelope<'a> {
+    #[serde(borrow)]
+    metrics: Option<&'a RawValue>,
+    #[serde(borrow)]
+    response: Option<NestedTimings<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct NestedTimings<'a> {
+    #[serde(borrow)]
+    metrics: Option<&'a RawValue>,
 }
 
 fn count(value: &Value, key: &str) -> Option<usize> {
@@ -193,6 +279,7 @@ pub(crate) struct StreamObservation {
     pub error_seen: bool,
     pub has_visible_text: bool,
     pub usage: Usage,
+    pub provider_timings: ProviderTimings,
 }
 
 impl StreamObservation {
@@ -220,6 +307,7 @@ impl StreamObservation {
                 );
             self.has_visible_text |= visible_text(&value);
             self.usage.observe(&value);
+            self.provider_timings.observe(&value);
             self.has_output |= has_generation(&value);
         } else {
             self.incomplete = true;
@@ -432,6 +520,54 @@ mod tests {
             assert_eq!(usage.cached_tokens, Some(40));
             assert_eq!(usage.cache_write_tokens, Some(32));
             assert_eq!(usage.log_value(false)["input_tokens"], 100);
+        }
+    }
+
+    #[test]
+    fn responses_cache_writes_and_engine_timings_are_bounded_and_observational() {
+        for writes in [0, 32] {
+            let response = serde_json::json!({"usage":{"input_tokens":100,"output_tokens":4,"input_tokens_details":{"cached_tokens":40,"cache_write_tokens":writes}},"metrics":{"time_to_first_token_ms":12.5,"generation_time_ms":30,"queue_time_ms":0,"mean_itl_ms":1.25,"tokens_per_second":100,"unknown":42}});
+            for value in [
+                response.clone(),
+                serde_json::json!({"type":"response.completed","response":response}),
+            ] {
+                let bytes = serde_json::to_vec(&value).unwrap();
+                let mut streamed = StreamObservation::default();
+                streamed.observe_json(&bytes);
+                for usage in [Usage::from_response(&bytes), streamed.usage] {
+                    assert_eq!(usage.cache_write_tokens, Some(writes));
+                    assert_eq!(usage.cached_tokens, Some(40));
+                    assert_eq!(usage.log_value(false)["input_tokens"], 100);
+                }
+                for timings in [
+                    ProviderTimings::from_response(&bytes),
+                    streamed.provider_timings,
+                ] {
+                    let mut recorded = BTreeMap::from([("total".to_owned(), 123)]);
+                    timings.write_to(&mut recorded);
+                    assert_eq!(recorded.len(), 5);
+                    assert_eq!(recorded["total"], 123);
+                    assert_eq!(recorded["engine_time_to_first_token"], 12_500);
+                    assert_eq!(recorded["engine_generation_time"], 30_000);
+                    assert_eq!(recorded["engine_queue_time"], 0);
+                    assert_eq!(recorded["engine_mean_itl"], 1_250);
+                }
+            }
+        }
+        for metrics in [
+            serde_json::json!(null),
+            serde_json::json!("invalid"),
+            serde_json::json!({"queue_time_ms":-1,"mean_itl_ms":1e300,"generation_time_ms":"invalid","time_to_first_token_ms":null}),
+            serde_json::json!({"queue_time_ms":1,"unknown":"x".repeat(MAX_OBSERVATION_BYTES)}),
+        ] {
+            let bytes = serde_json::to_vec(
+                &serde_json::json!({"usage":{"input_tokens":7},"metrics":metrics}),
+            )
+            .unwrap();
+            let mut recorded = BTreeMap::new();
+            ProviderTimings::from_response(&bytes).write_to(&mut recorded);
+            assert!(recorded.is_empty());
+            assert_eq!(Usage::from_response(&bytes).input_tokens, Some(7));
         }
     }
 }

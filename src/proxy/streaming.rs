@@ -560,6 +560,9 @@ impl BodyGuard {
                     crate::session_log::micros(self.upstream_started.elapsed()),
                 );
                 attempt.usage = self.observation.usage.log_value(self.anthropic_usage);
+                self.observation
+                    .provider_timings
+                    .write_to(&mut attempt.timings_us);
             });
             if self.observation.error_seen {
                 log.terminal_error("stream", "upstream_stream_error");

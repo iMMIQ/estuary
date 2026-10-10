@@ -22,6 +22,13 @@ use super::response::{buffered_success_response, proxy_error_response};
 use super::streaming::streaming_response;
 use super::{ProxyRequest, UpstreamResponseMode};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeMessagesCompat {
+    None,
+    Legacy,
+    NativeThinking,
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) async fn proxy_with_retries(
     state: Arc<AppState>,
@@ -140,7 +147,13 @@ pub(super) async fn proxy_with_retries(
             upstream_parsed,
             selection.upstream_model.as_deref(),
             request.public_model.as_deref(),
-            native_vllm_messages,
+            if !native_vllm_messages {
+                NativeMessagesCompat::None
+            } else if node.vllm_native_anthropic_thinking() {
+                NativeMessagesCompat::NativeThinking
+            } else {
+                NativeMessagesCompat::Legacy
+            },
             vllm_codex_responses,
             flatten_codex_namespaces,
         )?;
@@ -416,15 +429,15 @@ pub(super) fn mapped_body(
     parsed: Option<&Value>,
     upstream_model: Option<&str>,
     public_model: Option<&str>,
-    native_vllm_messages: bool,
+    native_messages: NativeMessagesCompat,
     vllm_codex_responses: bool,
     flatten_codex_namespaces: bool,
 ) -> Result<(Bytes, bool, Option<Arc<codex::NamespaceMap>>), GatewayError> {
-    let rewrite_native_thinking = native_vllm_messages
+    let rewrite_native_thinking = native_messages == NativeMessagesCompat::Legacy
         && parsed
             .and_then(|value| value.get("thinking"))
             .is_some_and(|value| !value.is_null());
-    let remove_empty_native_tools = native_vllm_messages
+    let remove_empty_native_tools = native_messages != NativeMessagesCompat::None
         && parsed
             .and_then(Value::as_object)
             .is_some_and(crate::anthropic::empty_tools_are_noop);

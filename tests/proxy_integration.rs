@@ -490,7 +490,7 @@ async fn responses_anthropic_response(
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(
-            r#"{"id":"resp_1","object":"response","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]},{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"path\":\"a\"}"}],"usage":{"input_tokens":100,"output_tokens":8,"input_tokens_details":{"cached_tokens":40}}}"#,
+            r#"{"id":"resp_1","object":"response","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]},{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"path\":\"a\"}"}],"usage":{"input_tokens":100,"output_tokens":8,"input_tokens_details":{"cached_tokens":40,"cache_write_tokens":32}}}"#,
         ))
         .expect("Responses response")
 }
@@ -530,8 +530,9 @@ async fn anthropic_messages_use_configured_responses_adapter() {
     );
     assert_eq!(response["content"][1]["type"], "tool_use");
     assert_eq!(response["stop_reason"], "tool_use");
-    assert_eq!(response["usage"]["input_tokens"], 60);
+    assert_eq!(response["usage"]["input_tokens"], 28);
     assert_eq!(response["usage"]["cache_read_input_tokens"], 40);
+    assert_eq!(response["usage"]["cache_creation_input_tokens"], 32);
 
     let captured = timeout(IO_TIMEOUT, receiver.recv())
         .await
@@ -736,6 +737,86 @@ struct NativeAnthropicCapture {
 
 async fn vllm_version() -> Json<Value> {
     Json(json!({"version": "0.25.0"}))
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn native_thinking_is_selected_by_version_for_buffered_and_streaming_requests() {
+    for (version, native) in [
+        ("0.25.0", false),
+        ("0.30.0", false),
+        ("0.31.0", true),
+        ("0.32.0+custom", true),
+        ("dev", false),
+        ("0.31.0.dev123", false),
+    ] {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let upstream = TestServer::spawn(
+            Router::new()
+                .route("/version", axum::routing::get(move || async move { Json(json!({"version":version})) }))
+                .route("/metrics", axum::routing::get(vllm_metrics))
+                .route("/v1/messages", post(move |Json(body): Json<Value>| {
+                    let sender = sender.clone();
+                    async move {
+                        let streaming = body["stream"] == true;
+                        sender.send(body).unwrap();
+                        if streaming {
+                            Response::builder()
+                                .header(CONTENT_TYPE, "text/event-stream")
+                                .body(Body::from("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"internal-model\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+                                .unwrap()
+                        } else {
+                            Response::builder().header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(r#"{"id":"msg","type":"message","role":"assistant","model":"internal-model","content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":0}}"#)).unwrap()
+                        }
+                    }
+                })),
+        ).await;
+        let gateway =
+            spawn_vllm_gateway(node("n", &upstream, [("claude", "internal-model")])).await;
+        for thinking in [
+            json!({"type":"enabled","budget_tokens":2048,"display":"omitted"}),
+            json!({"type":"disabled"}),
+            json!({"type":"adaptive"}),
+        ] {
+            for streaming in [false, true] {
+                let response = test_client().post(gateway.url("/v1/messages"))
+                    .json(&json!({"model":"claude","max_tokens":4096,"stream":streaming,"thinking":thinking,"tools":[],"messages":[{"role":"user","content":"hello"}],"chat_template_kwargs":{"custom":true},"output_config":{"effort":"high"}}))
+                    .send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{version}");
+                assert_eq!(
+                    response.headers().contains_key("x-estuary-thinking-budget"),
+                    !native && thinking["type"] == "enabled",
+                    "{version}"
+                );
+                let text = response.text().await.unwrap();
+                assert!(text.contains(if streaming {
+                    "message_stop"
+                } else {
+                    "end_turn"
+                }));
+                let captured = timeout(IO_TIMEOUT, receiver.recv()).await.unwrap().unwrap();
+                assert_eq!(captured["model"], "internal-model");
+                assert_eq!(captured["output_config"]["effort"], "high");
+                assert_eq!(captured["chat_template_kwargs"]["custom"], true);
+                assert!(captured.get("tools").is_none());
+                if native {
+                    assert_eq!(captured["thinking"], thinking);
+                    assert!(
+                        captured["chat_template_kwargs"]
+                            .get("enable_thinking")
+                            .is_none()
+                    );
+                } else {
+                    assert_eq!(
+                        captured["chat_template_kwargs"]["enable_thinking"],
+                        thinking["type"] != "disabled"
+                    );
+                    assert!(captured["thinking"].get("display").is_none());
+                }
+            }
+        }
+    }
 }
 
 async fn vllm_metrics() -> Response {

@@ -106,10 +106,26 @@ headers, first output, first visible text, upstream completion and total observe
 body lifetime. Attempt timings also record first chunk and cumulative downstream
 capacity wait. They are gateway observations; streaming backpressure can affect
 measurements. They do not measure GPU kernel time or client receipt/processing.
+
+When an upstream reports vLLM per-request `metrics`, each attempt also stores
+`engine_time_to_first_token`, `engine_generation_time`, `engine_queue_time` and
+`engine_mean_itl` in `timings_us`. Source fields ending in `_ms` are converted
+from milliseconds to microseconds. The details view labels these engine timings
+separately; gateway timings retain their original meaning. They belong to each
+upstream attempt, so retries do not blend timing values from different nodes.
+Absent fields remain absent; reported zero is retained. Invalid, negative,
+out-of-range and unknown fields are ignored. Only these four durations are
+retained, rather than storing arbitrary metric objects or rates as durations.
+Buffered metric objects and SSE events have a 64 KiB observation limit.
+Content capture limits and metadata-only mode do not disable this observer.
+
 Missing token usage stays null. Provider usage includes cache read/write and
 reasoning counts when available; Anthropic input totals add reported uncached,
-cache-read and cache-creation tokens. Captured content preserves redacted raw
-usage; metadata retains a raw usage preview up to 4 KiB, with larger values explicitly omitted; metadata-only mode uses the bounded provider observer.
+cache-read and cache-creation tokens. Responses input counts already include
+cached tokens and are not added again. Captured content preserves redacted raw
+usage, including Responses `input_tokens_details.cache_write_tokens`; metadata
+retains a raw usage preview up to 4 KiB, with larger values explicitly omitted.
+Metadata-only mode uses the bounded provider observer.
 
 HTTP status and semantic outcome are separate. A stream can have HTTP `200`
 and still report an error or missing terminal marker. An oversized event that

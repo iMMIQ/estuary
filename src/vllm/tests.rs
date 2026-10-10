@@ -521,6 +521,30 @@ async fn accepts_supported_vllm_versions_in_monitor_and_preflight() {
     }
 }
 
+#[test]
+fn native_thinking_capability_tracks_confirmed_releases_and_version_changes() {
+    let node = vllm_node("http://127.0.0.1:8000");
+    for (version, native) in [
+        ("0.31.0", true),
+        (" v0.31 ", true),
+        ("0.31.0+gabcdef", true),
+        ("1.0.0", true),
+        ("0.30.9", false),
+        ("dev", false),
+        ("main+gabcdef", false),
+        ("0.31.0.dev123", false),
+        ("0.31.0-rc1", false),
+        ("0.31.0rc1", false),
+        ("0.31.0.1", false),
+    ] {
+        node.record_vllm_ready(version.to_owned());
+        assert_eq!(node.vllm_native_anthropic_thinking(), native, "{version}");
+    }
+    node.record_vllm_ready("0.31.0".to_owned());
+    node.record_vllm_incompatible(Some("0.31.0".to_owned()), "probe failed".to_owned());
+    assert!(!node.vllm_native_anthropic_thinking());
+}
+
 #[tokio::test]
 async fn rejects_vllm_below_v025() {
     let client = Client::new();

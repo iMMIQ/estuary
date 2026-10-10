@@ -133,16 +133,26 @@ different public model names.
 
 vLLM 0.25+ exposes native `/v1/messages` and `/v1/messages/count_tokens` routes.
 Estuary removes Claude Code's standalone billing marker, removes its no-op
-`clear_thinking` edit, rewrites the model alias, and maps thinking enablement to
-`chat_template_kwargs.enable_thinking`.
+`clear_thinking` edit, and rewrites the model alias.
 The Chat and Responses adapters also preserve Claude Code's inline text-only
 `role: system` messages, including environment context, in their original order.
 
-The vLLM 0.25 request model does not expose an exact thinking-only token budget.
-Estuary preserves `budget_tokens`, uses `max_tokens` as the total output ceiling,
-and adds `x-estuary-thinking-budget: approximated-by-max-tokens`. Generated
-thinking is retained so Claude Code can carry it into the next turn. Unsupported
-context edits and file-download requests return explicit Anthropic errors.
+For confirmed stable vLLM 0.31+ versions (including `0.31`, `v0.31.0`, and
+`0.31.0+BUILD`), Estuary passes native `thinking` through, including enabled
+budgets, disabled/adaptive modes and `display`. It does not inject template
+enablement or an approximation header. vLLM validates and implements these
+settings; exact budget support still depends on the selected model/runner.
+The capability is refreshed with the node's existing version probe.
+
+For 0.25–0.30, prereleases and opaque labels such as `dev`, Estuary retains the
+compatibility shim: thinking enablement maps to
+`chat_template_kwargs.enable_thinking`, `display: omitted` is removed, and an
+enabled budget adds `x-estuary-thinking-budget: approximated-by-max-tokens`.
+`budget_tokens` is preserved, with `max_tokens` as the total output ceiling.
+These labels remain accepted by the version gate; they do not prove that the
+native thinking feature has shipped. Generated thinking is retained so Claude
+Code can carry it into the next turn. Unsupported context edits and
+file-download requests return explicit Anthropic errors.
 
 `messages/count_tokens` requires a node using native Messages. The Responses and
 Chat adapters cannot provide this native token count.
@@ -188,6 +198,9 @@ For Codex requests selected onto vLLM, Estuary collision-checks and flattens
 namespace tools, then restores namespace and name fields in buffered and SSE
 responses. Standard functions, structured output, image input, full-history
 replay, and `prompt_cache_key` retain their Responses shapes.
+This conversion remains necessary for GPT-OSS/Harmony in vLLM 0.31 even though
+ordinary Responses models support namespace tools; a server version alone does
+not establish support for every model's tool parser.
 
 Generic OpenAI-compatible backends can opt into the same namespace conversion
 with `provider.flatten_codex_namespaces: true`, for example when using llama.cpp.
@@ -197,6 +210,22 @@ Responses Lite custom calls, tool-search items, `additional_tools`, and web
 search are rejected because vLLM's Harmony path cannot represent them. These
 checks apply only to detected Codex requests routed to vLLM; other Responses
 traffic uses the normal pass-through path.
+
+## Per-request measurements
+
+Start vLLM with `--enable-per-request-metrics` to report optional engine timings.
+Estuary records the four duration fields in buffered responses and terminal SSE
+`response.completed` events separately from its own network/body timers. Chat
+Completions can report these metrics from 0.25; Responses adds them in 0.31.
+Missing fields remain absent, including Responses flows where upstream built-in
+tools span multiple engine generations and vLLM suppresses timing metrics.
+
+Responses `usage.input_tokens_details.cache_write_tokens` is recorded alongside
+cache reads, output and reasoning tokens. Estuary also retains support for Chat
+`created_cache_tokens` and Anthropic `cache_creation_input_tokens`. These
+observations require neither a version gate nor captured response content and
+do not change protocol bytes. See [Session logging](session-logging.md) for
+units, limits and attribution.
 
 ## Related Documentation
 

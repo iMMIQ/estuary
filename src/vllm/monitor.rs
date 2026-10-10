@@ -8,7 +8,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use prometheus_parse::{Scrape, Value as MetricValue};
 use reqwest::Client;
-use semver::Version;
 use serde::Deserialize;
 use tokio::{
     sync::{Notify, watch},
@@ -25,6 +24,7 @@ use crate::{
 
 use super::{
     MAX_MANAGEMENT_BODY_BYTES, MIN_VLLM_VERSION, VERSION_RECHECK_TICKS, read_bounded_response,
+    release_version,
 };
 
 pub(super) async fn run_node_monitor(
@@ -153,27 +153,10 @@ pub(super) async fn fetch_version(client: &Client, node: &Node) -> Result<String
 }
 
 pub(super) fn is_supported_vllm_version(raw: &str) -> bool {
-    let normalized = raw.trim().trim_start_matches('v');
     // Python package versions can use dev/rc suffixes or omit the patch number.
     // Compare only the numeric release prefix; opaque build labels such as
     // "dev" cannot establish an old release and are allowed through the gate.
-    let release = normalized
-        .split(|ch: char| !ch.is_ascii_digit() && ch != '.')
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches('.');
-    let mut components = release.split('.');
-    let (Ok(major), Some(Ok(minor))) = (
-        components.next().unwrap_or_default().parse(),
-        components.next().map(str::parse),
-    ) else {
-        return true;
-    };
-    let patch = components
-        .next()
-        .and_then(|component| component.parse().ok())
-        .unwrap_or(0);
-    Version::new(major, minor, patch) >= MIN_VLLM_VERSION
+    release_version(raw).is_none_or(|version| version >= MIN_VLLM_VERSION)
 }
 
 pub(super) async fn fetch_metrics(client: &Client, node: &Node) -> Result<VllmMetricsSnapshot> {

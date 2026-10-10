@@ -38,6 +38,38 @@ use kv_events::run_event_supervisor;
 pub use monitor::preflight_vllm;
 
 const MIN_VLLM_VERSION: Version = Version::new(0, 25, 0);
+
+fn release_prefix(raw: &str) -> &str {
+    raw.trim()
+        .trim_start_matches('v')
+        .split(|ch: char| !ch.is_ascii_digit() && ch != '.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.')
+}
+
+fn release_version(raw: &str) -> Option<Version> {
+    let mut components = release_prefix(raw).split('.');
+    let major = components.next()?.parse().ok()?;
+    let minor = components.next()?.parse().ok()?;
+    let patch = components
+        .next()
+        .and_then(|part| part.parse().ok())
+        .unwrap_or(0);
+    Some(Version::new(major, minor, patch))
+}
+
+pub(crate) fn supports_native_anthropic_thinking(raw: &str) -> bool {
+    let normalized = raw.trim().trim_start_matches('v');
+    let prefix = release_prefix(raw);
+    let suffix = &normalized[prefix.len()..];
+    // Admission tolerates opaque and prerelease versions, but they do not prove
+    // that a feature has shipped. Only stable releases (with optional build IDs)
+    // can retire the older thinking shim.
+    (suffix.is_empty() || suffix.starts_with('+'))
+        && matches!(prefix.split('.').count(), 2 | 3)
+        && release_version(raw).is_some_and(|version| version >= Version::new(0, 31, 0))
+}
 const MAX_MANAGEMENT_BODY_BYTES: usize = 8 * 1024 * 1024;
 const VERSION_RECHECK_TICKS: u64 = 30;
 const KV_HEALTH_POLL_MAX: Duration = Duration::from_millis(250);

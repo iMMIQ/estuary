@@ -36,7 +36,7 @@ rusqlite_migration = "=2.3.0"
 rust-embed = "8.7"
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 sonic-rs = "0.5.8"
 subtle = "2.6"
 thiserror = "2.0"

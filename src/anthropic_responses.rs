@@ -598,7 +598,11 @@ fn response_usage(value: Option<&Value>) -> Value {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let created = value
-        .and_then(|value| value.pointer("/input_tokens_details/created_cache_tokens"))
+        .and_then(|value| {
+            value
+                .pointer("/input_tokens_details/cache_write_tokens")
+                .or_else(|| value.pointer("/input_tokens_details/created_cache_tokens"))
+        })
         .and_then(Value::as_u64)
         .unwrap_or(0);
     json!({"input_tokens": total.saturating_sub(cached).saturating_sub(created), "output_tokens": output, "cache_creation_input_tokens": created, "cache_read_input_tokens": cached})
@@ -1037,12 +1041,16 @@ mod tests {
 
     #[test]
     fn responses_cache_creation_is_not_double_counted() {
-        let converted = response_usage(Some(
-            &json!({"input_tokens":100,"output_tokens":4,"input_tokens_details":{"cached_tokens":40,"created_cache_tokens":32}}),
-        ));
-        assert_eq!(converted["input_tokens"], 28);
-        assert_eq!(converted["cache_read_input_tokens"], 40);
-        assert_eq!(converted["cache_creation_input_tokens"], 32);
+        for field in ["cache_write_tokens", "created_cache_tokens"] {
+            for written in [0, 32] {
+                let mut usage = json!({"input_tokens":100,"output_tokens":4,"input_tokens_details":{"cached_tokens":40}});
+                usage["input_tokens_details"][field] = json!(written);
+                let converted = response_usage(Some(&usage));
+                assert_eq!(converted["input_tokens"], 60 - written);
+                assert_eq!(converted["cache_read_input_tokens"], 40);
+                assert_eq!(converted["cache_creation_input_tokens"], written);
+            }
+        }
     }
 
     #[test]
@@ -1165,7 +1173,7 @@ mod tests {
             "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"a\\\"}\"}\n\n",
             "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}\n\n",
             "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"arguments\":\"{\\\"pattern\\\":\\\"*.rs\\\"}\"}}\n\n",
-            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":50,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":20}}}}\n\n"
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":50,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":20,\"cache_write_tokens\":8}}}}\n\n"
         );
         let mut converter = StreamConverter::new("claude-public".to_owned(), false);
         let split = source.len() / 2;
@@ -1185,8 +1193,9 @@ mod tests {
         assert!(output.contains(r#""id":"call_1""#));
         assert!(output.contains(r#""id":"call_2""#));
         assert!(output.contains(r#""partial_json":"{\"pattern\":\"*.rs\"}""#));
-        assert!(output.contains(r#""input_tokens":30"#));
+        assert!(output.contains(r#""input_tokens":22"#));
         assert!(output.contains(r#""cache_read_input_tokens":20"#));
+        assert!(output.contains(r#""cache_creation_input_tokens":8"#));
         assert!(output.contains(r#""stop_reason":"tool_use""#));
         assert!(output.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
     }

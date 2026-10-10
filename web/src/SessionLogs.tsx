@@ -15,6 +15,20 @@ function duration(value: number | undefined) {
   return value === undefined ? "—" : `${(value / 1000).toFixed(1)} ms`;
 }
 
+function TimingGrid({ timings }: { timings: Record<string, number> }) {
+  const { t } = useTranslation();
+  return (
+    <div className="log-timings">
+      {Object.entries(timings).map(([name, value]) => (
+        <div key={name}>
+          <span>{t(`logs.timing.${name}`, { defaultValue: name })}</span>
+          <strong>{duration(value)}</strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function SessionLogs() {
   const { t } = useTranslation();
   const [status, setStatus] = useState<LogStatus | null>(null);
@@ -116,14 +130,7 @@ export function SessionLogs() {
               </Alert>
             )}
             <h2>{t("logs.timings")}</h2>
-            <div className="log-timings">
-              {Object.entries(detail.request.timings_us).map(([name, value]) => (
-                <div key={name}>
-                  <span>{t(`logs.timing.${name}`, { defaultValue: name })}</span>
-                  <strong>{duration(value)}</strong>
-                </div>
-              ))}
-            </div>
+            <TimingGrid timings={detail.request.timings_us} />
             <h2>{t("logs.attempts")}</h2>
             {detail.request.attempts.map((attempt) => (
               <article className="log-attempt" key={attempt.number}>
@@ -138,6 +145,7 @@ export function SessionLogs() {
                   {t("logs.timings")}: {duration(attempt.timings_us.total)} · {attempt.error_class}{" "}
                   {attempt.retry_reason}
                 </p>
+                <TimingGrid timings={attempt.timings_us} />
                 <details>
                   <summary>{t("logs.routing")}</summary>
                   <pre>{JSON.stringify(attempt.route, null, 2)}</pre>

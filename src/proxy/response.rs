@@ -114,7 +114,10 @@ pub(super) async fn buffered_success_response(
     }
     metrics.observe_usage(usage);
     if let Some(log) = log_attempt.as_mut() {
+        let provider_timings =
+            crate::inference_stats::ProviderTimings::from_response(&upstream_body);
         log.update(|attempt| {
+            provider_timings.write_to(&mut attempt.timings_us);
             attempt.usage = usage.log_value(matches!(
                 response_mode,
                 UpstreamResponseMode::NativeAnthropic { .. }
