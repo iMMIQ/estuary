@@ -320,6 +320,9 @@ fn serialize_chat(
         || source.get("reasoning").is_some_and(|v| !v.is_null())
         || source["output_config"].get("effort").is_some();
     if let Some(kwargs) = source.get("chat_template_kwargs") {
+        if !kwargs.is_object() && !kwargs.is_null() {
+            return Err(invalid("chat_template_kwargs must be an object"));
+        }
         chat["chat_template_kwargs"] = kwargs.clone();
     }
     if explicit_thinking {
@@ -755,6 +758,23 @@ mod tests {
             chat["response_format"]["json_schema"]["schema"],
             json!({"type":"object"})
         );
+    }
+
+    #[test]
+    fn malformed_chat_template_kwargs_return_a_request_error() {
+        for endpoint in ["messages", "messages/count_tokens", "responses"] {
+            for kwargs in [json!(false), json!(4), json!("invalid"), json!([])] {
+                let source = if endpoint == "responses" {
+                    json!({"model":"m","input":"hi","reasoning":{"effort":"high"},"chat_template_kwargs":kwargs})
+                } else {
+                    json!({"model":"m","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":32},"chat_template_kwargs":kwargs})
+                };
+                assert!(matches!(
+                    prepare(endpoint, &source),
+                    Err(GatewayError::InvalidRequest(_))
+                ));
+            }
+        }
     }
 
     #[test]

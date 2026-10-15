@@ -269,6 +269,46 @@ async fn streaming_end_and_usage_are_observed_without_chunk_rows() {
 }
 
 #[tokio::test]
+async fn completion_stream_text_survives_log_storage_and_reconstruction() {
+    let sse = "data: {\"choices\":[{\"index\":0,\"text\":\"hello \"}]}\n\ndata: {\"choices\":[{\"index\":0,\"text\":\"world\",\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let upstream = Server::spawn(Router::new().route(
+        "/v1/completions",
+        post(move || async move { ([(header::CONTENT_TYPE, "text/event-stream")], sse) }),
+    ))
+    .await;
+    let db = Database::new();
+    let (public, _, logs) = logged_gateway(settings(&db, vec![node("n", &upstream.url)])).await;
+    let response = client()
+        .post(format!("{}/v1/completions", public.url))
+        .json(&json!({"model":"m","stream":true,"prompt":"hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), sse);
+    assert!(logs.flush(Duration::from_secs(3)).await);
+    let request = logs
+        .list(None, None, 0, 10)
+        .await
+        .unwrap()
+        .requests
+        .pop()
+        .unwrap();
+    let detail = logs.detail(request.id).await.unwrap().unwrap();
+    assert_eq!(detail.request.outcome, "success");
+    for stage in ["upstream_output", "client_output"] {
+        let payload = detail.payloads.iter().find(|p| p.stage == stage).unwrap();
+        assert_eq!(payload.state, "summary");
+        let text = payload.content["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|block| block["text"].as_str());
+        assert_eq!(text, Some("hello world"));
+    }
+}
+
+#[tokio::test]
 async fn missing_stream_terminal_is_logged_even_after_http_200() {
     let upstream = Server::spawn(Router::new().route(
         "/v1/chat/completions",

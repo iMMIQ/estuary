@@ -496,7 +496,6 @@ export function NodeEditor({
                       update((current) => ({
                         ...current,
                         api_key: value,
-                        preserve_api_key: value ? false : current.preserve_api_key,
                       }));
                     }}
                   />

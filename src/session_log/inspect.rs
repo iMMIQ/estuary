@@ -79,6 +79,12 @@ fn stream_summary(bytes: &[u8], anthropic: bool) -> (Value, Value, &'static str)
         if let Some(choices) = value.get("choices").and_then(Value::as_array) {
             for choice in choices {
                 let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+                append(
+                    &mut blocks,
+                    &format!("choice:{index}:text"),
+                    "text",
+                    choice.get("text"),
+                );
                 if let Some(delta) = choice.get("delta") {
                     for name in ["content", "reasoning_content", "reasoning"] {
                         append(

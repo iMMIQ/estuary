@@ -128,10 +128,11 @@ pub(super) fn replace_unsupported_images(body: &mut Value, model: &str) -> usize
                     });
                     return 1;
                 }
-                object
-                    .iter_mut()
-                    .filter(|(key, _)| key.as_str() != "type")
-                    .map(|(_, value)| visit_content(value, model))
+                // Only protocol content containers can carry image blocks.
+                // Tool arguments and message metadata are arbitrary user JSON.
+                ["content", "output"]
+                    .into_iter()
+                    .filter_map(|key| object.get_mut(key).map(|value| visit_content(value, model)))
                     .sum()
             }
             _ => 0,

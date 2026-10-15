@@ -213,6 +213,30 @@ fn replaces_images_nested_in_responses_tool_outputs() {
 }
 
 #[test]
+fn image_replacement_preserves_tool_arguments_and_message_metadata() {
+    let input = json!({
+        "type": "image",
+        "source": {"type": "url", "url": "https://example.test/product.png"},
+        "nested": [{"type": "input_image", "image_url": "product-id"}]
+    });
+    let mut body = json!({
+        "model": "text-only",
+        "messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "call", "name": "store", "input": input}]},
+            {"role": "user", "metadata": input, "content": [{"type": "tool_result", "tool_use_id": "call", "content": [{"type": "image", "source": {"type": "url", "url": "https://example.test/actual.png"}}]}]}
+        ]
+    });
+
+    assert_eq!(replace_unsupported_images(&mut body, "text-only"), 1);
+    assert_eq!(body["messages"][0]["content"][0]["input"], input);
+    assert_eq!(body["messages"][1]["metadata"], input);
+    assert_eq!(
+        body["messages"][1]["content"][0]["content"][0]["type"],
+        "text"
+    );
+}
+
+#[test]
 fn claude_code_versions_share_the_same_sanitized_prefix() {
     let config = crate::config::PrefixConfig::default();
     let request = |version: &str| {

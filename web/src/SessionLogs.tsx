@@ -37,6 +37,8 @@ export function SessionLogs() {
   const [session, setSession] = useState<string | null>(null);
   const [cursor, setCursor] = useState<string | null>(null);
   const [days, setDays] = useState("7");
+  // Cursor pages share a cutoff until the user starts a new query.
+  const [since, setSince] = useState(() => Date.now() - Number(days) * 86400000);
   const [revision, setRevision] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -58,7 +60,6 @@ export function SessionLogs() {
           setPage({ requests: [], next_cursor: null });
           return;
         }
-        const since = Date.now() - Number(days) * 86400000;
         const [requests, groups] = await Promise.all([
           api.listLogRequests(session, cursor, since, controller.signal),
           api.listLogSessions(since, controller.signal),
@@ -75,7 +76,7 @@ export function SessionLogs() {
       }
     })();
     return () => controller.abort();
-  }, [session, cursor, days, revision]);
+  }, [session, cursor, since, revision]);
 
   useEffect(() => {
     setDetail(null);
@@ -209,6 +210,7 @@ export function SessionLogs() {
           leftSection={<RefreshCw size={15} />}
           onClick={() => {
             setCursor(null);
+            setSince(Date.now() - Number(days) * 86400000);
             setRevision((value) => value + 1);
           }}
         >
@@ -250,7 +252,9 @@ export function SessionLogs() {
                 { value: "30", label: t("logs.days", { count: 30 }) },
               ]}
               onChange={(value) => {
-                setDays(value ?? "7");
+                const nextDays = value ?? "7";
+                setDays(nextDays);
+                setSince(Date.now() - Number(nextDays) * 86400000);
                 setCursor(null);
               }}
             />

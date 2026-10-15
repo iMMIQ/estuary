@@ -142,3 +142,54 @@ test("disabled logging explains setup and does not fetch content", async ({ page
   await expect(page.getByRole("alert")).toContainText("Session logging is disabled");
   expect(contentReads).toBe(0);
 });
+
+test("pagination preserves the time range until refresh or a range change", async ({ page }) => {
+  const now = Date.UTC(2026, 9, 15, 12);
+  const day = 86400000;
+  await page.clock.setFixedTime(now);
+  await mockControlPlane(page);
+  await page.route("**/admin/api/logs/status", (route) =>
+    route.fulfill({ json: { enabled: true, available: true } }),
+  );
+  const queried: URL[] = [];
+  await page.route("**/admin/api/logs/requests?*", (route) => {
+    const url = new URL(route.request().url());
+    queried.push(url);
+    const since = Number(url.searchParams.get("since"));
+    return route.fulfill({
+      json: {
+        requests: url.searchParams.has("cursor")
+          ? since <= now - 7 * day + 1000
+            ? [{ ...request, id: "old-request", model: "oldest-in-range" }]
+            : []
+          : [request],
+        next_cursor: url.searchParams.has("cursor") ? null : "next-cursor",
+      },
+    });
+  });
+  await page.route("**/admin/api/logs/sessions?*", (route) =>
+    route.fulfill({ json: { sessions: [] } }),
+  );
+  await page.goto("/admin/");
+  await page
+    .locator("button:visible")
+    .filter({ hasText: /^Session logs$/ })
+    .click();
+  await expect(page.getByLabel("Request details request-a")).toBeVisible();
+  expect(queried[0].searchParams.get("since")).toBe(String(now - 7 * day));
+  await page.clock.setFixedTime(now + day);
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect.poll(() => queried.length).toBe(2);
+  expect(queried[1].searchParams.get("since")).toBe(queried[0].searchParams.get("since"));
+  await expect(
+    page.getByRole("cell", { name: "oldest-in-range openai_responses", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect.poll(() => queried.length).toBe(3);
+  expect(queried[2].searchParams.get("since")).toBe(String(now - 6 * day));
+  expect(queried[2].searchParams.has("cursor")).toBe(false);
+  await page.getByRole("combobox", { name: "Time range", exact: true }).click();
+  await page.getByRole("option", { name: "Last 1 days", exact: true }).click();
+  await expect.poll(() => queried.length).toBe(4);
+  expect(queried[3].searchParams.get("since")).toBe(String(now));
+});

@@ -185,6 +185,26 @@ fn redaction_and_anthropic_usage_preserve_unknown_values() {
 }
 
 #[test]
+fn completion_stream_summary_preserves_generated_text_and_usage() {
+    let (content, usage, representation) = inspect::prepare(
+        b"data: {\"choices\":[{\"index\":0,\"text\":\"hello \"},{\"index\":1,\"text\":\"other\"}]}\n\ndata: {\"choices\":[{\"index\":0,\"text\":\"world\",\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n",
+        true,
+        false,
+    );
+    assert_eq!(representation, "stream_summary");
+    let texts = content["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(texts, ["hello world", "other"]);
+    assert_eq!(usage["input_tokens"], 3);
+    assert_eq!(usage["output_tokens"], 2);
+    assert_eq!(content["terminal_marker_seen"], true);
+}
+
+#[test]
 fn truncated_json_and_embedded_tool_arguments_mask_credential_fields() {
     for source in [
         r#"{"api_key":"secret-plain"#,

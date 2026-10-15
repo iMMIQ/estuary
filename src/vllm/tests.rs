@@ -25,6 +25,11 @@ use zeromq::PubSocket;
 use super::*;
 use crate::config::{HealthConfig, NodeConfig, PrefixConfig, ProviderConfig, VllmKvEventsConfig};
 
+fn test_client() -> Client {
+    // Local test servers must not depend on the host proxy configuration.
+    Client::builder().no_proxy().build().unwrap()
+}
+
 async fn management_server(version: &'static str) -> (String, JoinHandle<()>) {
     let router = Router::new()
         .route(
@@ -130,7 +135,7 @@ async fn management_response_is_rejected_while_streaming_past_limit() {
     let server = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    let response = Client::new()
+    let response = test_client()
         .get(format!("http://{address}/large"))
         .send()
         .await
@@ -484,7 +489,7 @@ async fn consumes_the_vllm_pub_sub_frame_layout() {
 
 #[tokio::test]
 async fn accepts_supported_vllm_versions_in_monitor_and_preflight() {
-    let client = Client::new();
+    let client = test_client();
     for version in [
         "0.25.0",
         "0.25",
@@ -523,7 +528,7 @@ async fn accepts_supported_vllm_versions_in_monitor_and_preflight() {
 
 #[tokio::test]
 async fn rejects_vllm_below_v025() {
-    let client = Client::new();
+    let client = test_client();
     for version in ["0.24.1", "0.24", "v0.24.9", "0.24.1.dev123", "0.24.1-rc1"] {
         let (base_url, server) = management_server(version).await;
         let node = vllm_node(&base_url);
@@ -545,7 +550,7 @@ async fn rejects_vllm_below_v025() {
 
 #[tokio::test]
 async fn rejects_empty_vllm_versions() {
-    let client = Client::new();
+    let client = test_client();
     for version in ["", " \t\n"] {
         let (base_url, server) = management_server(version).await;
         let node = vllm_node(&base_url);
@@ -592,7 +597,7 @@ async fn tokenizes_chat_with_the_upstream_model_name() {
     let manager = VllmManager::new(scheduler);
     let tokens = manager
         .tokenize_for_routing(
-            &Client::new(),
+            &test_client(),
             "chat/completions",
             "public",
             &json!({"messages": [{"role": "user", "content": "hello"}]}),
@@ -658,7 +663,7 @@ async fn chat_versions_share_render_cache_gating_and_exact_routing() {
     ));
     let manager = VllmManager::new(Arc::clone(&scheduler));
     seed_exact_cache(&scheduler, &node);
-    let client = Client::new();
+    let client = test_client();
     for (endpoint, version) in [
         ("chat/completions", "0.29.0"),
         ("chat/completions", "0.30.0"),
@@ -724,7 +729,7 @@ async fn unconverted_client_protocols_do_not_call_native_renderers() {
     for endpoint in ["messages", "responses"] {
         let result = manager
             .tokenize_for_routing(
-                &Client::new(),
+                &test_client(),
                 endpoint,
                 "public",
                 &json!({"input":"hello"}),
@@ -756,7 +761,7 @@ async fn token_ids_are_shared_by_normalized_model_pool_candidates() {
     }
     let body = json!({"messages":[{"role":"user", "content":"hello"}]});
     let result = manager
-        .tokenize_for_routing(&Client::new(), "chat/completions", "public", &body, true)
+        .tokenize_for_routing(&test_client(), "chat/completions", "public", &body, true)
         .await;
     assert_eq!(result.tokens, Some(vec![1, 2, 3]));
     assert_eq!(
@@ -839,7 +844,7 @@ async fn chat_keeps_legacy_tokenization_when_renderer_is_disabled() {
         let body = json!({"messages":[{"role":"user", "content":"hello"}]});
         for expected in ["upstream_success", "cache_hit"] {
             let result = manager
-                .tokenize_for_routing(&Client::new(), "chat/completions", "public", &body, true)
+                .tokenize_for_routing(&test_client(), "chat/completions", "public", &body, true)
                 .await;
             assert_eq!(result.outcome, expected);
             assert_eq!(result.tokens, Some(vec![1, 2, 3]));
@@ -889,7 +894,7 @@ async fn tokenization_failure_does_not_fan_out_to_other_nodes() {
 
     let result = manager
         .tokenize_for_routing(
-            &Client::new(),
+            &test_client(),
             "chat/completions",
             "public",
             &json!({"messages": [{"role": "user", "content": "hello"}]}),
@@ -937,7 +942,7 @@ async fn tokenization_uses_one_total_deadline() {
 
     let result = manager
         .tokenize_for_routing(
-            &Client::new(),
+            &test_client(),
             "chat/completions",
             "public",
             &json!({"messages": [{"role": "user", "content": "hello"}]}),
@@ -985,7 +990,7 @@ async fn tokenization_prefix_gate_avoids_the_upstream_request() {
 
     let result = manager
         .tokenize_for_routing(
-            &Client::new(),
+            &test_client(),
             "chat/completions",
             "public",
             &json!({"messages": [{"role": "user", "content": "first request"}]}),

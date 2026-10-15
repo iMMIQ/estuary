@@ -12,3 +12,12 @@ test("compressed assets match the final published files including lazy import re
     expect(gunzipSync(compressed).equals(original)).toBe(true);
   }
 });
+
+test("the embedded deployment page contains valid JavaScript", () => {
+  const source = readFileSync(new URL("../../src/supervisor/deploy.rs", import.meta.url), "utf8");
+  const html = source.match(/const DEPLOY_HTML: &str = r#"([\s\S]*?)"#;/)?.[1];
+  expect(html).toBeDefined();
+  const script = html?.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  expect(script).toBeDefined();
+  expect(() => new Bun.Transpiler({ loader: "js" }).transformSync(script ?? "")).not.toThrow();
+});

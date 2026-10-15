@@ -143,6 +143,33 @@ test("editing preserves inherited image capability", async ({ page }) => {
   expect(saved?.model_capabilities).toEqual({ "*": { multimodal: false } });
 });
 
+for (const removeStoredKey of [false, true]) {
+  test(`clearing a replacement key ${removeStoredKey ? "after explicit removal deletes" : "preserves"} the stored credential`, async ({
+    page,
+  }) => {
+    const initial = record(nodeConfig());
+    initial.credentials.api_key_configured = true;
+    initial.credentials.api_key_source = "database";
+    await mockControlPlane(page, [initial]);
+    let saved: { config: NodeConfig; clear_api_key: boolean } | undefined;
+    await page.route("**/admin/api/nodes/vllm-a?*", async (route) => {
+      saved = route.request().postDataJSON();
+      await route.fulfill({ json: initial });
+    });
+    await openEdit(page);
+    await page.getByRole("button", { name: "Next", exact: true }).click();
+    if (removeStoredKey)
+      await page.getByRole("button", { name: "Remove key", exact: true }).click();
+    await page.getByLabel("Bearer API key", { exact: true }).fill("temporary-replacement");
+    await page.getByLabel("Bearer API key", { exact: true }).fill("");
+    await page.getByRole("button", { name: "Next", exact: true }).click();
+    await page.getByRole("button", { name: "Save Changes", exact: true }).click();
+    await expect.poll(() => saved !== undefined).toBe(true);
+    expect(saved?.config.api_key).toBeNull();
+    expect(saved?.clear_api_key).toBe(removeStoredKey);
+  });
+}
+
 test("failed IP limit retains the input for retry", async ({ page }) => {
   await mockControlPlane(page);
   await page.route("**/admin/api/ip-limits/**", (route) =>
