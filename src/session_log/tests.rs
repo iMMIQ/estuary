@@ -49,7 +49,7 @@ fn payload(
 fn retention_preserves_shared_prefixes_and_reclaims_only_unreferenced_content() {
     let db = Database::new();
     let mut connection = store::open(&db.0).unwrap();
-    let now = super::unix_ms();
+    let now = crate::time::unix_millis();
     let old = RequestRecord {
         id: "old".to_owned(),
         started_at_ms: 1,
@@ -347,7 +347,7 @@ fn thousand_turn_history_shares_prefixes_and_restores_the_final_request() {
         logical_bytes += serde_json::to_vec(&value).unwrap().len();
         let record = RequestRecord {
             id: format!("request-{i}"),
-            started_at_ms: super::unix_ms(),
+            started_at_ms: crate::time::unix_millis(),
             ..RequestRecord::default()
         };
         store::write_record(&transaction, &record).unwrap();
@@ -355,7 +355,7 @@ fn thousand_turn_history_shares_prefixes_and_restores_the_final_request() {
             &transaction,
             &record.id,
             &value,
-            super::unix_ms(),
+            crate::time::unix_millis(),
             &mut cache,
         );
     }

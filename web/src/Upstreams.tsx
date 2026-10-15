@@ -14,16 +14,9 @@ import {
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-  formatRate,
-  formatRatio,
-  ProgressValue,
-  relativeSync,
-  VllmRuntimePanel,
-} from "./admin-metrics";
-import { formatCompactNumber } from "./node-config";
+import { formatRate, ProgressValue, relativeSync, VllmRuntimePanel } from "./admin-metrics";
 import type { NodeRecord } from "./types";
-import { StatusBadge } from "./ui";
+import { formatCompactNumber, formatPercent, StatusBadge } from "./ui";
 export type NodeFilter = "all" | "accepting" | "attention" | "draining" | "not_ready";
 
 export function Upstreams({
@@ -275,15 +268,19 @@ export function Upstreams({
                         <strong>
                           {node.config.provider.type === "vllm"
                             ? t("upstreams.used", {
-                                value: formatRatio(telemetry ? node.runtime.kv_cache_usage : null),
+                                value: formatPercent(
+                                  telemetry ? node.runtime.kv_cache_usage : null,
+                                  "--",
+                                ),
                               })
                             : "--"}
                         </strong>
                         <span>
                           {node.config.provider.type === "vllm"
                             ? t("upstreams.kvDetail", {
-                                hit: formatRatio(
+                                hit: formatPercent(
                                   telemetry ? node.runtime.prefix_cache_hit_rate : null,
+                                  "--",
                                 ),
                                 blocks: formatCompactNumber(node.exact_kv_blocks, locale),
                                 mode: node.exact_kv_authoritative

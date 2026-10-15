@@ -1,4 +1,5 @@
 use super::AppState;
+use crate::time::unix_millis;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -6,10 +7,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::Arc;
 
 #[derive(Default, Deserialize)]
 pub(super) struct Filter {
@@ -20,16 +18,9 @@ pub(super) struct Filter {
 }
 
 fn since(filter: &Filter) -> u64 {
-    filter.since.unwrap_or_else(|| {
-        u64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX)
-        .saturating_sub(7 * 86_400_000)
-    })
+    filter
+        .since
+        .unwrap_or_else(|| unix_millis().saturating_sub(7 * 86_400_000))
 }
 fn failure(error: &anyhow::Error) -> (StatusCode, Json<Value>) {
     tracing::warn!(error=%error,"session log query failed");

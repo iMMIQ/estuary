@@ -105,7 +105,7 @@ pub(super) async fn proxy_with_retries(
                 node: node.id().chars().take(128).collect(), node_instance: node.instance_id(),
                 provider: serde_json::to_value(node.provider().kind).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default(),
                 endpoint: upstream_endpoint_log.chars().take(128).collect(), model: selection.upstream_model.as_ref().map(|m| m.chars().take(256).collect()),
-                adapter: response_mode.name().to_owned(), started_at_ms: crate::session_log::now_ms(), outcome: "started".to_owned(),
+                adapter: response_mode.name().to_owned(), started_at_ms: crate::time::unix_millis(), outcome: "started".to_owned(),
                 route: serde_json::json!({"score":selection.score,"prefix_match_chars":selection.prefix_match_chars,"prefix_match_tokens":selection.prefix_match_tokens,
                     "active":snapshot.active,"capacity":snapshot.max_concurrency,"upstream_running":snapshot.upstream_running,"upstream_waiting":snapshot.upstream_waiting,
                     "kv_utilization":snapshot.kv_cache_usage,"telemetry_updated_at_ms":snapshot.provider_telemetry_updated_unix_ms}),

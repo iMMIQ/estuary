@@ -1,3 +1,4 @@
+use crate::time::unix_millis;
 use axum::http::HeaderMap;
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -14,7 +15,6 @@ use tokio::sync::mpsc;
 use super::{
     Command, LogSink,
     model::{AttemptRecord, LogEvent, RequestRecord},
-    unix_ms,
 };
 
 pub(super) struct CapturedPayload {
@@ -79,7 +79,7 @@ impl Observation {
             }
             .to_owned(),
             client: header(headers, "user-agent"),
-            started_at_ms: unix_ms(),
+            started_at_ms: unix_millis(),
             outcome: "started".to_owned(),
             delivery: "pending".to_owned(),
             capture_state: if sink.config.capture_content {
@@ -249,7 +249,7 @@ impl Observation {
             "body_dropped"
         }
         .clone_into(&mut pending.record.delivery);
-        pending.record.ended_at_ms = Some(unix_ms());
+        pending.record.ended_at_ms = Some(unix_millis());
         pending
             .record
             .timings_us

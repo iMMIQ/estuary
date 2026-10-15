@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -16,6 +16,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::config::{CircuitBreakerConfig, HealthConfig, NodeConfig, ProviderConfig, ProviderKind};
+use crate::time::unix_millis;
 
 const EWMA_ALPHA: f64 = 0.20;
 static NEXT_NODE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -1132,15 +1133,6 @@ fn update_ewma(current: &mut f64, sample: f64) {
 
 fn ewma(current: f64, sample: f64) -> f64 {
     EWMA_ALPHA.mul_add(sample, (1.0 - EWMA_ALPHA) * current)
-}
-
-fn unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

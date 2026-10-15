@@ -2,9 +2,9 @@ use super::{
     capture::CapturedPayload,
     content, inspect,
     model::{PayloadDetail, RequestDetail, RequestPage, RequestRecord, SessionSummary},
-    unix_ms,
 };
 use crate::config::SessionLogConfig;
+use crate::time::unix_millis;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
@@ -138,7 +138,7 @@ pub(super) fn write_payloads(
             "complete"
         };
         if connection.execute("INSERT OR IGNORE INTO payloads(request_id,stage,attempt,root_hash,state,bytes_seen,representation,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![record.id,payload.stage,payload.attempt,root,state,payload.bytes_seen,representation,unix_ms()])?==1 {
+            params![record.id,payload.stage,payload.attempt,root,state,payload.bytes_seen,representation,unix_millis()])?==1 {
             connection.execute("UPDATE content_blobs SET refs=refs+1 WHERE hash=?1",[root])?;
         }
     }
@@ -151,7 +151,7 @@ pub(super) fn write_payloads(
 
 pub(super) fn maintain(connection: &mut Connection, config: &SessionLogConfig) -> Result<()> {
     let transaction = connection.transaction()?;
-    let now = unix_ms();
+    let now = unix_millis();
     let day = 86_400_000u64;
     transaction.execute("DELETE FROM requests WHERE id IN (SELECT id FROM requests WHERE started_at_ms<?1 LIMIT 1000)",[now.saturating_sub(u64::from(config.retention_days)*day)])?;
     transaction.execute("DELETE FROM payloads WHERE id IN (SELECT id FROM payloads WHERE created_at_ms<?1 LIMIT 1000)",[now.saturating_sub(u64::from(config.content_retention_days)*day)])?;

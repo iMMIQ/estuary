@@ -16,10 +16,11 @@ use crate::{
     health::preflight_health,
     node::{CircuitState, LifecycleState, Node, NodeSnapshot},
     store::StoredNode,
+    time::unix_millis,
     vllm::preflight_vllm,
 };
 
-use super::{AppState, unix_millis};
+use super::AppState;
 
 pub(super) async fn live() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
@@ -339,26 +340,43 @@ pub(super) struct CredentialMutationQuery {
     pub(super) clear_headers: bool,
 }
 
+fn preserve_stored_credentials(
+    config: &mut NodeConfig,
+    stored: &NodeConfig,
+    clear_api_key: bool,
+    clear_headers: bool,
+) {
+    if config.api_key.is_none() && !clear_api_key {
+        config.api_key.clone_from(&stored.api_key);
+    }
+    if config.headers.is_empty() && !clear_headers {
+        config.headers.clone_from(&stored.headers);
+    }
+}
+
 pub(super) async fn preflight_node(
     State(state): State<Arc<AppState>>,
     Query(query): Query<CredentialMutationQuery>,
     Json(mut config): Json<NodeConfig>,
 ) -> Response {
-    if config.api_key.is_none() && !query.clear_api_key {
+    let preserve_api_key = config.api_key.is_none() && !query.clear_api_key;
+    let preserve_headers = config.headers.is_empty() && !query.clear_headers;
+    if preserve_api_key || preserve_headers {
         match state.store.get_async(&config.id).await {
-            Ok(Some(stored)) => config.api_key = stored.config.api_key,
+            Ok(Some(stored)) => preserve_stored_credentials(
+                &mut config,
+                &stored.config,
+                query.clear_api_key,
+                query.clear_headers,
+            ),
             Ok(None) => {}
             Err(error) => {
-                return admin_internal_error("could not load stored credentials", &error);
-            }
-        }
-    }
-    if config.headers.is_empty() && !query.clear_headers {
-        match state.store.get_async(&config.id).await {
-            Ok(Some(stored)) => config.headers = stored.config.headers,
-            Ok(None) => {}
-            Err(error) => {
-                return admin_internal_error("could not load stored headers", &error);
+                let message = if preserve_api_key {
+                    "could not load stored credentials"
+                } else {
+                    "could not load stored headers"
+                };
+                return admin_internal_error(message, &error);
             }
         }
     }
@@ -465,12 +483,12 @@ pub(super) async fn update_node(
         return admin_internal_message("node is persisted but missing from the runtime registry");
     };
     let mut requested_config = request.config;
-    if requested_config.api_key.is_none() && !request.clear_api_key {
-        requested_config.api_key.clone_from(&stored.config.api_key);
-    }
-    if requested_config.headers.is_empty() && !request.clear_headers {
-        requested_config.headers.clone_from(&stored.config.headers);
-    }
+    preserve_stored_credentials(
+        &mut requested_config,
+        &stored.config,
+        request.clear_api_key,
+        request.clear_headers,
+    );
     let replacement = match prepare_node(&state, &requested_config).await {
         Ok(node) => node,
         Err(error) => return admin_validation_error(&error),
@@ -606,41 +624,14 @@ pub(super) async fn drain_node(
     Query(query): Query<DrainQuery>,
 ) -> Response {
     let _mutation = state.admin_mutation.lock().await;
-    let mut stored = match state.store.get_async(&node_id).await {
-        Ok(Some(stored)) => stored,
-        Ok(None) => return admin_node_not_found(&node_id),
-        Err(error) => return admin_internal_error("could not load node configuration", &error),
+    let (node, revision) = match persist_node_draining(&state, &node_id, true).await {
+        Ok(result) => result,
+        Err(response) => return *response,
     };
-    stored.config.draining = true;
-    let stored = match state
-        .store
-        .update_async(&node_id, stored.revision, &stored.config)
-        .await
-    {
-        Ok(Some(stored)) => stored,
-        Ok(None) => {
-            return admin_conflict(
-                "revision_conflict",
-                "the node changed while draining was being applied",
-            );
-        }
-        Err(error) => return admin_internal_error("could not persist draining state", &error),
-    };
-    let Some(node) = state.scheduler.set_node_draining(&node_id, true) else {
-        return admin_internal_message("node is persisted but missing from the runtime registry");
-    };
-    state
-        .runtime_revisions
-        .write()
-        .insert(node_id.clone(), stored.revision);
     let drained = if query.wait {
-        let timeout_ms = query
-            .timeout_ms
-            .unwrap_or(state.settings.server.node_mutation_timeout_ms)
-            .min(3_600_000);
         state
             .scheduler
-            .wait_for_node_idle(&node, Duration::from_millis(timeout_ms))
+            .wait_for_node_idle(&node, mutation_timeout(&state, query.timeout_ms))
             .await
     } else {
         node.active() == 0
@@ -657,7 +648,7 @@ pub(super) async fn drain_node(
             "lifecycle": node.lifecycle(),
             "active": node.active(),
             "drained": drained,
-            "revision": stored.revision,
+            "revision": revision,
         })),
     )
         .into_response()
@@ -668,40 +659,66 @@ pub(super) async fn resume_node(
     Path(node_id): Path<String>,
 ) -> Response {
     let _mutation = state.admin_mutation.lock().await;
-    let mut stored = match state.store.get_async(&node_id).await {
-        Ok(Some(stored)) => stored,
-        Ok(None) => return admin_node_not_found(&node_id),
-        Err(error) => return admin_internal_error("could not load node configuration", &error),
+    let (node, revision) = match persist_node_draining(&state, &node_id, false).await {
+        Ok(result) => result,
+        Err(response) => return *response,
     };
-    stored.config.draining = false;
-    let stored = match state
-        .store
-        .update_async(&node_id, stored.revision, &stored.config)
-        .await
-    {
-        Ok(Some(stored)) => stored,
-        Ok(None) => {
-            return admin_conflict(
-                "revision_conflict",
-                "the node changed while resume was being applied",
-            );
-        }
-        Err(error) => return admin_internal_error("could not persist serving state", &error),
-    };
-    let Some(node) = state.scheduler.set_node_draining(&node_id, false) else {
-        return admin_internal_message("node is persisted but missing from the runtime registry");
-    };
-    state
-        .runtime_revisions
-        .write()
-        .insert(node_id, stored.revision);
     Json(json!({
         "node": node.id(),
         "lifecycle": node.lifecycle(),
         "routable": node.is_routable(),
-        "revision": stored.revision,
+        "revision": revision,
     }))
     .into_response()
+}
+
+async fn persist_node_draining(
+    state: &AppState,
+    node_id: &str,
+    draining: bool,
+) -> Result<(Arc<Node>, u64), Box<Response>> {
+    let mut stored = state
+        .store
+        .get_async(node_id)
+        .await
+        .map_err(|error| {
+            Box::new(admin_internal_error(
+                "could not load node configuration",
+                &error,
+            ))
+        })?
+        .ok_or_else(|| Box::new(admin_node_not_found(node_id)))?;
+    stored.config.draining = draining;
+    let (conflict_message, persist_message) = if draining {
+        (
+            "the node changed while draining was being applied",
+            "could not persist draining state",
+        )
+    } else {
+        (
+            "the node changed while resume was being applied",
+            "could not persist serving state",
+        )
+    };
+    let stored = state
+        .store
+        .update_async(node_id, stored.revision, &stored.config)
+        .await
+        .map_err(|error| Box::new(admin_internal_error(persist_message, &error)))?
+        .ok_or_else(|| Box::new(admin_conflict("revision_conflict", conflict_message)))?;
+    let node = state
+        .scheduler
+        .set_node_draining(node_id, draining)
+        .ok_or_else(|| {
+            Box::new(admin_internal_message(
+                "node is persisted but missing from the runtime registry",
+            ))
+        })?;
+    state
+        .runtime_revisions
+        .write()
+        .insert(node_id.to_owned(), stored.revision);
+    Ok((node, stored.revision))
 }
 
 pub(super) fn admin_node_not_found(node_id: &str) -> Response {

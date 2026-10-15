@@ -1,5 +1,6 @@
-use super::{Command, Stats, store, unix_ms};
+use super::{Command, Stats, store};
 use crate::config::SessionLogConfig;
+use crate::time::unix_millis;
 use std::{
     sync::{Arc, atomic::Ordering},
     time::Duration,
@@ -197,5 +198,7 @@ fn record_committed(batch: &[Command], stats: &Stats) {
             .count() as u64,
         Ordering::Relaxed,
     );
-    stats.last_commit_at_ms.store(unix_ms(), Ordering::Relaxed);
+    stats
+        .last_commit_at_ms
+        .store(unix_millis(), Ordering::Relaxed);
 }

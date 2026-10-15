@@ -7,6 +7,7 @@ use rusqlite_migration::{M, Migrations};
 use serde::Serialize;
 
 use crate::config::{NodeConfig, validate_node_config};
+use crate::time::unix_millis;
 
 const MIGRATION_LIST: &[M<'static>] = &[M::up(
     "CREATE TABLE node_configs (
@@ -305,15 +306,6 @@ fn decode_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNode> {
         created_at_unix_ms: row.get(2)?,
         updated_at_unix_ms: row.get(3)?,
     })
-}
-
-fn unix_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

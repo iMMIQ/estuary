@@ -1,8 +1,8 @@
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 
-import { formatCompactNumber } from "./node-config";
 import type { NodeRecord } from "./types";
+import { formatCompactNumber, formatPercent } from "./ui";
 
 export function relativeSync(value: number | null, t: TFunction): string {
   if (!value) return t("sync.never");
@@ -33,10 +33,6 @@ export function formatRate(value: number | null | undefined, locale: string): st
   return value == null || !Number.isFinite(value)
     ? "--"
     : formatCompactNumber(Math.max(0, value), locale);
-}
-
-export function formatRatio(value: number | null | undefined): string {
-  return value == null || !Number.isFinite(value) ? "--" : `${Math.round(value * 100)}%`;
 }
 
 export function summarizeVllm(nodes: NodeRecord[]) {
@@ -111,10 +107,10 @@ export function VllmRuntimePanel({
         />
         <MetricBox
           label={t("vllm.peakKv")}
-          value={formatRatio(runtime.maxKvUsage)}
+          value={formatPercent(runtime.maxKvUsage, "--")}
           accent={(runtime.maxKvUsage ?? 0) >= 0.9 ? "amber" : undefined}
         />
-        <MetricBox label={t("vllm.prefixHit")} value={formatRatio(runtime.prefixHitRate)} />
+        <MetricBox label={t("vllm.prefixHit")} value={formatPercent(runtime.prefixHitRate, "--")} />
       </div>
     </details>
   );

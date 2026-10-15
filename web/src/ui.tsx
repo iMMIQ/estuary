@@ -35,6 +35,12 @@ export function formatBytes(value: number): string {
   return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
+export function formatCompactNumber(value: number, locale = "en"): string {
+  return new Intl.NumberFormat(locale, { notation: "compact", maximumFractionDigits: 1 }).format(
+    value,
+  );
+}
+
 export function formatPercent(
   value: number | null | undefined,
   unavailable = "Unavailable",

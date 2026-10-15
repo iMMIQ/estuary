@@ -1192,6 +1192,17 @@ async fn admin_drain_and_resume_change_readiness() {
     let drained: Value = drained.json().await.expect("drain JSON");
     assert_eq!(drained["lifecycle"], "draining");
     assert_eq!(drained["drained"], true);
+    assert_eq!(drained["revision"], 2);
+    let persisted: Value = client
+        .get(admin.url("/admin/api/nodes/drainable"))
+        .send()
+        .await
+        .expect("load drained node")
+        .json()
+        .await
+        .expect("node JSON");
+    assert_eq!(persisted["config"]["draining"], true);
+    assert_eq!(persisted["revision"], drained["revision"]);
 
     let readiness = client
         .get(admin.url("/health/ready"))
@@ -1209,6 +1220,17 @@ async fn admin_drain_and_resume_change_readiness() {
     let resumed: Value = resumed.json().await.expect("resume JSON");
     assert_eq!(resumed["lifecycle"], "serving");
     assert_eq!(resumed["routable"], true);
+    assert_eq!(resumed["revision"], 3);
+    let persisted: Value = client
+        .get(admin.url("/admin/api/nodes/drainable"))
+        .send()
+        .await
+        .expect("load resumed node")
+        .json()
+        .await
+        .expect("node JSON");
+    assert_eq!(persisted["config"]["draining"], false);
+    assert_eq!(persisted["revision"], resumed["revision"]);
 }
 
 #[tokio::test]

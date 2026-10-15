@@ -9,9 +9,8 @@ import {
   UsageRow,
   VllmRuntimePanel,
 } from "./admin-metrics";
-import { formatCompactNumber } from "./node-config";
 import type { GatewayStatus, NodeRecord } from "./types";
-import { formatBytes, StatusBadge } from "./ui";
+import { formatBytes, formatCompactNumber, StatusBadge } from "./ui";
 export function Overview({
   status,
   nodes,

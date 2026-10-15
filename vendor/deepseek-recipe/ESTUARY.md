@@ -15,6 +15,7 @@ Local changes:
   Estuary sends Chat requests to vLLM, which renders and tokenizes them.
 - Replace the full-workspace README with a description of the vendored subset.
 - Keep upstream JSON Schema tool validation enabled.
+- Remove the unused Tokio dev-dependency from the included protocol crate.
 
 To update, replace the two crate source directories from the chosen upstream revision,
 reapply the optional tokenizer feature and implementation guard, and run the protocol

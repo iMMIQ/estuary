@@ -424,6 +424,85 @@ async fn preflight_checks_a_node_without_persisting_it() {
 }
 
 #[tokio::test]
+async fn preflight_preserves_credentials_unless_explicitly_cleared() {
+    let upstream = TestServer::spawn(Router::new().route(
+        "/v1/models",
+        get(|headers: axum::http::HeaderMap| async move {
+            if headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                == Some("Bearer stored-secret")
+                && headers
+                    .get("x-tenant")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("tenant-secret")
+            {
+                StatusCode::OK
+            } else {
+                StatusCode::UNAUTHORIZED
+            }
+        }),
+    ))
+    .await;
+    let admin =
+        TestServer::spawn(Gateway::build(Settings::default()).unwrap().admin_router()).await;
+    let client = client();
+    let mut config = node(&upstream.base_url);
+    config.api_key = Some("stored-secret".to_owned());
+    config
+        .headers
+        .insert("x-tenant".to_owned(), "tenant-secret".to_owned());
+    let created = client
+        .post(admin.url("/admin/api/nodes"))
+        .json(&config)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let mut redacted = config.clone();
+    redacted.api_key = None;
+    redacted.headers.clear();
+    for (query, candidate, expected) in [
+        ("", &redacted, StatusCode::OK),
+        (
+            "?clear_api_key=true",
+            &redacted,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "?clear_headers=true",
+            &redacted,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "?clear_api_key=true&clear_headers=true",
+            &config,
+            StatusCode::OK,
+        ),
+    ] {
+        let response = client
+            .post(admin.url(&format!("/admin/api/nodes/preflight{query}")))
+            .json(candidate)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "preflight query {query:?}");
+    }
+    let stored = client
+        .get(admin.url("/admin/api/nodes/dynamic-a"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(stored["revision"], 1);
+    assert_eq!(stored["credentials"]["api_key_configured"], true);
+    assert_eq!(stored["credentials"]["header_names"], json!(["x-tenant"]));
+}
+
+#[tokio::test]
 async fn process_drain_disables_readiness_without_draining_upstream_nodes() {
     let mut settings = Settings::default();
     settings.health.route_while_starting = true;
