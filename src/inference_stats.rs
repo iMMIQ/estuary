@@ -188,6 +188,9 @@ const PROVIDER_TIMING_FIELDS: [(&str, &str); 4] = [
 ];
 
 impl ProviderTimings {
+    pub(crate) fn mean_itl_seconds(self) -> Option<f64> {
+        self.values[3].map(|micros| micros as f64 / 1_000_000.0)
+    }
     pub fn observe(&mut self, value: &Value) {
         for metrics in [value.get("metrics"), value.pointer("/response/metrics")]
             .into_iter()
@@ -285,6 +288,7 @@ fn merge(target: &mut Option<usize>, value: Option<usize>) {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
 pub(crate) struct StreamObservation {
+    pub generation_events: u64,
     line: Vec<u8>,
     data: Vec<u8>,
     oversized: bool,
@@ -324,7 +328,10 @@ impl StreamObservation {
             self.has_visible_text |= visible_text(&value);
             self.usage.observe(&value);
             self.provider_timings.observe(&value);
-            self.has_output |= has_generation(&value);
+            if has_generation(&value) {
+                self.has_output = true;
+                self.generation_events = self.generation_events.saturating_add(1);
+            }
         } else {
             self.incomplete = true;
         }

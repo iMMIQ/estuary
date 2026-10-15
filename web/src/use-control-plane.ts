@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import * as api from "./api";
+import type { Observability } from "./observability-types";
 import type { GatewayStatus, NodeRecord } from "./types";
 
-export function useControlPlane() {
+export function useControlPlane(metricsQuery = "scope=fleet&window=300") {
   const { t } = useTranslation();
   const [nodes, setNodes] = useState<NodeRecord[]>([]);
   const [status, setStatus] = useState<GatewayStatus | null>(null);
@@ -17,6 +18,8 @@ export function useControlPlane() {
   const [nodesStale, setNodesStale] = useState(false);
   const [statusStale, setStatusStale] = useState(false);
   const [nodesLoaded, setNodesLoaded] = useState(false);
+  const [observability, setObservability] = useState<Observability | null>(null);
+  const [metricsStale, setMetricsStale] = useState(false);
 
   const refresh = useCallback(
     async (quiet = false) => {
@@ -25,9 +28,10 @@ export function useControlPlane() {
       const controller = new AbortController();
       pending.current = controller;
       if (!quiet) setRefreshing(true);
-      const [nodeResult, statusResult] = await Promise.allSettled([
+      const [nodeResult, statusResult, metricsResult] = await Promise.allSettled([
         api.listNodes(controller.signal),
         api.getStatus(controller.signal),
+        api.getObservability(metricsQuery, controller.signal),
       ]);
       if (controller.signal.aborted) return;
       pending.current = null;
@@ -36,6 +40,8 @@ export function useControlPlane() {
         setNodesLoaded(true);
       }
       if (statusResult.status === "fulfilled") setStatus(statusResult.value);
+      if (metricsResult.status === "fulfilled") setObservability(metricsResult.value);
+      setMetricsStale(metricsResult.status === "rejected");
       setNodesStale(nodeResult.status === "rejected");
       setStatusStale(statusResult.status === "rejected");
       const failure =
@@ -59,7 +65,7 @@ export function useControlPlane() {
       setLoading(false);
       setRefreshing(false);
     },
-    [t],
+    [t, metricsQuery],
   );
 
   useEffect(() => {
@@ -96,5 +102,7 @@ export function useControlPlane() {
     nodesStale,
     statusStale,
     nodesLoaded,
+    observability,
+    metricsStale,
   };
 }

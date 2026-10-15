@@ -539,6 +539,23 @@ impl BodyGuard {
             lease.record_success(self.header_latency);
         }
         self.metrics.observe_usage(self.observation.usage);
+        if let Some(lease) = &self.lease
+            && let Some(telemetry) = &lease.observation
+        {
+            let outcome = if self.observation.error_seen {
+                crate::observability::Outcome::Failed
+            } else if self.observation.incomplete || !self.observation.terminal_marker_seen {
+                crate::observability::Outcome::Unknown
+            } else {
+                crate::observability::Outcome::Success
+            };
+            telemetry.upstream(
+                outcome,
+                self.observation.usage,
+                self.observation.provider_timings.mean_itl_seconds(),
+                lease.generations(),
+            );
+        }
         self.terminal = true;
     }
 
@@ -563,9 +580,16 @@ impl BodyGuard {
                 }
             }
         }
+        let generation_events = self.observation.generation_events;
         match input {
             StreamingInput::Raw(bytes) => self.observation.observe_bytes(bytes),
             StreamingInput::Event(event) => self.observation.observe_json(event.data().as_bytes()),
+        }
+        if self.observation.generation_events > generation_events
+            && let Some(lease) = &self.lease
+            && let Some(telemetry) = &lease.observation
+        {
+            telemetry.generation(self.upstream_started.elapsed());
         }
         if self.observation.has_visible_text
             && let Some(log) = &self.log_attempt
@@ -586,6 +610,16 @@ impl BodyGuard {
     }
 
     pub(super) fn failed(&mut self, message: String, health_config: &crate::config::HealthConfig) {
+        if let Some(lease) = &self.lease
+            && let Some(telemetry) = &lease.observation
+        {
+            telemetry.upstream(
+                crate::observability::Outcome::Failed,
+                self.observation.usage,
+                self.observation.provider_timings.mean_itl_seconds(),
+                lease.generations(),
+            );
+        }
         if let Some(log) = &mut self.log_attempt {
             let class = if message.contains("idle timeout") {
                 "body_idle_timeout"
@@ -608,6 +642,16 @@ impl BodyGuard {
 impl Drop for BodyGuard {
     fn drop(&mut self) {
         if !self.terminal {
+            if let Some(lease) = &self.lease
+                && let Some(telemetry) = &lease.observation
+            {
+                telemetry.upstream(
+                    crate::observability::Outcome::Cancelled,
+                    self.observation.usage,
+                    self.observation.provider_timings.mean_itl_seconds(),
+                    lease.generations(),
+                );
+            }
             self.metrics.stream_cancelled(&self.node_id);
         }
     }

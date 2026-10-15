@@ -7,6 +7,7 @@ use. The maintained technical documentation is organized by task:
 | --- | --- |
 | [Architecture](architecture.md) | Request flow, scheduling, persistence, protocol adaptation, backpressure, and process lifecycle. |
 | [Configuration and operations](operations.md) | Runtime settings, node configuration, security, health checks, management endpoints, and metrics. |
+| [Dashboard observability](observability.md) | Smoothed throughput, latency, request outcomes, engine telemetry, windows, and metric definitions. |
 | [Native vLLM provider](vllm.md) | vLLM version requirements, telemetry, tokenization, KV events, and client compatibility. |
 | [Local end-to-end tests](local-e2e.md) | Real Claude Code, Codex, and OpenCode tests with local CPU inference servers. |
 | [Deployment](../deploy/README.md) | Static binary installation, Docker, zero-downtime rollout, rollback, and persistent paths. |

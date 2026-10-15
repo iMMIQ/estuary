@@ -1,10 +1,12 @@
 import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
+import { metricsChinese, metricsEnglish } from "./metrics-i18n";
 
 export type Locale = "en" | "zh-CN";
 export const localeStorageKey = "estuary.locale";
 
 const en = {
+  ...metricsEnglish,
   "nav.logs": "Session logs",
   "logs.title": "Session logs",
   "logs.subtitle": "Requests, routing attempts and captured conversation content",
@@ -407,6 +409,7 @@ declare module "i18next" {
 }
 
 const zhCN: Record<keyof typeof en, string> = {
+  ...metricsChinese,
   "nav.logs": "会话日志",
   "logs.title": "会话日志",
   "logs.subtitle": "查看请求、路由尝试和捕获的会话内容",

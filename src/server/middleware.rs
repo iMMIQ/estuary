@@ -104,7 +104,19 @@ pub(super) async fn admit_public_request(
     }
 
     let started = std::time::Instant::now();
+    if let Some(telemetry) = request
+        .extensions()
+        .get::<Arc<crate::observability::Observation>>()
+    {
+        telemetry.wait_started(true);
+    }
     let _admission = state.scheduler.admit_ingress(reserved_bytes).await;
+    if let Some(telemetry) = request
+        .extensions()
+        .get::<Arc<crate::observability::Observation>>()
+    {
+        telemetry.ingress(started.elapsed());
+    }
     if let Some(log) = request
         .extensions()
         .get::<Arc<crate::session_log::Observation>>()
@@ -225,13 +237,33 @@ pub(super) async fn track_public_response(
 
 pub(super) async fn observe_request(
     State(state): State<Arc<AppState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let started = std::time::Instant::now();
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     let endpoint = metric_endpoint(&path);
+    let telemetry = (method == Method::POST
+        && matches!(
+            path.as_str(),
+            "/v1/chat/completions"
+                | "/v1/responses"
+                | "/v1/completions"
+                | "/v1/embeddings"
+                | "/v1/messages"
+        ))
+    .then(|| {
+        let observation = state.telemetry.begin();
+        if path == "/v1/embeddings" {
+            observation.non_generating();
+        }
+        observation
+    });
+    let mut delivery = telemetry.as_ref().map(|observation| {
+        request.extensions_mut().insert(Arc::clone(observation));
+        crate::observability::Delivery::new(Arc::clone(observation))
+    });
     let request_id = request
         .extensions()
         .get::<RequestId>()
@@ -262,8 +294,42 @@ pub(super) async fn observe_request(
         path,
         status = response.status().as_u16(),
         elapsed_ms = elapsed.as_millis(),
-        "request completed"
+        "response created"
     );
+    if let Some(telemetry) = telemetry {
+        let streaming = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream"));
+        telemetry.headers(response.status().as_u16(), streaming);
+        let length = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let (parts, body) = response.into_parts();
+        if let Some(delivery) = &mut delivery {
+            delivery.complete = length == Some(0) || body.is_end_stream();
+        }
+        let stream = async_stream::stream! {
+            let mut delivery = delivery;
+            let mut remaining = length;
+            let mut body = body.into_data_stream();
+            while let Some(item) = body.next().await {
+                match &item {
+                    Ok(bytes) => if let Some(left) = &mut remaining {
+                        *left = left.saturating_sub(bytes.len() as u64);
+                        if let Some(delivery) = &mut delivery { delivery.complete = *left == 0; }
+                    },
+                    Err(_) => telemetry.failed(),
+                }
+                yield item;
+            }
+            if let Some(delivery) = &mut delivery { delivery.complete = true; }
+        };
+        return Response::from_parts(parts, Body::from_stream(stream));
+    }
     response
 }
 

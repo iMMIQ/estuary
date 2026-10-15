@@ -90,7 +90,9 @@ pub(super) async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                 "content-type",
                 "application/openmetrics-text; version=1.0.0; charset=utf-8",
             )],
-            state.session_log.encode_metrics(body),
+            state
+                .session_log
+                .encode_metrics(state.telemetry.encode_metrics(body)),
         )
             .into_response(),
         Err(error) => {
@@ -114,6 +116,34 @@ pub(super) async fn admin_nodes(State(state): State<Arc<AppState>>) -> Response 
         .into_response(),
         Err(error) => admin_internal_error("could not load node configurations", &error),
     }
+}
+
+#[derive(Default, Deserialize)]
+pub(super) struct ObservabilityQuery {
+    #[serde(default)]
+    scope: String,
+    #[serde(default)]
+    id: String,
+    window: Option<u64>,
+}
+pub(super) async fn observability(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ObservabilityQuery>,
+) -> Response {
+    let seconds = query.window.unwrap_or(300);
+    let scope = if query.scope.is_empty() {
+        "fleet"
+    } else {
+        &query.scope
+    };
+    if ![60, 300, 900].contains(&seconds)
+        || !["fleet", "node", "model"].contains(&scope)
+        || query.id.len() > 1024
+        || (scope != "fleet" && query.id.is_empty())
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"invalid_observability_query","message":"Use scope fleet/node/model and window 60/300/900 seconds"}}))).into_response();
+    }
+    Json(state.telemetry.snapshot(scope, &query.id, seconds)).into_response()
 }
 
 #[derive(Debug, Serialize)]

@@ -115,6 +115,14 @@ pub(super) async fn buffered_success_response(
         lease.record_output_tokens(tokens);
     }
     metrics.observe_usage(usage);
+    if let Some(telemetry) = &lease.observation {
+        telemetry.upstream(
+            crate::observability::Outcome::Success,
+            usage,
+            provider_timings.mean_itl_seconds(),
+            lease.generations(),
+        );
+    }
     if let Some(log) = log_attempt.as_mut() {
         log.update(|attempt| {
             provider_timings.write_to(&mut attempt.timings_us);

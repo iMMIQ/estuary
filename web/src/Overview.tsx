@@ -1,17 +1,12 @@
 import { Button, TextInput } from "@mantine/core";
 import { AlertTriangle, Check, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-  MetricBox,
-  relativeSync,
-  summarizeVllm,
-  UsageRow,
-  VllmRuntimePanel,
-} from "./admin-metrics";
+import { MetricBox, relativeSync, summarizeVllm, UsageRow } from "./admin-metrics";
 import type { GatewayStatus, NodeRecord } from "./types";
 import { formatBytes, formatCompactNumber, StatusBadge } from "./ui";
 export function Overview({
+  observabilityPanel,
   status,
   nodes,
   lastSync,
@@ -25,6 +20,7 @@ export function Overview({
   loading,
   nodesLoaded,
 }: {
+  observabilityPanel: ReactNode;
   loading: boolean;
   nodesLoaded: boolean;
   status: GatewayStatus | null;
@@ -102,6 +98,22 @@ export function Overview({
         </Button>
       </section>
 
+      {attention.length > 0 && (
+        <div className="data-status" role="status">
+          <span>{t("metrics.attentionCount", { count: attention.length })}</span>
+          <Button
+            size="compact-xs"
+            variant="default"
+            onClick={() => {
+              const node = attention[0];
+              if (node) onSelectNode(node);
+            }}
+          >
+            {t("common.view")}
+          </Button>
+        </div>
+      )}
+      {observabilityPanel}
       <section className="dashboard-panel fleet-summary-panel">
         <h2>{t("overview.fleetSummary")}</h2>
         <div className="fleet-summary-grid">
@@ -226,7 +238,6 @@ export function Overview({
           />
         </div>
       </section>
-      <VllmRuntimePanel nodes={nodes} />
 
       <div className="dashboard-two-column">
         <section className="dashboard-panel compact-panel">

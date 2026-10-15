@@ -30,6 +30,9 @@ pub(super) async fn proxy_with_retries(
     let mut attempt = 0usize;
     loop {
         let queue_started = Instant::now();
+        if let Some(telemetry) = &request.telemetry {
+            telemetry.wait_started(false);
+        }
         let selection = state
             .scheduler
             .acquire(
@@ -43,7 +46,18 @@ pub(super) async fn proxy_with_retries(
             .metrics
             .observe_queue_duration(queue_started.elapsed().as_secs_f64());
         let scheduler_wait = queue_started.elapsed();
-        let selection = selection?;
+        if let Some(telemetry) = &request.telemetry {
+            telemetry.queue(scheduler_wait);
+        }
+        let mut selection = selection?;
+        if let Some(telemetry) = &request.telemetry {
+            if let Some(model) = &request.public_model {
+                telemetry.model(model);
+            }
+            telemetry.assign(selection.node.id(), selection.node.instance_id());
+            telemetry.route(selection.prefix_match_tokens, selection.prefix_match_chars);
+            selection.lease.observation = Some(Arc::clone(telemetry));
+        }
         state
             .metrics
             .observe_prefix_match(selection.prefix_match_chars);
@@ -150,6 +164,9 @@ pub(super) async fn proxy_with_retries(
                     .record_failure(error.to_string(), &state.settings.health);
                 state.metrics.attempt(node.id(), "transport_error");
                 if retryable {
+                    if let Some(telemetry) = &request.telemetry {
+                        telemetry.retry();
+                    }
                     state.metrics.retry(node.id(), "connect_error");
                     excluded.insert(node.id().to_owned());
                     drop(selection.lease);
@@ -208,6 +225,9 @@ pub(super) async fn proxy_with_retries(
         state.metrics.attempt(node.id(), status.as_str());
 
         if retryable_status {
+            if let Some(telemetry) = &request.telemetry {
+                telemetry.retry();
+            }
             if let Some(log) = &mut log_attempt {
                 log.finish("error", Some("upstream_status"));
                 log.update(|a| a.retry_reason = Some(status.as_str().to_owned()));
@@ -287,6 +307,9 @@ pub(super) async fn proxy_with_retries(
                         }
                     }
                     if retryable {
+                        if let Some(telemetry) = &request.telemetry {
+                            telemetry.retry();
+                        }
                         state.metrics.retry(node.id(), "body_error");
                         excluded.insert(node.id().to_owned());
                         drop(selection.lease);

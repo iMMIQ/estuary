@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
+import { metricNumber } from "./metric-series";
 import { effectiveCapability, effectiveModelMappings, protocolPaths } from "./node-config";
 import type { NodeRecord } from "./types";
 import { formatPercent, formatTimestamp, StatusBadge } from "./ui";
@@ -25,7 +26,7 @@ function metricRate(
   unavailable: string,
 ): string {
   if (value == null || !Number.isFinite(value)) return unavailable;
-  return `${new Intl.NumberFormat(locale, { notation: "compact", maximumFractionDigits: 1 }).format(value)} ${unit}`;
+  return `${metricNumber(value, locale)} ${unit}`;
 }
 
 function DataRow({ label, value }: { label: string; value: ReactNode }) {
@@ -47,6 +48,7 @@ function RuntimeCard({ title, children }: { title: string; children: ReactNode }
 }
 
 export function NodeDetails({
+  observabilityPanel,
   node,
   busy,
   onClose,
@@ -54,6 +56,7 @@ export function NodeDetails({
   onToggleDrain,
   onDelete,
 }: {
+  observabilityPanel: ReactNode;
   node: NodeRecord;
   busy: boolean;
   onClose: () => void;
@@ -287,6 +290,7 @@ export function NodeDetails({
         </Tabs.Panel>
 
         <Tabs.Panel value="metrics" pt="md">
+          {observabilityPanel}
           <div className="metric-tile-grid">
             <div>
               <Gauge size={16} />

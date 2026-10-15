@@ -85,12 +85,14 @@ pub async fn proxy(
     Path(endpoint): Path<String>,
     Extension(request_id): Extension<RequestId>,
     observation: Option<Extension<Arc<crate::session_log::Observation>>>,
+    telemetry: Option<Extension<Arc<crate::observability::Observation>>>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
     let observation = observation.map(|Extension(log)| log);
+    let telemetry = telemetry.map(|Extension(telemetry)| telemetry);
     let body_started = std::time::Instant::now();
     let is_anthropic = matches!(endpoint.as_str(), "messages" | "messages/count_tokens")
         || endpoint.starts_with("files/");
@@ -129,6 +131,7 @@ pub async fn proxy(
         headers,
         body,
         observation.clone(),
+        telemetry,
     )
     .await;
     if let Err(error) = &result
@@ -182,6 +185,7 @@ async fn proxy_inner(
     headers: HeaderMap,
     body: Bytes,
     observation: Option<Arc<crate::session_log::Observation>>,
+    telemetry: Option<Arc<crate::observability::Observation>>,
 ) -> Result<Response, GatewayError> {
     if endpoint.starts_with("files/") {
         return Err(GatewayError::UnsupportedFeature(
@@ -237,6 +241,11 @@ async fn proxy_inner(
         .map(str::to_owned);
     if is_inference_json && public_model.is_none() {
         return Err(GatewayError::MissingModel);
+    }
+    if let (Some(telemetry), Some(model)) = (&telemetry, public_model.as_deref())
+        && state.scheduler.has_explicit_model(model)
+    {
+        telemetry.model(model);
     }
     if let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_mut())
         && !state.scheduler.model_supports_multimodal(model)
@@ -321,12 +330,14 @@ async fn proxy_inner(
             count_tokens,
             record_prefix,
             observation,
+            telemetry,
         },
     )
     .await
 }
 
 struct ProxyRequest {
+    telemetry: Option<Arc<crate::observability::Observation>>,
     endpoint: String,
     method: Method,
     query: Option<String>,

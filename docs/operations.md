@@ -122,6 +122,7 @@ The following routes are exposed on the management listener:
 | `GET /admin/` | Embedded management application. |
 | `GET /metrics` | OpenMetrics exposition. |
 | `GET /admin/api/status` | Fleet, queue, connection, and response-buffer summary. |
+| `GET /admin/api/observability` | Smoothed rates, windowed outcomes and latency, model/node summaries, and selected history. |
 | `GET /admin/api/process` | Local process lifecycle and queue state. |
 | `PUT /admin/api/process/drain` | Disable readiness, stop accepting after withdrawal, drain accepted responses, and exit. |
 | `POST /admin/api/nodes/preflight` | Validate and probe a candidate without saving it. |
@@ -166,6 +167,8 @@ assets, including the generated `.gz` files.
 
 ## Metrics
 
+The [dashboard observability guide](observability.md) defines smoothing, windows,
+sources, request outcomes, missing data, and the shared dashboard/metrics API.
 Important metric families include:
 
 - requests, upstream attempts, retries, streaming cancellations, and streaming
@@ -180,7 +183,8 @@ Important metric families include:
 - exact vLLM directory readiness, blocks, and accounted bytes.
 
 All names use the `estuary_` prefix. Labels are bounded to endpoints, statuses,
-nodes, and predefined outcomes; credentials are never used as labels.
+nodes, capped public-model names, and predefined outcomes; credentials are never
+used as labels.
 
 ## Security
 

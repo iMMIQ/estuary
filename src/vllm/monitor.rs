@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 use crate::{
     config::ProviderKind,
     kv_cache::ExactCacheDirectory,
-    node::{Node, ProviderState, VllmMetricsSnapshot},
+    node::{Node, ProviderCounter, ProviderState, VllmMetricsSnapshot},
     prefix::PrefixDirectory,
 };
 
@@ -216,8 +216,27 @@ pub(super) fn parse_metrics(body: &[u8]) -> Result<VllmMetricsSnapshot> {
     let mut prefix_queries = None;
     let mut prefix_hits = None;
     let mut preemptions = None;
+    let mut counter_series = Vec::new();
     for sample in scrape.samples {
         let value = scalar_metric(&sample.value);
+        let kind = match sample.metric.trim_end_matches("_total") {
+            "vllm_prompt_tokens" => Some(0),
+            "vllm_generation_tokens" => Some(1),
+            "vllm_request_success" => Some(2),
+            "vllm_prefix_cache_queries" => Some(3),
+            "vllm_prefix_cache_hits" => Some(4),
+            "vllm_num_preemptions" => Some(5),
+            _ => None,
+        };
+        if let (Some(kind), Some(value)) = (kind, value)
+            && value.is_finite()
+            && value >= 0.0
+            && counter_series.len() <= 512
+        {
+            let labels = sample.labels.to_string();
+            let key = format!("{kind}:{}", blake3::hash(labels.as_bytes()).to_hex());
+            counter_series.push(ProviderCounter { key, kind, value });
+        }
         match sample.metric.as_str() {
             "vllm_num_requests_running" => {
                 running = Some(running.unwrap_or(0.0) + value.unwrap_or(0.0));
@@ -255,6 +274,7 @@ pub(super) fn parse_metrics(body: &[u8]) -> Result<VllmMetricsSnapshot> {
         .filter(|value| value.is_finite())
         .map(|value| value.clamp(0.0, 1.0));
     Ok(VllmMetricsSnapshot {
+        counter_series,
         running,
         waiting,
         kv_cache_usage,

@@ -28,6 +28,230 @@
   --mantine-primary-color-filled-hover: #365ac4;
 }
 
+.observability-panel {
+  min-width: 0;
+  padding: 20px;
+}
+.observability-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+.observability-heading p {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 6px;
+}
+.observability-heading .mantine-Select-root {
+  width: 180px;
+  max-width: 100%;
+}
+.observability-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px 14px;
+  margin-top: 22px;
+}
+.metric-summary {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.metric-summary > span,
+.metric-summary small {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.metric-summary > strong {
+  color: var(--text);
+  font-size: 25px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.metrics-quality {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px 18px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 12px;
+  margin: 20px 0;
+}
+.metrics-section-label {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 18px 0 10px;
+}
+.metric-trends {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+.metric-trend {
+  margin: 0;
+  min-width: 0;
+}
+.metric-trend-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  margin: 8px 0;
+}
+.metric-trend-heading > span {
+  color: var(--muted);
+}
+.metric-trend svg {
+  display: block;
+  overflow: visible;
+  touch-action: pan-y;
+}
+.metric-grid-line {
+  stroke: var(--border-soft);
+  stroke-width: 1;
+}
+.metric-axis {
+  fill: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.metric-line {
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linejoin: round;
+}
+.metric-line.metric-series-0 {
+  stroke: var(--blue);
+}
+.metric-line.metric-series-1 {
+  stroke: var(--green);
+}
+.metric-guide {
+  stroke: var(--muted);
+  stroke-width: 1;
+  stroke-dasharray: 2 3;
+}
+.metric-trend figcaption {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px 14px;
+  color: var(--muted);
+  font-size: 11px;
+  min-height: 32px;
+  font-variant-numeric: tabular-nums;
+}
+.metric-trend figcaption > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.metric-swatch {
+  width: 12px;
+  height: 3px;
+  background: var(--blue);
+  display: inline-block;
+}
+.metric-swatch.metric-series-1 {
+  background: var(--green);
+}
+.metric-inspector {
+  width: 100%;
+  height: 18px;
+  accent-color: var(--indigo);
+}
+.metric-time-inspector {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 14px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.metric-time-inspector > span {
+  flex: 0 0 auto;
+}
+.metrics-details {
+  border-top: 1px solid var(--border-soft);
+  margin-top: 20px;
+  padding-top: 14px;
+}
+.metrics-details > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 5px 0;
+}
+.observability-extra {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px 14px;
+  margin: 18px 0 8px;
+}
+.observability-extra .metric-summary > strong {
+  font-size: 18px;
+}
+.metrics-note {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+  margin-top: 14px;
+}
+.engine-summary {
+  margin: 16px 0;
+  padding: 14px 0;
+  border-top: 1px solid var(--border-soft);
+  border-bottom: 1px solid var(--border-soft);
+}
+.engine-summary .observability-extra {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.metrics-model-link {
+  padding: 3px 0;
+  border: 0;
+  background: transparent;
+  color: var(--blue);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+@media (min-width: 1200px) {
+  .observability-summary {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+}
+@media (max-width: 720px) {
+  .observability-summary,
+  .observability-extra {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .metric-trends {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .observability-heading {
+    align-items: flex-start;
+  }
+  .observability-heading > .mantine-Group-root {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .observability-heading .mantine-Select-root {
+    width: 100%;
+    flex: 1 1 140px;
+  }
+  .metric-summary > strong {
+    font-size: 22px;
+  }
+  .metric-inspector {
+    height: 30px;
+  }
+}
+
 * {
   box-sizing: border-box;
 }

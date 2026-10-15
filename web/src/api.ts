@@ -1,3 +1,4 @@
+import type { Observability } from "./observability-types";
 import type { GatewayStatus, NodeConfig, NodeRecord, PreflightResponse } from "./types";
 
 interface NodeListResponse {
@@ -46,6 +47,10 @@ export async function listNodes(signal?: AbortSignal): Promise<NodeRecord[]> {
 
 export function getStatus(signal?: AbortSignal): Promise<GatewayStatus> {
   return request("/admin/api/status", readOptions(signal));
+}
+
+export function getObservability(query: string, signal?: AbortSignal): Promise<Observability> {
+  return request(`/admin/api/observability?${query}`, readOptions(signal));
 }
 
 export function getNode(id: string): Promise<NodeRecord> {

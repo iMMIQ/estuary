@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     net::{SocketAddr, TcpListener as StdTcpListener},
     path::Path as FsPath,
-    sync::{Arc, atomic::AtomicU64},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -32,6 +35,7 @@ use crate::{
     lifecycle::ProcessLifecycle,
     metrics::Metrics,
     node::Node,
+    observability::{Observability, Pressure},
     proxy,
     response_buffer::ResponseBufferBudget,
     scheduler::Scheduler,
@@ -62,6 +66,8 @@ use admin::{
 pub struct RequestId(pub String);
 
 pub struct AppState {
+    pub(crate) telemetry: Arc<Observability>,
+    sampler_started: AtomicBool,
     pub(crate) client: reqwest::Client,
     pub(crate) scheduler: Arc<Scheduler>,
     pub(crate) metrics: Arc<Metrics>,
@@ -142,8 +148,12 @@ impl Gateway {
         );
         let connections = Arc::new(ConnectionTracker::default());
         let session_log = crate::session_log::LogSink::new(settings.session_log.clone());
+        let telemetry = Observability::new();
+        telemetry.configure_models(scheduler.models());
         Ok(Self {
             state: Arc::new(AppState {
+                telemetry,
+                sampler_started: AtomicBool::new(false),
                 client,
                 scheduler,
                 metrics,
@@ -166,6 +176,7 @@ impl Gateway {
     }
 
     pub fn public_router(&self) -> Router {
+        self.start_telemetry();
         let max_body = self.state.settings.server.max_request_body_bytes;
         Router::new()
             .route("/api/hello", get(api_hello))
@@ -195,6 +206,7 @@ impl Gateway {
     }
 
     pub fn admin_router(&self) -> Router {
+        self.start_telemetry();
         let protected = Router::new()
             .route("/", get(admin_redirect))
             .route("/admin", get(admin_redirect))
@@ -202,6 +214,7 @@ impl Gateway {
             .route("/metrics", get(metrics))
             .route("/admin/nodes", get(nodes))
             .route("/admin/api/status", get(admin_status))
+            .route("/admin/api/observability", get(admin::observability))
             .route("/admin/api/logs/status", get(logs::status))
             .route("/admin/api/logs/requests", get(logs::requests))
             .route("/admin/api/logs/requests/{id}", get(logs::request))
@@ -254,6 +267,47 @@ impl Gateway {
             .await
             .with_context(|| format!("failed to bind public listener on {public_address}"))?;
         self.run_with_listener(public_listener, false).await
+    }
+
+    fn start_telemetry(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.state.sampler_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.state);
+        runtime.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(state) = weak.upgrade() else {
+                    break;
+                };
+                let buffer = state.response_buffer.snapshot();
+                state.telemetry.configure_models(state.scheduler.models());
+                let (queued, _) = state.scheduler.queue_snapshot();
+                let pressure = Pressure {
+                    queued,
+                    admission_waiters: state.scheduler.admission_waiters(),
+                    buffer_waiters: buffer.waiting_responses,
+                    buffer_bytes: buffer.used_bytes,
+                    buffer_limit: buffer.max_bytes,
+                    ..Pressure::default()
+                };
+                let nodes = state
+                    .scheduler
+                    .nodes()
+                    .into_iter()
+                    .map(|node| {
+                        let fresh = node.fresh_vllm_waiting().is_some();
+                        (node.snapshot(), fresh)
+                    })
+                    .collect();
+                state.telemetry.sample(nodes, pressure);
+            }
+        });
     }
 
     pub async fn run_with_public_listener(self, listener: StdTcpListener) -> Result<()> {

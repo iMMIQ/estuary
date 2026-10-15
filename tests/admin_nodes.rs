@@ -113,7 +113,8 @@ async fn vllm_operational_metrics_are_exposed_as_structured_admin_data() {
     assert_eq!(created["runtime"]["upstream_running"], 2);
     assert_eq!(created["runtime"]["upstream_waiting"], 1);
     assert_eq!(created["runtime"]["kv_cache_usage"], 0.62);
-    assert_eq!(created["runtime"]["prefix_cache_hit_rate"], 0.74);
+    // A recent-window ratio needs two samples; lifetime totals alone are not a rate.
+    assert!(created["runtime"]["prefix_cache_hit_rate"].is_null());
     assert_eq!(created["runtime"]["prefix_cache_queries_total"], 1000.0);
     assert_eq!(created["runtime"]["prefix_cache_hits_total"], 740.0);
     assert_eq!(created["runtime"]["preemptions_total"], 2.0);

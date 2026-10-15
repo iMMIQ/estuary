@@ -128,7 +128,7 @@ impl Metrics {
         let mut registry = Registry::with_prefix("estuary");
         registry.register(
             "requests",
-            "Completed downstream responses by endpoint and HTTP status.",
+            "Downstream response headers created by endpoint and HTTP status; streaming bodies may still be in progress.",
             requests.clone(),
         );
         registry.register(

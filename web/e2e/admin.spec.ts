@@ -76,9 +76,8 @@ test("creates an upstream through the management workflow", async ({ page }) => 
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
   await expect(page.getByText("All systems nominal")).toBeVisible();
   await expect(page.getByText("Raw Metrics")).toHaveCount(0);
-  if (test.info().project.name === "mobile")
-    await page.locator(".vllm-runtime-panel summary").click();
-  await expect(page.getByText("Prompt throughput")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Gateway observability" })).toBeVisible();
+  await expect(page.locator(".observability-summary").getByText("Output throughput")).toBeVisible();
 
   await page
     .locator("button:visible")

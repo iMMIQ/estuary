@@ -9,6 +9,7 @@ pub mod kv_cache;
 pub mod lifecycle;
 pub mod metrics;
 pub mod node;
+pub mod observability;
 pub mod prefix;
 pub mod proxy;
 pub mod response_buffer;

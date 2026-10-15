@@ -16,6 +16,7 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import * as api from "./api";
 import { type Locale, localeStorageKey } from "./i18n";
+import { ObservabilityPanel } from "./Observability";
 import { Overview } from "./Overview";
 import { type NodeFilter, Upstreams } from "./Upstreams";
 
@@ -84,6 +85,14 @@ function LanguageSwitch() {
 export default function App() {
   const { t, i18n } = useTranslation();
   const [view, setView] = useState<View>("overview");
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [metricsWindow, setMetricsWindow] = useState(300);
+  const [metricsModel, setMetricsModel] = useState("");
+  const metricsQuery = new URLSearchParams({
+    scope: selectedNodeId ? "node" : metricsModel ? "model" : "fleet",
+    id: selectedNodeId ?? metricsModel,
+    window: String(metricsWindow),
+  }).toString();
   const {
     nodes,
     status,
@@ -95,11 +104,12 @@ export default function App() {
     nodesStale,
     statusStale,
     nodesLoaded,
-  } = useControlPlane();
+    observability,
+    metricsStale,
+  } = useControlPlane(metricsQuery);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [editorDirty, setEditorDirty] = useState(false);
   const [conflict, setConflict] = useState<NodeRecord | null>(null);
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<NodeRecord | null>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
@@ -124,6 +134,18 @@ export default function App() {
   }, [view, selectedNodeId, editor?.mode]);
 
   const selectedNode = nodes.find((node) => node.config.id === selectedNodeId) ?? null;
+  const metricsPanel = (
+    <ObservabilityPanel
+      data={observability}
+      stale={metricsStale}
+      window={metricsWindow}
+      onWindow={setMetricsWindow}
+      model={metricsModel}
+      onModel={setMetricsModel}
+      nodeId={selectedNode?.config.id}
+      nodeInstance={selectedNode?.runtime.instance_id}
+    />
+  );
   const openAdd = () => {
     setConflict(null);
     setEditorDirty(false);
@@ -351,6 +373,7 @@ export default function App() {
             />
           ) : selectedNode ? (
             <NodeDetails
+              observabilityPanel={metricsPanel}
               node={selectedNode}
               busy={busy}
               onClose={() => setSelectedNodeId(null)}
@@ -362,6 +385,7 @@ export default function App() {
             <SessionLogs />
           ) : view === "overview" ? (
             <Overview
+              observabilityPanel={metricsPanel}
               loading={loading}
               nodesLoaded={nodesLoaded}
               status={status}
@@ -377,6 +401,8 @@ export default function App() {
             />
           ) : (
             <Upstreams
+              observabilityPanel={metricsPanel}
+              metrics={observability?.nodes ?? []}
               nodes={nodes}
               busy={busy}
               loading={loading}

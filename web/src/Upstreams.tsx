@@ -12,14 +12,17 @@ import {
   Server,
   Trash2,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { formatRate, ProgressValue, relativeSync, VllmRuntimePanel } from "./admin-metrics";
+import { formatRate, ProgressValue, relativeSync } from "./admin-metrics";
+import type { ScopeMetrics } from "./observability-types";
 import type { NodeRecord } from "./types";
 import { formatCompactNumber, formatPercent, StatusBadge } from "./ui";
 export type NodeFilter = "all" | "accepting" | "attention" | "draining" | "not_ready";
 
 export function Upstreams({
+  observabilityPanel,
+  metrics,
   nodes,
   loading,
   busy,
@@ -36,6 +39,8 @@ export function Upstreams({
   onDelete,
   onAdd,
 }: {
+  observabilityPanel: ReactNode;
+  metrics: ScopeMetrics[];
   nodes: NodeRecord[];
   loading: boolean;
   busy: boolean;
@@ -126,7 +131,7 @@ export function Upstreams({
         </div>
       </header>
 
-      <VllmRuntimePanel nodes={nodes} compact />
+      {observabilityPanel}
 
       <TextInput
         className="node-search"
@@ -190,6 +195,10 @@ export function Upstreams({
               </thead>
               <tbody>
                 {visible.map((node) => {
+                  const measured = metrics.find(
+                    (scope) =>
+                      scope.id === node.config.id && scope.instance === node.runtime.instance_id,
+                  );
                   const telemetry = node.admission.telemetry_fresh;
                   const running =
                     node.config.provider.type === "vllm"
@@ -257,6 +266,10 @@ export function Upstreams({
                           )}
                         </strong>
                         <span>{t("upstreams.promptGeneration")}</span>
+                        <span>
+                          {t("metrics.nodeOutput")}:{" "}
+                          {formatRate(measured?.rates.output.smoothed, locale)} tok/s
+                        </span>
                       </td>
                       <td data-label={t("upstreams.localLoad")}>
                         <ProgressValue
@@ -291,6 +304,12 @@ export function Upstreams({
                         </span>
                       </td>
                       <td data-label={t("upstreams.latency")}>
+                        <strong>
+                          {t("metrics.nodeTtft")}:{" "}
+                          {measured?.latency.ttft.p95 == null
+                            ? "—"
+                            : `${Math.round(measured.latency.ttft.p95 * 1000)} ms`}
+                        </strong>
                         <strong>
                           {node.runtime.ttft_ewma_ms == null
                             ? "--"

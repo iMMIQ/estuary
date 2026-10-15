@@ -455,6 +455,13 @@ impl Scheduler {
         }
     }
 
+    pub(crate) fn has_explicit_model(&self, model: &str) -> bool {
+        self.nodes
+            .read()
+            .iter()
+            .any(|node| node.explicit_models().any(|(public, _)| public == model))
+    }
+
     pub fn models(&self) -> Vec<String> {
         let mut models = self
             .nodes()

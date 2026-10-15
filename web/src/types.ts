@@ -12,6 +12,7 @@ type LifecycleState = "serving" | "draining";
 type CircuitState = "closed" | "open" | "half_open";
 
 interface NodeRuntime {
+  instance_id?: number;
   id: string;
   base_url: string;
   provider: ProviderKind;

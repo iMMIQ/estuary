@@ -19,6 +19,9 @@ use crate::config::{CircuitBreakerConfig, HealthConfig, NodeConfig, ProviderConf
 use crate::time::unix_millis;
 
 const EWMA_ALPHA: f64 = 0.20;
+mod telemetry;
+pub use telemetry::EngineTelemetry;
+pub(crate) use telemetry::ProviderCounter;
 static NEXT_NODE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -106,6 +109,7 @@ struct CircuitTicket {
 
 #[derive(Clone, Debug, Default)]
 struct ProviderRuntime {
+    counters: telemetry::Tracker,
     state: Option<ProviderState>,
     version: Option<String>,
     running: usize,
@@ -188,6 +192,8 @@ impl Default for RuntimeStats {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct NodeSnapshot {
+    pub instance_id: u64,
+    pub engine: EngineTelemetry,
     pub id: String,
     pub base_url: String,
     pub health: HealthState,
@@ -225,8 +231,9 @@ pub struct NodeSnapshot {
     pub provider_last_error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct VllmMetricsSnapshot {
+    pub counter_series: Vec<ProviderCounter>,
     pub running: usize,
     pub waiting: usize,
     pub kv_cache_usage: Option<f64>,
@@ -509,6 +516,7 @@ impl Node {
                 .is_some_and(|current| current != &version)
         {
             self.bump_provider_generation();
+            runtime.counters = telemetry::Tracker::default();
         }
         runtime.state = Some(ProviderState::Ready);
         runtime.version = Some(version);
@@ -557,24 +565,36 @@ impl Node {
     pub(crate) fn record_vllm_metrics(&self, telemetry: VllmMetricsSnapshot) {
         let updated_at = unix_millis();
         let mut runtime = self.provider_runtime.lock();
-        let elapsed_seconds = runtime
-            .telemetry_updated_unix_ms
-            .map(|previous| updated_at.saturating_sub(previous) as f64 / 1_000.0);
-        runtime.prompt_tokens_per_second = counter_rate(
-            telemetry.prompt_tokens_total,
-            runtime.prompt_tokens_total,
-            elapsed_seconds,
+        let counters = if telemetry.counter_series.is_empty() {
+            [
+                telemetry.prompt_tokens_total,
+                telemetry.generation_tokens_total,
+                telemetry.requests_total,
+                telemetry.prefix_cache_queries_total,
+                telemetry.prefix_cache_hits_total,
+                telemetry.preemptions_total,
+            ]
+            .into_iter()
+            .enumerate()
+            .filter_map(|(kind, value)| {
+                value.map(|value| ProviderCounter {
+                    key: kind.to_string(),
+                    kind,
+                    value,
+                })
+            })
+            .collect()
+        } else {
+            telemetry.counter_series
+        };
+        runtime.counters.update(
+            counters,
+            Instant::now(),
+            Duration::from_millis(self.provider.telemetry_stale_ms),
         );
-        runtime.generation_tokens_per_second = counter_rate(
-            telemetry.generation_tokens_total,
-            runtime.generation_tokens_total,
-            elapsed_seconds,
-        );
-        runtime.requests_per_second = counter_rate(
-            telemetry.requests_total,
-            runtime.requests_total,
-            elapsed_seconds,
-        );
+        runtime.prompt_tokens_per_second = runtime.counters.snapshot.input.smoothed;
+        runtime.generation_tokens_per_second = runtime.counters.snapshot.output.smoothed;
+        runtime.requests_per_second = runtime.counters.snapshot.requests.smoothed;
         runtime.running = telemetry.running;
         runtime.waiting = telemetry.waiting;
         runtime.kv_cache_usage = telemetry.kv_cache_usage;
@@ -583,10 +603,7 @@ impl Node {
         runtime.requests_total = telemetry.requests_total;
         runtime.prefix_cache_queries_total = telemetry.prefix_cache_queries_total;
         runtime.prefix_cache_hits_total = telemetry.prefix_cache_hits_total;
-        runtime.prefix_cache_hit_rate = prefix_cache_hit_rate(
-            telemetry.prefix_cache_hits_total,
-            telemetry.prefix_cache_queries_total,
-        );
+        runtime.prefix_cache_hit_rate = runtime.counters.snapshot.cache_hit_ratio;
         runtime.preemptions_total = telemetry.preemptions_total;
         runtime.telemetry_updated_unix_ms = Some(updated_at);
         runtime.telemetry_error = None;
@@ -798,6 +815,7 @@ impl Node {
             idle_notify,
             workload: Mutex::new(Workload::default()),
             generations: AtomicUsize::new(1),
+            observation: None,
         })
     }
 
@@ -948,6 +966,8 @@ impl Node {
         Self::refresh_circuit_locked(&mut circuit);
         let has_telemetry = provider.telemetry_updated_unix_ms.is_some();
         NodeSnapshot {
+            instance_id: self.instance_id(),
+            engine: provider.counters.snapshot.clone(),
             id: self.id.clone(),
             base_url: self.base_url.as_str().trim_end_matches('/').to_owned(),
             health: self.health(),
@@ -1028,12 +1048,14 @@ impl NodeReservation {
             idle_notify,
             workload: Mutex::new(Workload::default()),
             generations: AtomicUsize::new(1),
+            observation: None,
         })
     }
 }
 
 #[derive(Debug)]
 pub struct NodeLease {
+    pub(crate) observation: Option<Arc<crate::observability::Observation>>,
     node: Arc<Node>,
     permit: Option<OwnedSemaphorePermit>,
     circuit_ticket: Option<CircuitTicket>,
@@ -1043,6 +1065,9 @@ pub struct NodeLease {
 }
 
 impl NodeLease {
+    pub(crate) fn generations(&self) -> usize {
+        self.generations.load(Ordering::Relaxed).max(1)
+    }
     pub(crate) fn assign_workload(
         &self,
         prefill_tokens: usize,

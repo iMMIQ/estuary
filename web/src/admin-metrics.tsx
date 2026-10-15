@@ -1,8 +1,7 @@
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
-
+import { metricNumber } from "./metric-series";
 import type { NodeRecord } from "./types";
-import { formatCompactNumber, formatPercent } from "./ui";
 
 export function relativeSync(value: number | null, t: TFunction): string {
   if (!value) return t("sync.never");
@@ -30,9 +29,7 @@ export function MetricBox({
 }
 
 export function formatRate(value: number | null | undefined, locale: string): string {
-  return value == null || !Number.isFinite(value)
-    ? "--"
-    : formatCompactNumber(Math.max(0, value), locale);
+  return value == null || !Number.isFinite(value) ? "--" : metricNumber(Math.max(0, value), locale);
 }
 
 export function summarizeVllm(nodes: NodeRecord[]) {
@@ -44,76 +41,13 @@ export function summarizeVllm(nodes: NodeRecord[]) {
       .filter((value): value is number => value != null && Number.isFinite(value));
     return values.length ? values.reduce((total, value) => total + value, 0) : null;
   };
-  const prefixQueries = sum((node) => node.runtime.prefix_cache_queries_total);
-  const prefixHits = sum((node) => node.runtime.prefix_cache_hits_total);
-  const kvValues = fresh
-    .map((node) => node.runtime.kv_cache_usage)
-    .filter((value): value is number => value != null && Number.isFinite(value));
   return {
     nodes: vllm.length,
-    fresh: fresh.length,
-    running: sum((node) => node.runtime.upstream_running),
-    waiting: sum((node) => node.runtime.upstream_waiting),
-    promptRate: sum((node) => node.runtime.prompt_tokens_per_second),
-    generationRate: sum((node) => node.runtime.generation_tokens_per_second),
-    requestRate: sum((node) => node.runtime.requests_per_second),
-    prefixHitRate:
-      prefixQueries && prefixHits !== null ? Math.min(1, prefixHits / prefixQueries) : null,
-    maxKvUsage: kvValues.length ? Math.max(...kvValues) : null,
     preemptions: sum((node) => node.runtime.preemptions_total),
     exactReady: vllm.filter((node) => node.exact_kv_authoritative).length,
     waitingBlocked: vllm.filter((node) => node.admission.waiting_watermark_blocked).length,
     kvPressure: fresh.filter((node) => (node.runtime.kv_cache_usage ?? 0) >= 0.9).length,
   };
-}
-
-export function VllmRuntimePanel({
-  nodes,
-  compact = false,
-}: {
-  nodes: NodeRecord[];
-  compact?: boolean;
-}) {
-  const { t, i18n } = useTranslation();
-  const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
-  const runtime = summarizeVllm(nodes);
-  return (
-    <details
-      open={window.matchMedia("(min-width: 721px)").matches}
-      className={`dashboard-panel vllm-runtime-panel ${compact ? "compact" : ""}`}
-    >
-      <summary className="panel-heading">
-        <h2>{t("vllm.runtime")}</h2>
-        <span>{t("vllm.reporting", { fresh: runtime.fresh, total: runtime.nodes })}</span>
-        <small>{t("vllm.showRuntime")}</small>
-      </summary>
-      <div className="vllm-runtime-grid">
-        <MetricBox
-          label={t("vllm.promptThroughput")}
-          value={`${formatRate(runtime.promptRate, locale)} tok/s`}
-        />
-        <MetricBox
-          label={t("vllm.generationThroughput")}
-          value={`${formatRate(runtime.generationRate, locale)} tok/s`}
-        />
-        <MetricBox
-          label={t("vllm.completedRequests")}
-          value={`${formatRate(runtime.requestRate, locale)} req/s`}
-        />
-        <MetricBox
-          label={t("vllm.engineDemand")}
-          value={`${runtime.running ?? "--"} / ${runtime.waiting ?? "--"}`}
-          accent={(runtime.waiting ?? 0) > 0 ? "amber" : undefined}
-        />
-        <MetricBox
-          label={t("vllm.peakKv")}
-          value={formatPercent(runtime.maxKvUsage, "--")}
-          accent={(runtime.maxKvUsage ?? 0) >= 0.9 ? "amber" : undefined}
-        />
-        <MetricBox label={t("vllm.prefixHit")} value={formatPercent(runtime.prefixHitRate, "--")} />
-      </div>
-    </details>
-  );
 }
 
 export function UsageRow({

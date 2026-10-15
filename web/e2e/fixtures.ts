@@ -1,6 +1,7 @@
 import type { Page } from "@playwright/test";
 import { configDefaults } from "../src/config-contract";
 import type { NodeConfig } from "../src/types";
+import { observabilityFixture } from "./observability-fixture";
 export function status(nodeCount: number) {
   return {
     status: nodeCount ? "ready" : "not_ready",
@@ -51,6 +52,7 @@ export function record(config: Record<string, unknown>) {
     created_at_unix_ms: Date.now(),
     updated_at_unix_ms: Date.now(),
     runtime: {
+      instance_id: 1,
       id: config.id,
       base_url: config.base_url,
       provider: "vllm",
@@ -108,6 +110,24 @@ export async function mockControlPlane(
 ) {
   const nodes = [...initial];
   const limits = new Map<string, number>();
+  await page.route("**/admin/api/observability**", (route) => {
+    const query = new URL(route.request().url()).searchParams;
+    const ids = nodes.map((node) => String(node.config.id));
+    const models = [
+      ...new Set(
+        nodes.flatMap((node) => Object.keys((node.config.models ?? {}) as Record<string, string>)),
+      ),
+    ];
+    return route.fulfill({
+      json: observabilityFixture(
+        ids,
+        models,
+        query.get("scope") ?? "fleet",
+        query.get("id") ?? "",
+        Number(query.get("window") ?? 300),
+      ),
+    });
+  });
   await page.route("**/admin/api/status", (route) =>
     route.fulfill({
       json: {
