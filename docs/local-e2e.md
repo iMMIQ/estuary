@@ -88,6 +88,20 @@ The default tool fixture uses MCP; `--tool-mode read` tests the CLI's built-in
 
 ## Codex
 
+For a deterministic Chat-only mock backend, run:
+
+```bash
+python3 tests/codex_mock_e2e.py
+```
+
+This uses the real Codex CLI and tests Responses streaming, actual MCP execution,
+single/two-image CLI attachments, and MCP results containing one/two images plus
+a random nonce. The mock checks exact PNG bytes, media type, image count/order,
+tool roles, stripped credentials, and Chat-only backend routes. CLI token usage
+must match the gateway logs, including cached input. Reports remain under
+`target/codex-mock-e2e/runs/`. These fixtures test protocol transport and usage
+accounting, not visual recognition or real cache performance.
+
 The Codex test uses Responses with isolated settings and a small replacement
 instruction file:
 
@@ -104,6 +118,8 @@ client's JSON and SSE responses.
 
 The script disables web search and shell tools and preapproves only the fixed
 local nonce tool for unattended execution.
+Add `--images` when testing against a local vision model to include image input
+and MCP image-result replay. Both scripts use an isolated `CODEX_HOME`.
 
 ## OpenCode v2
 

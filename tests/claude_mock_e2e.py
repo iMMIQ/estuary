@@ -28,11 +28,13 @@ from image_fixtures import IMAGES
 class MockLlm(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, output):
+    def __init__(self, output, model="mock-claude", reply=None):
         super().__init__(("127.0.0.1", 0), MockHandler)
         self.output = output
         self.requests = []
         self.lock = threading.Lock()
+        self.model = model
+        self.reply = reply or mock_reply
 
     def record(self, record):
         with self.lock:
@@ -58,7 +60,10 @@ class MockHandler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 - HTTP handler API
         if urlsplit(self.path).path == "/v1/models":
             self.json_response(
-                {"object": "list", "data": [{"id": "mock-claude", "object": "model"}]}
+                {
+                    "object": "list",
+                    "data": [{"id": self.server.model, "object": "model"}],
+                }
             )
         else:
             self.json_response({"error": {"message": "unexpected mock route"}}, 404)
@@ -79,7 +84,7 @@ class MockHandler(BaseHTTPRequestHandler):
                 "/v1/chat/completions/render",
             }, self.path
             assert not record["client_credentials_forwarded"]
-            assert body["model"] == "mock-claude", body.get("model")
+            assert body["model"] == self.server.model, body.get("model")
             assert "input" not in body and "system" not in body
             assert isinstance(body["messages"], list)
             if record["path"].endswith("/render"):
@@ -87,7 +92,7 @@ class MockHandler(BaseHTTPRequestHandler):
                 self.server.record(record)
                 self.json_response({"token_ids": list(range(1000))})
                 return
-            message, finish, action = mock_reply(body)
+            message, finish, action = self.server.reply(body)
             record["action"] = action
             record["images"] = image_summary(body)
             self.server.record(record)
@@ -104,7 +109,7 @@ class MockHandler(BaseHTTPRequestHandler):
                     {
                         "id": "chatcmpl_mock",
                         "object": "chat.completion",
-                        "model": "mock-claude",
+                        "model": self.server.model,
                         "choices": [
                             {"index": 0, "message": message, "finish_reason": finish}
                         ],

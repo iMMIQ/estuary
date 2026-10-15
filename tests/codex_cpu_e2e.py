@@ -24,6 +24,7 @@ from pathlib import Path
 
 from claude_vllm_cpu_e2e import wait_for
 from e2e_helpers import free_port, http
+from image_fixtures import IMAGES
 
 
 def main():
@@ -36,6 +37,11 @@ def main():
         "--output", type=Path, default=Path("target/codex-cpu-e2e/runs")
     )
     parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument(
+        "--images",
+        action="store_true",
+        help="Test single/multiple PNG input and MCP image replay",
+    )
     args = parser.parse_args()
     if urllib.parse.urlsplit(args.upstream).hostname not in {
         "localhost",
@@ -52,6 +58,9 @@ def main():
     fixture = workspace / "nonce.json"
     nonce = "LOCAL_NONCE_" + uuid.uuid4().hex[:12]
     fixture.write_text(json.dumps({"nonce": nonce}) + "\n")
+    image_paths = [workspace / f"image-{index}.png" for index in range(len(IMAGES))]
+    for path, data in zip(image_paths, IMAGES, strict=True):
+        path.write_bytes(data)
     instructions = output / "instructions.txt"
     instructions.write_text(
         "You are a helpful assistant. Use tools when asked. Be concise.\n"
@@ -104,8 +113,10 @@ def main():
             success(control + "/admin/api/logs/requests/" + row["id"]) for row in rows
         ]
 
-    def codex(tools=False):
+    def codex(tools=False, image_count=0):
         session = "codex-tools" if tools else "codex-text"
+        if image_count:
+            session += f"-images-{image_count}"
         settings = {
             "model_provider": "estuary_cpu_e2e",
             "model_providers.estuary_cpu_e2e.name": "Estuary local CPU E2E",
@@ -139,15 +150,17 @@ def main():
             "features.goals": False,
         }
         if tools:
+            tool_name = "images" if image_count else "read"
             settings.update(
                 {
                     "mcp_servers.nonce.command": sys.executable,
                     "mcp_servers.nonce.args": [
                         str(Path(__file__).resolve().parent / "fixtures/mcp_nonce.py"),
                         str(fixture),
+                        *([str(path) for path in image_paths] if image_count else []),
                     ],
-                    "mcp_servers.nonce.enabled_tools": ["read"],
-                    "mcp_servers.nonce.tools.read.approval_mode": "approve",
+                    "mcp_servers.nonce.enabled_tools": [tool_name],
+                    f"mcp_servers.nonce.tools.{tool_name}.approval_mode": "approve",
                 }
             )
 
@@ -182,11 +195,20 @@ def main():
         ]
         for key, value in settings.items():
             command += ["-c", key + "=" + toml(value)]
-        command += [
+        prompt = (
             "Call mcp__nonce__read exactly once with {}. It reads the local file for you and requires no file path. After it returns, reply only with its exact nonce string."
             if tools
             else "Reply exactly CPU_OK. Do not use any tools."
-        ]
+        )
+        if image_count:
+            if tools:
+                prompt = f"CODEX_IMAGE_TOOL_E2E count={image_count}. Call the nonce images tool exactly once with count={image_count}. After it returns, reply only with its exact nonce string."
+            else:
+                prompt = f"CODEX_IMAGE_INPUT_E2E count={image_count}. Reply exactly IMAGE_OK_{image_count}."
+                for path in image_paths[:image_count]:
+                    command += ["--image", str(path)]
+        # --image accepts multiple paths and otherwise consumes the prompt too.
+        command += ["--", prompt]
         env = {
             k: v
             for k, v in os.environ.items()
@@ -195,14 +217,23 @@ def main():
             )
         }
         env.update(
-            ESTUARY_LOCAL_TEST_KEY="local-test-only", NO_PROXY="127.0.0.1,localhost,::1"
+            ESTUARY_LOCAL_TEST_KEY="local-test-only",
+            NO_PROXY="127.0.0.1,localhost,::1",
+            CODEX_HOME=str(output / "codex-home"),
         )
+        Path(env["CODEX_HOME"]).mkdir(exist_ok=True)
         with (
             (output / (session + ".jsonl")).open("w") as out,
             (output / (session + ".stderr")).open("w") as err,
         ):
             process = subprocess.Popen(
-                command, env=env, stdout=out, stderr=err, start_new_session=True
+                command,
+                cwd=workspace,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                start_new_session=True,
             )
             try:
                 process.wait(timeout=args.timeout)
@@ -223,9 +254,15 @@ def main():
             events[-5:],
             (output / (session + ".stderr")).read_text()[-2000:],
         )
-        assert any(e.get("type") == "turn.completed" for e in events), events
+        completed = next(
+            (e for e in reversed(events) if e.get("type") == "turn.completed"), None
+        )
+        assert completed, events
         result = final.read_text().strip()
-        assert result == (nonce if tools else "CPU_OK"), result
+        expected = (
+            nonce if tools else f"IMAGE_OK_{image_count}" if image_count else "CPU_OK"
+        )
+        assert result == expected, result
         rows = details(session)
         assert len(rows) >= (2 if tools else 1), rows
         for d in rows:
@@ -246,7 +283,12 @@ def main():
                 "client_output",
                 "upstream_output",
             }, d
-            assert all(a["endpoint"] == "responses" for a in r["attempts"]), r
+            assert len(r["attempts"]) == 1, r
+            assert all(
+                a["endpoint"] == "chat/completions"
+                and a["adapter"] == "chat_to_responses"
+                for a in r["attempts"]
+            ), r
         if tools:
             calls = [
                 e["item"]
@@ -272,6 +314,7 @@ def main():
             "requests": len(rows),
             "usage": [d["request"]["usage"] for d in rows],
             "timings_us": [d["request"]["timings_us"] for d in rows],
+            "client_usage": completed["usage"],
         }
 
     with (output / "gateway.log").open("w") as log:
@@ -317,13 +360,26 @@ def main():
             check(
                 "Codex MCP tool roundtrip with Responses history", lambda: codex(True)
             )
+            if args.images:
+                for count in [1, 2]:
+                    check(
+                        f"Codex {count} image input through Chat",
+                        lambda count=count: codex(image_count=count),
+                    )
+                    check(
+                        f"Codex MCP {count} image replay through Chat",
+                        lambda count=count: codex(True, count),
+                    )
 
             def logger():
-                records = [
-                    d["request"]
-                    for s in ["codex-text", "codex-tools"]
-                    for d in details(s)
-                ]
+                sessions = ["codex-text", "codex-tools"]
+                if args.images:
+                    sessions.extend(
+                        f"codex-{kind}-images-{count}"
+                        for count in [1, 2]
+                        for kind in ["text", "tools"]
+                    )
+                records = [d["request"] for s in sessions for d in details(s)]
                 status = success(control + "/admin/api/logs/status")
                 assert (
                     status["available"]

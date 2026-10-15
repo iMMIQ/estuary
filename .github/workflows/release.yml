@@ -121,6 +121,7 @@ jobs:
           python3 tests/claude_mock_e2e.py --help
           python3 tests/claude_vllm_cpu_e2e.py --help
           python3 tests/codex_cpu_e2e.py --help
+          python3 tests/codex_mock_e2e.py --help
           python3 tests/opencode_cpu_e2e.py --help
       - run: actionlint
       - run: shellcheck deploy/*.sh

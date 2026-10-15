@@ -1,5 +1,6 @@
-"""Minimal local stdio MCP fixture; its only tool reads the test nonce file."""
+"""Local stdio MCP fixture for nonce reads and optional PNG image results."""
 
+import base64
 import json
 import sys
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 
 def main():
     fixture = Path(sys.argv[1])
+    images = [Path(path) for path in sys.argv[2:]]
     for line in sys.stdin:
         request = json.loads(line)
         if "id" not in request:
@@ -32,10 +34,45 @@ def main():
                     }
                 ]
             }
+            if images:
+                result["tools"].append(
+                    {
+                        "name": "images",
+                        "description": "Read local PNG fixtures in order and return their image contents.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "count": {"type": "integer", "enum": [1, 2]}
+                            },
+                            "required": ["count"],
+                            "additionalProperties": False,
+                        },
+                    }
+                )
         elif method == "tools/call" and request.get("params", {}).get("name") == "read":
             result = {
                 "content": [
                     {"type": "text", "text": json.loads(fixture.read_text())["nonce"]}
+                ]
+            }
+        elif (
+            method == "tools/call"
+            and request.get("params", {}).get("name") == "images"
+            and images
+        ):
+            count = request["params"]["arguments"]["count"]
+            assert type(count) is int and 1 <= count <= len(images), count
+            result = {
+                "content": [
+                    {"type": "text", "text": json.loads(fixture.read_text())["nonce"]},
+                    *[
+                        {
+                            "type": "image",
+                            "mimeType": "image/png",
+                            "data": base64.b64encode(path.read_bytes()).decode(),
+                        }
+                        for path in images[:count]
+                    ],
                 ]
             }
         elif method == "ping":
