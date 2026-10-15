@@ -646,7 +646,15 @@ impl StreamConverter {
             events.extend(
                 self.emit(OutputChunk::ToolCall {
                     tool_name: name,
-                    arguments: tool.arguments,
+                    arguments: String::new(),
+                })
+                .await?,
+            );
+            // Streaming clients assemble arguments from delta events, even
+            // when the Chat backend supplied the complete JSON in one chunk.
+            events.extend(
+                self.emit(OutputChunk::ToolArgumentsDelta {
+                    content: tool.arguments,
                 })
                 .await?,
             );
@@ -1024,5 +1032,63 @@ mod selection_tests {
         assert_eq!(chat["messages"][0]["content"][0]["text"], "before");
         assert_eq!(chat["messages"][0]["content"][1]["type"], "image_url");
         assert_eq!(chat["messages"][0]["content"][2]["text"], "after");
+    }
+}
+
+#[cfg(test)]
+mod tool_stream_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn clients_receive_tool_arguments_as_deltas_and_buffered_results_keep_them() {
+        let arguments = json!({"file_path":"/workspace/nonce.json"}).to_string();
+        for messages in [true, false] {
+            let context = Context {
+                messages,
+                thinking: false,
+                custom_tools: HashSet::new(),
+                tool_names: HashMap::new(),
+            };
+            let mut converter = StreamConverter::new(context, "public".into());
+            converter.push(&json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"Read","arguments":arguments}}]},"finish_reason":"tool_calls"}]})).await.unwrap();
+            let events = converter.finish().await.unwrap();
+            let values: Vec<Value> = events
+                .iter()
+                .map(|event| serde_json::from_str(event.data()).unwrap())
+                .collect();
+            let fragments: String = values
+                .iter()
+                .filter_map(|value| {
+                    if messages && value["type"] == "content_block_delta" {
+                        value["delta"]["partial_json"].as_str()
+                    } else if !messages && value["type"] == "response.function_call_arguments.delta"
+                    {
+                        value["delta"].as_str()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(fragments, arguments);
+            let response: Value = serde_json::from_slice(&converter.response().unwrap()).unwrap();
+            if messages {
+                let start = values
+                    .iter()
+                    .find(|value| value["type"] == "content_block_start")
+                    .unwrap();
+                assert_eq!(start["content_block"]["input"], json!({}));
+                assert_eq!(
+                    response["content"][0]["input"]["file_path"],
+                    "/workspace/nonce.json"
+                );
+            } else {
+                let start = values
+                    .iter()
+                    .find(|value| value["type"] == "response.output_item.added")
+                    .unwrap();
+                assert_eq!(start["item"]["arguments"], "");
+                assert_eq!(response["output"][0]["arguments"], arguments);
+            }
+        }
     }
 }

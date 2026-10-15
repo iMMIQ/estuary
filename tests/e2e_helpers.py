@@ -5,6 +5,8 @@ import socket
 import urllib.error
 import urllib.request
 
+LOOPBACK_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 def http(url, body=None, headers=None):
     request = urllib.request.Request(
@@ -13,7 +15,7 @@ def http(url, body=None, headers=None):
         headers={"Content-Type": "application/json", **(headers or {})},
     )
     try:
-        response = urllib.request.urlopen(request, timeout=120)
+        response = LOOPBACK_HTTP.open(request, timeout=120)
     except urllib.error.HTTPError as error:
         response = error
     with response:

@@ -1,6 +1,6 @@
 # Local coding-agent end-to-end tests
 
-[Documentation index](README.md) | [Native vLLM provider](vllm.md) |
+[Documentation index](README.md) | [vLLM provider](vllm.md) |
 [Session logging](session-logging.md)
 
 The opt-in tests run installed Claude Code, Codex, and OpenCode CLIs through
@@ -15,6 +15,26 @@ isolate CLI settings, workspaces, and databases under `target/` and exclude clou
 credentials from the CLI environment. Keep downloaded models, server binaries,
 reports, and CLI transcripts under this ignored directory as well. Use each
 script's `--help` for timeout, binary, protocol, and output options.
+
+## Claude Code with a mock LLM
+
+With Claude Code installed and Estuary built, run:
+
+```bash
+python3 tests/claude_mock_e2e.py
+```
+
+This starts a local Chat-only mock server and drives the real Claude Code CLI
+through Estuary. No model download, GPU, or cloud credentials are needed. It
+checks fragmented SSE text, empty-argument MCP calls, built-in `Read` calls with
+JSON arguments, tool-result history replay, usage accounting, session logs, and
+released scheduler reservations. The mock cannot read the random nonce file;
+only the real tool can supply the nonce in a subsequent Chat tool result.
+
+Reports, CLI transcripts, and mock requests are written under
+`target/claude-mock-e2e/runs/`. The mock reports 1000 input tokens and 880 cached
+tokens to verify accounting; these fixtures do not measure a real KV-cache hit
+rate. All loopback HTTP test helpers bypass environment proxies.
 
 ## llama.cpp
 
