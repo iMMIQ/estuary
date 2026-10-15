@@ -238,6 +238,51 @@ pub(super) struct BufferedUpstreamBody {
     pub(super) reservation: ResponseBufferReservation,
 }
 
+#[derive(Default)]
+enum BodyBuffer {
+    #[default]
+    Empty,
+    Single(Bytes),
+    Multiple(BytesMut),
+}
+
+impl BodyBuffer {
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Single(bytes) => bytes.len(),
+            Self::Multiple(bytes) => bytes.len(),
+        }
+    }
+
+    fn push(&mut self, bytes: Bytes, length_hint: usize) {
+        if bytes.is_empty() {
+            return;
+        }
+        match self {
+            Self::Empty => *self = Self::Single(bytes),
+            Self::Single(first) => {
+                // Keep a single chunk without copying. Allocate a contiguous
+                // buffer only when the upstream body actually spans chunks.
+                let mut output =
+                    BytesMut::with_capacity(length_hint.max(first.len() + bytes.len()));
+                output.extend_from_slice(first);
+                output.extend_from_slice(&bytes);
+                *self = Self::Multiple(output);
+            }
+            Self::Multiple(output) => output.extend_from_slice(&bytes),
+        }
+    }
+
+    fn freeze(self) -> Bytes {
+        match self {
+            Self::Empty => Bytes::new(),
+            Self::Single(bytes) => bytes,
+            Self::Multiple(bytes) => bytes.freeze(),
+        }
+    }
+}
+
 pub(super) async fn read_limited(
     response: reqwest::Response,
     limit: usize,
@@ -245,14 +290,15 @@ pub(super) async fn read_limited(
     stream_idle_timeout: Duration,
     upstream_body_timeout: Duration,
 ) -> Result<BufferedUpstreamBody, GatewayError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
+    let length_hint = response.content_length();
+    if length_hint.is_some_and(|length| length > limit as u64) {
         return Err(GatewayError::InvalidUpstreamResponse);
     }
+    let length_hint = length_hint
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default();
     let reservation = response_buffer.reserve(limit).await;
-    let mut output = BytesMut::new();
+    let mut output = BodyBuffer::default();
     let mut stream = response.bytes_stream();
     let body_deadline = tokio::time::Instant::now() + upstream_body_timeout;
     loop {
@@ -271,7 +317,7 @@ pub(super) async fn read_limited(
         if output.len().saturating_add(bytes.len()) > limit {
             return Err(GatewayError::InvalidUpstreamResponse);
         }
-        output.extend_from_slice(&bytes);
+        output.push(bytes, length_hint);
     }
     Ok(BufferedUpstreamBody {
         bytes: output.freeze(),
@@ -299,4 +345,90 @@ pub(super) fn hold_response_buffer(
         }
     });
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::stream;
+
+    use super::*;
+
+    async fn read_body(
+        response: reqwest::Response,
+        limit: usize,
+        budget: Arc<ResponseBufferBudget>,
+    ) -> Result<BufferedUpstreamBody, GatewayError> {
+        read_limited(
+            response,
+            limit,
+            budget,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn single_chunk_body_preserves_upstream_storage() {
+        let bytes = Bytes::from(vec![b'x'; 64 * 1024]);
+        let upstream_pointer = bytes.as_ptr();
+        let response = reqwest::Response::from(http::Response::new(bytes.clone()));
+        let budget = ResponseBufferBudget::new(bytes.len(), Metrics::new());
+        let body = read_body(response, bytes.len(), Arc::clone(&budget))
+            .await
+            .unwrap();
+
+        assert_eq!(body.bytes, bytes);
+        assert_eq!(body.bytes.as_ptr(), upstream_pointer);
+        assert_eq!(budget.snapshot().used_bytes, bytes.len());
+        drop(body);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn fragmented_body_handles_empty_chunks_and_enforces_limit() {
+        for limit in [3, 4] {
+            let chunks = [
+                Bytes::new(),
+                Bytes::from_static(b"ab"),
+                Bytes::new(),
+                Bytes::from_static(b"cd"),
+                Bytes::new(),
+            ];
+            let response = reqwest::Response::from(http::Response::new(
+                reqwest::Body::wrap_stream(stream::iter(chunks.map(Ok::<_, io::Error>))),
+            ));
+            let budget = ResponseBufferBudget::new(limit, Metrics::new());
+            let result = read_body(response, limit, Arc::clone(&budget)).await;
+            if limit == 4 {
+                assert_eq!(result.as_ref().unwrap().bytes, b"abcd"[..]);
+            } else {
+                assert!(matches!(result, Err(GatewayError::InvalidUpstreamResponse)));
+            }
+            drop(result);
+            assert_eq!(budget.snapshot().used_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_body_and_transport_failure_release_reservations() {
+        let budget = ResponseBufferBudget::new(16, Metrics::new());
+        let empty = reqwest::Response::from(http::Response::new(Bytes::new()));
+        let body = read_body(empty, 16, Arc::clone(&budget)).await.unwrap();
+        assert!(body.bytes.is_empty());
+        drop(body);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+
+        let failed = reqwest::Response::from(http::Response::new(reqwest::Body::wrap_stream(
+            stream::iter([
+                Ok(Bytes::from_static(b"first")),
+                Err(io::Error::other("upstream disconnected")),
+            ]),
+        )));
+        assert!(matches!(
+            read_body(failed, 16, Arc::clone(&budget)).await,
+            Err(GatewayError::InvalidUpstreamResponse)
+        ));
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
 }

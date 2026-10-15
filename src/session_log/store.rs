@@ -194,10 +194,20 @@ pub(super) fn list(
     } else {
         (i64::MAX as u64, String::new())
     };
-    let mut statement=connection.prepare("SELECT data FROM requests WHERE started_at_ms>=?1 AND (?2 IS NULL OR session_id=?2) AND (started_at_ms<?3 OR (started_at_ms=?3 AND id<?4)) ORDER BY started_at_ms DESC,id DESC LIMIT ?5")?;
-    let rows = statement.query_map(params![since, session, time, id, limit + 1], |r| {
-        r.get::<_, String>(0)
-    })?;
+    // An optional-session OR prevents SQLite from using requests_session, so
+    // keep filtered reads as an equality on the index's leading column.
+    let query = if session.is_some() {
+        "SELECT data FROM requests WHERE session_id=?5 AND started_at_ms>=?1 AND (started_at_ms<?2 OR (started_at_ms=?2 AND id<?3)) ORDER BY started_at_ms DESC,id DESC LIMIT ?4"
+    } else {
+        "SELECT data FROM requests WHERE started_at_ms>=?1 AND (started_at_ms<?2 OR (started_at_ms=?2 AND id<?3)) ORDER BY started_at_ms DESC,id DESC LIMIT ?4"
+    };
+    let mut statement = connection.prepare(query)?;
+    let read_data = |r: &rusqlite::Row<'_>| r.get::<_, String>(0);
+    let rows = if let Some(session) = session {
+        statement.query_map(params![since, time, id, limit + 1, session], read_data)?
+    } else {
+        statement.query_map(params![since, time, id, limit + 1], read_data)?
+    };
     let mut requests = rows
         .map(|row| Ok(serde_json::from_str::<RequestRecord>(&row?)?))
         .collect::<Result<Vec<_>>>()?;

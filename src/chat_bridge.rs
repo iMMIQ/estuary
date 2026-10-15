@@ -20,6 +20,7 @@ use deepseek_recipe_core::{
     messages::InputMessage,
     multimodal::{IMAGE_SPECIAL_TOKEN, ImageSource},
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{error::GatewayError, sse};
@@ -40,11 +41,12 @@ fn invalid(error: impl std::fmt::Display) -> GatewayError {
 /// their model-specific options unchanged; protocol adapters use shared types.
 pub(crate) fn prepare(
     endpoint: &str,
-    source: &Value,
+    source: Value,
 ) -> Result<(Value, Option<Context>), GatewayError> {
     if !matches!(endpoint, "messages" | "messages/count_tokens" | "responses") {
-        return Ok((source.clone(), None));
+        return Ok((source, None));
     }
+    let source = &source;
     reject_lossy_input(source)?;
     if source["tool_choice"]["type"]
         .as_str()
@@ -62,14 +64,12 @@ pub(crate) fn prepare(
         return Err(invalid("max_tokens is required for Messages"));
     }
     let (request, custom_tools) = if messages {
-        let mut request: MessagesRequest =
-            serde_json::from_value(source.clone()).map_err(invalid)?;
+        let mut request = MessagesRequest::deserialize(source).map_err(invalid)?;
         // Tool selection belongs to Chat/vLLM; recipe applies DeepSeek prompt policies.
         request.tool_choice = None;
         (request.convert(options).map_err(invalid)?, HashSet::new())
     } else {
-        let mut request: ResponsesRequest =
-            serde_json::from_value(source.clone()).map_err(invalid)?;
+        let mut request = ResponsesRequest::deserialize(source).map_err(invalid)?;
         request.tool_choice = None;
         let names = request.custom_tool_names();
         (request.convert(options).map_err(invalid)?, names)
@@ -712,11 +712,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn passthrough_requests_reuse_the_owned_json() {
+        for endpoint in ["chat/completions", "completions", "embeddings"] {
+            let source = json!({"model":"m","input":"x".repeat(128 * 1024),"vendor_option":{"enabled":true}});
+            let input_ptr = source["input"].as_str().unwrap().as_ptr();
+            let (prepared, context) = prepare(endpoint, source).unwrap();
+            assert!(context.is_none());
+            assert_eq!(prepared["input"].as_str().unwrap().as_ptr(), input_ptr);
+            assert_eq!(prepared["vendor_option"]["enabled"], true);
+        }
+    }
+
+    #[test]
     fn messages_normalization_preserves_history_and_discards_cache_markers() {
         let source = json!({"model":"any-model","max_tokens":64,"thinking":{"type":"enabled","budget_tokens":32},
             "system":[{"type":"text","text":"stable","cache_control":{"type":"ephemeral"}}],
             "messages":[{"role":"user","content":"question"},{"role":"assistant","content":[{"type":"thinking","thinking":"reason","signature":"opaque"},{"type":"text","text":"answer"}]},{"role":"system","content":"new reminder"},{"role":"user","content":"continue"}]});
-        let (chat, _) = prepare("messages", &source).unwrap();
+        let (chat, _) = prepare("messages", source.clone()).unwrap();
         assert_eq!(
             chat["messages"][0],
             json!({"role":"system","content":"stable"})
@@ -735,13 +747,13 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("cache_control");
-        assert_eq!(prepare("messages", &other).unwrap().0, chat);
+        assert_eq!(prepare("messages", other).unwrap().0, chat);
     }
 
     #[test]
     fn preserves_sampling_stop_and_required_tool_semantics() {
         let source = json!({"model":"m","max_tokens":32,"temperature":0.4,"stop_sequences":["END"],"tool_choice":{"type":"any","disable_parallel_tool_use":true},"tools":[{"name":"run","input_schema":{"type":"object","properties":{}}}],"messages":[{"role":"user","content":"go"}]});
-        let (chat, _) = prepare("messages", &source).unwrap();
+        let (chat, _) = prepare("messages", source.clone()).unwrap();
         assert_eq!(chat["tool_choice"], "required");
         assert_eq!(chat["parallel_tool_calls"], false);
         assert_eq!(chat["stop"], json!(["END"]));
@@ -751,7 +763,7 @@ mod tests {
     #[test]
     fn preserves_generic_reasoning_effort_and_json_schema() {
         let source = json!({"model":"qwen","input":"hi","reasoning":{"effort":"medium"},"text":{"format":{"type":"json_schema","name":"result","strict":true,"schema":{"type":"object"}}}});
-        let (chat, _) = prepare("responses", &source).unwrap();
+        let (chat, _) = prepare("responses", source.clone()).unwrap();
         assert_eq!(chat["reasoning_effort"], "medium");
         assert_eq!(chat["response_format"]["json_schema"]["name"], "result");
         assert_eq!(
@@ -770,7 +782,7 @@ mod tests {
                     json!({"model":"m","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":32},"chat_template_kwargs":kwargs})
                 };
                 assert!(matches!(
-                    prepare(endpoint, &source),
+                    prepare(endpoint, source),
                     Err(GatewayError::InvalidRequest(_))
                 ));
             }
@@ -783,7 +795,7 @@ mod tests {
             json!([{"type":"reasoning","encrypted_content":"cipher","summary":[]}]),
             json!([{"role":"user","content":[{"type":"input_file","file_id":"f"}]}]),
         ] {
-            assert!(prepare("responses", &json!({"model":"m","input":input})).is_err());
+            assert!(prepare("responses", json!({"model":"m","input":input})).is_err());
         }
     }
 
@@ -925,7 +937,7 @@ mod compatibility_tests {
     #[tokio::test]
     async fn namespace_tools_restore_names_and_replay_through_chat() {
         let mut source = json!({"model":"generic","tools":[{"type":"namespace","name":"terminal","tools":[{"type":"function","name":"run","parameters":{"type":"object"}}]}],"input":[{"role":"user","content":"run"}]});
-        let (chat, context) = prepare("responses", &source).unwrap();
+        let (chat, context) = prepare("responses", source.clone()).unwrap();
         let name = chat["tools"][0]["function"]["name"].as_str().unwrap();
         assert!(!name.contains(':'));
         let reply = json!({"choices":[{"message":{"tool_calls":[{"function":{"name":name,"arguments":"{}"}}]},"finish_reason":"tool_calls"}]});
@@ -949,7 +961,7 @@ mod compatibility_tests {
             call.clone(),
             json!({"type":"function_call_output","call_id":call["call_id"],"output":"done"}),
         ]);
-        let (replayed, _) = prepare("responses", &source).unwrap();
+        let (replayed, _) = prepare("responses", source.clone()).unwrap();
         assert_eq!(
             replayed["messages"][1]["tool_calls"][0]["function"]["name"],
             name
@@ -960,7 +972,7 @@ mod compatibility_tests {
     #[tokio::test]
     async fn custom_apply_patch_keeps_raw_input_and_images_keep_their_position() {
         let source = json!({"model":"m","tools":[{"type":"custom","name":"apply_patch","format":{"type":"text"}}],"input":"edit"});
-        let (chat, context) = prepare("responses", &source).unwrap();
+        let (chat, context) = prepare("responses", source.clone()).unwrap();
         assert_eq!(chat["tools"][0]["type"], "function");
         let patch = "*** Begin Patch\n*** End Patch";
         let reply = json!({"choices":[{"message":{"tool_calls":[{"function":{"name":"apply_patch","arguments":json!({"input":patch}).to_string()}}]},"finish_reason":"tool_calls"}]});
@@ -972,7 +984,7 @@ mod compatibility_tests {
         assert_eq!(response["output"][0]["type"], "custom_tool_call");
         assert_eq!(response["output"][0]["input"], patch);
         let source = json!({"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"before"},{"type":"input_image","image_url":"https://example.com/a.png"},{"type":"input_text","text":"after"}]}]});
-        let (chat, _) = prepare("responses", &source).unwrap();
+        let (chat, _) = prepare("responses", source.clone()).unwrap();
         assert_eq!(chat["messages"][0]["content"][0]["text"], "before");
         assert_eq!(
             chat["messages"][0]["content"][1]["image_url"]["url"],
@@ -983,7 +995,7 @@ mod compatibility_tests {
 
     #[tokio::test]
     async fn interleaved_parallel_tool_fragments_complete_without_argument_loss() {
-        let (_, context) = prepare("responses", &json!({"model":"m","input":"go"})).unwrap();
+        let (_, context) = prepare("responses", json!({"model":"m","input":"go"})).unwrap();
         let mut converter = StreamConverter::new(context.unwrap(), "m".into());
         for delta in [
             json!({"tool_calls":[{"index":0,"function":{"name":"first","arguments":"{\"a\":"}},{"index":1,"function":{"name":"second","arguments":"{\"b\":"}}]}),
@@ -1019,7 +1031,7 @@ mod selection_tests {
         ] {
             let mut source = source.clone();
             source["tool_choice"] = choice.clone();
-            let (chat, _) = prepare("responses", &source).unwrap();
+            let (chat, _) = prepare("responses", source.clone()).unwrap();
             assert_eq!(chat["tools"].as_array().unwrap().len(), 2);
             if choice.is_string() {
                 assert_eq!(chat["tool_choice"], choice);
@@ -1038,7 +1050,7 @@ mod selection_tests {
             assert!(
                 prepare(
                     "responses",
-                    &json!({"model":"m","input":"hi","tool_choice":choice})
+                    json!({"model":"m","input":"hi","tool_choice":choice})
                 )
                 .is_err()
             );
@@ -1047,7 +1059,7 @@ mod selection_tests {
     #[test]
     fn message_text_and_image_blocks_stay_in_one_user_turn() {
         let source = json!({"model":"m","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"before"},{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}},{"type":"text","text":"after"}]}]});
-        let (chat, _) = prepare("messages", &source).unwrap();
+        let (chat, _) = prepare("messages", source.clone()).unwrap();
         assert_eq!(chat["messages"].as_array().unwrap().len(), 1);
         assert_eq!(chat["messages"][0]["content"][0]["text"], "before");
         assert_eq!(chat["messages"][0]["content"][1]["type"], "image_url");

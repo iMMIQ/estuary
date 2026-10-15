@@ -35,19 +35,24 @@ impl ResponseBufferBudget {
     }
 
     pub async fn reserve(self: &Arc<Self>, max_response_bytes: usize) -> ResponseBufferReservation {
-        let waiting = self.waiting_responses.fetch_add(1, Ordering::AcqRel) + 1;
-        self.metrics.response_buffer_waiters(waiting);
-        let waiter = WaiterGuard {
-            budget: Arc::clone(self),
+        let permits = u32::try_from(max_response_bytes)
+            .expect("validated response buffer reservation exceeds u32");
+        let permit = if let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_many_owned(permits)
+        {
+            permit
+        } else {
+            let waiting = self.waiting_responses.fetch_add(1, Ordering::AcqRel) + 1;
+            self.metrics.response_buffer_waiters(waiting);
+            let waiter = WaiterGuard {
+                budget: Arc::clone(self),
+            };
+            let permit = Arc::clone(&self.semaphore)
+                .acquire_many_owned(permits)
+                .await
+                .expect("response buffer semaphore is never closed");
+            drop(waiter);
+            permit
         };
-        let permit = Arc::clone(&self.semaphore)
-            .acquire_many_owned(
-                u32::try_from(max_response_bytes)
-                    .expect("validated response buffer reservation exceeds u32"),
-            )
-            .await
-            .expect("response buffer semaphore is never closed");
-        drop(waiter);
 
         let used = self
             .used_bytes
@@ -144,6 +149,42 @@ mod tests {
         let second = pending.await.unwrap();
         assert_eq!(budget.snapshot().used_bytes, 16);
         drop(second);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn smaller_reservations_do_not_bypass_waiting_responses() {
+        let budget = ResponseBufferBudget::new(16, Metrics::new());
+        let mut first = budget.reserve(12).await;
+        let mut large = Box::pin(budget.reserve(8));
+        assert!(futures_util::poll!(&mut large).is_pending());
+        let mut small = Box::pin(budget.reserve(4));
+        assert!(futures_util::poll!(&mut small).is_pending());
+        assert_eq!(budget.snapshot().waiting_responses, 2);
+
+        first.shrink_to(8);
+        let large = large.await;
+        assert_eq!(budget.snapshot().used_bytes, 16);
+        assert!(futures_util::poll!(&mut small).is_pending());
+        drop(large);
+        let small = small.await;
+        assert_eq!(budget.snapshot().waiting_responses, 0);
+        assert_eq!(budget.snapshot().used_bytes, 12);
+        drop((small, first));
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_reservation_removes_its_waiter() {
+        let budget = ResponseBufferBudget::new(16, Metrics::new());
+        let first = budget.reserve(16).await;
+        let mut pending = Box::pin(budget.reserve(16));
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        assert_eq!(budget.snapshot().waiting_responses, 1);
+        drop(pending);
+        assert_eq!(budget.snapshot().waiting_responses, 0);
+        assert_eq!(budget.snapshot().used_bytes, 16);
+        drop(first);
         assert_eq!(budget.snapshot().used_bytes, 0);
     }
 }

@@ -12,8 +12,10 @@ use estuary::{
     Gateway, Settings,
     config::{NodeConfig, PrefixConfig, ProviderConfig, ProviderKind, RoutingConfig},
     kv_cache::{BlockHash, CacheMutation},
+    metrics::Metrics,
     node::Node,
-    prefix::routing_text,
+    prefix::{PrefixDirectory, routing_text},
+    response_buffer::ResponseBufferBudget,
     scheduler::Scheduler,
     vllm::VllmManager,
 };
@@ -150,6 +152,13 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(100usize);
+    anyhow::ensure!(requests > 0, "ESTUARY_BENCH_REQUESTS must be positive");
+    let micro_iterations = requests.saturating_mul(100).max(10_000);
+    if env::var("ESTUARY_BENCH_MICRO_ONLY").as_deref() == Ok("1") {
+        benchmark_prefix_directory(micro_iterations);
+        benchmark_response_buffer(micro_iterations).await;
+        return Ok(());
+    }
     let upstream = mock_vllm().await?;
     let client = Client::builder().no_proxy().build()?;
 
@@ -160,27 +169,19 @@ async fn main() -> Result<()> {
         for protocol in Protocol::ALL {
             for prompt_size in PROMPT_SIZES {
                 let prompt = "x".repeat(prompt_size);
-                let payload = Arc::new(protocol.request(&prompt));
+                let payload = Bytes::from(serde_json::to_vec(&protocol.request(&prompt))?);
+                let url = gateway.url(protocol.endpoint());
+                for _ in 0..4 {
+                    benchmark_request(&client, &url, protocol, payload.clone()).await?;
+                }
                 let concurrency = (nodes * 4).min(requests).max(1);
                 let started = Instant::now();
                 let mut latencies = stream::iter(0..requests)
                     .map(|_| {
                         let client = client.clone();
-                        let url = gateway.url(protocol.endpoint());
-                        let payload = Arc::clone(&payload);
-                        async move {
-                            let request_started = Instant::now();
-                            let mut request = client.post(url).json(payload.as_ref());
-                            if matches!(protocol, Protocol::Codex) {
-                                request = request.header("user-agent", "codex-cli/bench");
-                            }
-                            let response = request.send().await?;
-                            if response.status() != StatusCode::OK {
-                                anyhow::bail!("gateway returned {}", response.status());
-                            }
-                            response.bytes().await?;
-                            Ok::<_, anyhow::Error>(request_started.elapsed())
-                        }
+                        let url = url.clone();
+                        let payload = payload.clone();
+                        async move { benchmark_request(&client, &url, protocol, payload).await }
                     })
                     .buffer_unordered(concurrency)
                     .collect::<Vec<_>>()
@@ -204,9 +205,95 @@ async fn main() -> Result<()> {
     }
 
     benchmark_prefix_preprocessing(requests);
+    benchmark_prefix_directory(micro_iterations);
+    benchmark_response_buffer(micro_iterations).await;
     benchmark_scheduler(requests).await?;
     benchmark_tokenization(&upstream, &client, requests).await?;
     Ok(())
+}
+
+async fn benchmark_request(
+    client: &Client,
+    url: &str,
+    protocol: Protocol,
+    payload: Bytes,
+) -> Result<Duration> {
+    let started = Instant::now();
+    let mut request = client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(payload);
+    if matches!(protocol, Protocol::Codex) {
+        request = request.header("user-agent", "codex-cli/bench");
+    }
+    let response = request.send().await?;
+    anyhow::ensure!(
+        response.status() == StatusCode::OK,
+        "gateway returned {}",
+        response.status()
+    );
+    response.bytes().await?;
+    Ok(started.elapsed())
+}
+
+fn benchmark_prefix_directory(iterations: usize) {
+    println!("\nprefix directory");
+    println!("operation\ttrees\tprompt_chars\titerations\tmean_us");
+    for trees in [1, 128, 1024] {
+        for prompt_chars in [64, 16 * 1024] {
+            let config = PrefixConfig {
+                max_trees: trees,
+                max_directory_chars: 128 * 1024 * 1024,
+                ..PrefixConfig::default()
+            };
+            let directory = PrefixDirectory::new(&config);
+            let body = json!({"prompt": "x".repeat(prompt_chars)});
+            let inputs = (0..trees)
+                .map(|index| {
+                    routing_text(
+                        "completions",
+                        Some(&format!("model-{index}")),
+                        Some(&body),
+                        &config,
+                    )
+                })
+                .collect::<Vec<_>>();
+            for input in &inputs {
+                directory.record("node", input);
+            }
+            let input = &inputs[0];
+            let started = Instant::now();
+            for _ in 0..iterations {
+                directory.record("node", std::hint::black_box(input));
+            }
+            println!(
+                "record\t{trees}\t{prompt_chars}\t{iterations}\t{:.3}",
+                started.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64
+            );
+            let started = Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(directory.best_match(std::hint::black_box(input)));
+            }
+            println!(
+                "match\t{trees}\t{prompt_chars}\t{iterations}\t{:.3}",
+                started.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64
+            );
+        }
+    }
+}
+
+async fn benchmark_response_buffer(iterations: usize) {
+    let budget = ResponseBufferBudget::new(16 * 1024 * 1024, Metrics::new());
+    let started = Instant::now();
+    for _ in 0..iterations {
+        drop(std::hint::black_box(budget.reserve(1024 * 1024).await));
+    }
+    println!("\nresponse buffer");
+    println!("operation\titerations\tmean_us");
+    println!(
+        "reserve_release\t{iterations}\t{:.3}",
+        started.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64
+    );
 }
 
 async fn benchmark_tokenization(

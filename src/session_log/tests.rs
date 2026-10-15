@@ -46,6 +46,71 @@ fn payload(
 }
 
 #[test]
+fn request_list_preserves_session_filters_and_cursor_pagination() {
+    let db = Database::new();
+    let connection = store::open(&db.0).unwrap();
+    for (id, session, time) in [
+        ("a-old", Some("a"), 99),
+        ("a-1", Some("a"), 100),
+        ("a-2", Some("a"), 200),
+        ("a-3", Some("a"), 200),
+        ("a-4", Some("a"), 300),
+        ("b-1", Some("b"), 200),
+        ("b-2", Some("b"), 400),
+        ("ungrouped", None, 200),
+        ("empty-session", Some(""), 250),
+    ] {
+        store::write_record(
+            &connection,
+            &RequestRecord {
+                id: id.to_owned(),
+                session_id: session.map(str::to_owned),
+                session_source: session.map(|_| "test".to_owned()),
+                started_at_ms: time,
+                ..RequestRecord::default()
+            },
+        )
+        .unwrap();
+    }
+
+    for (session, expected) in [
+        (
+            None,
+            vec![
+                "b-2",
+                "a-4",
+                "empty-session",
+                "ungrouped",
+                "b-1",
+                "a-3",
+                "a-2",
+                "a-1",
+            ],
+        ),
+        (Some("a"), vec!["a-4", "a-3", "a-2", "a-1"]),
+        (Some("b"), vec!["b-2", "b-1"]),
+        (Some(""), vec!["empty-session"]),
+        (Some("missing"), vec![]),
+    ] {
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        loop {
+            let page = store::list(&db.0, session, cursor.as_deref(), 100, 2).unwrap();
+            assert!(page.requests.len() <= 2);
+            ids.extend(page.requests.into_iter().map(|record| record.id));
+            if page.next_cursor.is_none() {
+                break;
+            }
+            assert_ne!(page.next_cursor, cursor);
+            cursor = page.next_cursor;
+            assert!(ids.len() < expected.len());
+        }
+        assert_eq!(ids, expected, "session {session:?}");
+        assert!(store::list(&db.0, session, Some(""), 100, 2).is_err());
+    }
+}
+
+#[test]
 fn retention_preserves_shared_prefixes_and_reclaims_only_unreferenced_content() {
     let db = Database::new();
     let mut connection = store::open(&db.0).unwrap();

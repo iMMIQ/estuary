@@ -251,7 +251,7 @@ async fn proxy_inner(
         ClientProtocol::OpenAi
     };
     let (converted, bridge_context) =
-        chat_bridge::prepare(&endpoint, parsed.as_ref().expect("validated JSON"))?;
+        chat_bridge::prepare(&endpoint, parsed.take().expect("validated JSON"))?;
     let endpoint = if bridge_context.is_some() {
         "chat/completions".to_owned()
     } else {

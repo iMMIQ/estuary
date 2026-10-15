@@ -251,7 +251,12 @@ impl RadixTree {
             let Some(child) = current.children.get(&first) else {
                 break;
             };
-            let shared = shared_prefix_chars(remaining, &child.text);
+            let full_edge = remaining.starts_with(&child.text);
+            let shared = if full_edge {
+                child.char_count
+            } else {
+                shared_prefix_chars(remaining, &child.text)
+            };
             matched_chars += shared;
             tenants = child.tenant_last_access.keys().cloned().collect();
             for (tenant, recorded) in &child.tenant_last_seen {
@@ -267,10 +272,10 @@ impl RadixTree {
                     node_age_seconds.insert(tenant.clone(), age);
                 }
             }
-            if shared != child.char_count {
+            if !full_edge {
                 break;
             }
-            remaining = advance_chars(remaining, shared);
+            remaining = &remaining[child.text.len()..];
             current = child;
         }
 
@@ -344,8 +349,7 @@ fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, co
         return;
     };
 
-    let shared = shared_prefix_chars(remaining, &child.text);
-    if shared == child.char_count {
+    if let Some(suffix) = remaining.strip_prefix(&child.text) {
         child
             .tenant_last_seen
             .insert(tenant.to_owned(), Instant::now());
@@ -353,18 +357,13 @@ fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, co
             *count = count.saturating_add(child.char_count);
             child.tenant_last_access.insert(tenant.to_owned(), 0);
         }
-        insert_at(
-            &mut child,
-            advance_chars(remaining, shared),
-            tenant,
-            epoch,
-            count,
-        );
+        insert_at(&mut child, suffix, tenant, epoch, count);
         node.children.insert(first, child);
         refresh_oldest_leaf(node, tenant);
         return;
     }
 
+    let shared = shared_prefix_chars(remaining, &child.text);
     let split_byte = byte_index_at_char(&child.text, shared);
     let suffix = child.text.split_off(split_byte);
     child.text = suffix;
@@ -467,6 +466,8 @@ pub struct PrefixDirectory {
 struct PrefixTrees {
     values: HashMap<String, TreeEntry>,
     epoch: u64,
+    // Updated with each tree's character delta while holding the directory lock.
+    total_chars: usize,
 }
 
 #[derive(Debug)]
@@ -495,7 +496,7 @@ impl PrefixDirectory {
         trees.epoch = trees.epoch.wrapping_add(1);
         let epoch = trees.epoch;
         if !trees.values.contains_key(&input.tree_key) && trees.values.len() >= self.max_trees {
-            evict_oldest_tree(&mut trees.values);
+            evict_oldest_tree(&mut trees);
         }
         let entry = trees
             .values
@@ -506,18 +507,30 @@ impl PrefixDirectory {
                 accounted_chars: 0,
             });
         entry.last_recorded = epoch;
+        let previous_chars = entry.accounted_chars;
         let mut tree = entry.tree.write();
-        tree.insert(&input.text, node_id, self.max_tree_chars_per_node);
-        entry.accounted_chars = tree
+        let previous_tenant_chars = tree
             .tenant_char_count
-            .values()
-            .fold(0_usize, |total, chars| total.saturating_add(*chars));
+            .get(node_id)
+            .copied()
+            .unwrap_or_default();
+        tree.insert(&input.text, node_id, self.max_tree_chars_per_node);
+        let tenant_chars = tree
+            .tenant_char_count
+            .get(node_id)
+            .copied()
+            .unwrap_or_default();
+        entry.accounted_chars = previous_chars
+            .saturating_sub(previous_tenant_chars)
+            .saturating_add(tenant_chars);
+        let accounted_chars = entry.accounted_chars;
         drop(tree);
-        while trees.values.values().fold(0_usize, |total, entry| {
-            total.saturating_add(entry.accounted_chars)
-        }) > self.max_directory_chars
-        {
-            if !evict_oldest_tree(&mut trees.values) {
+        trees.total_chars = trees
+            .total_chars
+            .saturating_sub(previous_chars)
+            .saturating_add(accounted_chars);
+        while trees.total_chars > self.max_directory_chars {
+            if !evict_oldest_tree(&mut trees) {
                 break;
             }
         }
@@ -539,27 +552,34 @@ impl PrefixDirectory {
     }
 
     pub fn clear_node(&self, node_id: &str) {
-        self.trees.write().values.retain(|_, entry| {
+        let mut trees = self.trees.write();
+        let mut total_chars = 0usize;
+        trees.values.retain(|_, entry| {
             let mut tree = entry.tree.write();
             tree.clear_tenant(node_id);
             entry.accounted_chars = tree
                 .tenant_char_count
                 .values()
                 .fold(0_usize, |total, chars| total.saturating_add(*chars));
+            total_chars = total_chars.saturating_add(entry.accounted_chars);
             entry.accounted_chars > 0
         });
+        trees.total_chars = total_chars;
     }
 }
 
-fn evict_oldest_tree(trees: &mut HashMap<String, TreeEntry>) -> bool {
+fn evict_oldest_tree(trees: &mut PrefixTrees) -> bool {
     let Some(oldest) = trees
+        .values
         .iter()
         .min_by_key(|(_, entry)| entry.last_recorded)
         .map(|(key, _)| key.clone())
     else {
         return false;
     };
-    trees.remove(&oldest);
+    if let Some(removed) = trees.values.remove(&oldest) {
+        trees.total_chars = trees.total_chars.saturating_sub(removed.accounted_chars);
+    }
     true
 }
 
@@ -854,6 +874,52 @@ mod tests {
     }
 
     #[test]
+    fn radix_matches_keep_unicode_character_counts_across_complete_and_partial_edges() {
+        let mut tree = RadixTree::default();
+        let recorded = [
+            ("short", "你好🙂café"),
+            ("long", "你好🙂café 后续"),
+            ("other", "你好🙃different"),
+        ];
+        for (tenant, text) in recorded {
+            tree.insert(text, tenant, 1_000);
+        }
+        // Repeated insertion takes the same complete-edge path as a cache hit.
+        tree.insert(recorded[0].1, recorded[0].0, 1_000);
+        for text in [
+            "你好🙂café",
+            "你好🙂café 后续",
+            "你好🙂café 后续更多",
+            "你好🙂cafè",
+            "你好🙃different",
+            "你好🙄",
+            "你",
+        ] {
+            let matched = tree.prefix_match(text, text.chars().count());
+            for (tenant, cached) in recorded {
+                let expected = shared_prefix_chars(text, cached);
+                assert_eq!(
+                    matched
+                        .node_matches
+                        .get(tenant)
+                        .copied()
+                        .unwrap_or_default(),
+                    expected,
+                    "{tenant}: {text}"
+                );
+            }
+            assert_eq!(
+                matched.matched_chars,
+                recorded
+                    .iter()
+                    .map(|(_, cached)| shared_prefix_chars(text, cached))
+                    .max()
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn shared_messages_produce_a_longest_prefix_match() {
         let config = PrefixConfig::default();
         let first = json!({
@@ -1035,6 +1101,50 @@ mod tests {
     }
 
     #[test]
+    fn directory_character_accounting_tracks_updates_eviction_and_node_removal() {
+        let config = PrefixConfig {
+            max_trees: 3,
+            max_tree_chars_per_node: 32,
+            max_directory_chars: 140,
+            ..PrefixConfig::default()
+        };
+        let directory = PrefixDirectory::new(&config);
+        for index in 0..150 {
+            let node_id = format!("node-{}", index % 4);
+            let input = PrefixInput {
+                tree_key: format!("model-{}", (index / 7) % 5),
+                text: format!("共享前缀-{}-{}", index % 6, "x".repeat(index % 20)),
+                ..PrefixInput::default()
+            };
+            directory.record(&node_id, &input);
+            // Updating a complete prefix must not increase the accounted size.
+            let before = directory.trees.read().total_chars;
+            directory.record(&node_id, &input);
+            assert_eq!(directory.trees.read().total_chars, before);
+            if index % 11 == 0 {
+                directory.clear_node(&format!("node-{}", (index + 1) % 4));
+            }
+            let trees = directory.trees.read();
+            let mut expected_total = 0;
+            for entry in trees.values.values() {
+                let tree = entry.tree.read();
+                let expected = tree.tenant_char_count.values().sum::<usize>();
+                assert_eq!(entry.accounted_chars, expected);
+                assert!(tree.tenant_char_count.values().all(|chars| *chars <= 32));
+                expected_total += expected;
+            }
+            assert_eq!(trees.total_chars, expected_total);
+            assert!(trees.total_chars <= config.max_directory_chars);
+            assert!(trees.values.len() <= config.max_trees);
+        }
+        for index in 0..4 {
+            directory.clear_node(&format!("node-{index}"));
+        }
+        assert_eq!(directory.trees.read().total_chars, 0);
+        assert!(directory.trees.read().values.is_empty());
+    }
+
+    #[test]
     fn eviction_bounds_each_tenant_tree() {
         let config = PrefixConfig {
             max_tree_chars_per_node: 24,
@@ -1128,7 +1238,7 @@ mod routing_tests {
             ("responses", responses),
             ("chat/completions", chat),
         ] {
-            let (body, _) = prepare(endpoint, &source).unwrap();
+            let (body, _) = prepare(endpoint, source).unwrap();
             prefixes.push(crate::prefix::routing_text(
                 "chat/completions",
                 Some("m"),
@@ -1140,7 +1250,7 @@ mod routing_tests {
         assert_eq!(prefixes[1].text, prefixes[2].text);
         let mut thinking = messages;
         thinking["thinking"] = json!({"type":"enabled","budget_tokens":32});
-        let (body, _) = prepare("messages", &thinking).unwrap();
+        let (body, _) = prepare("messages", thinking).unwrap();
         assert_ne!(
             prefixes[0].text,
             crate::prefix::routing_text("chat/completions", Some("m"), Some(&body), &config).text
