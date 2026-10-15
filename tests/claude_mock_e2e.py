@@ -3,12 +3,14 @@
 
 Build with cargo build --locked, then run python3 tests/claude_mock_e2e.py.
 Requires Claude Code on PATH. Uses no model server or cloud credentials.
-Exercises text streaming plus real MCP and built-in Read tool execution.
+Exercises text/image streaming plus real MCP and built-in Read tool execution.
 The mock never reads the nonce file: it can repeat the nonce only after it
 arrives in a replayed Chat tool result. Artifacts remain under ignored target/.
 """
 
 import argparse
+import base64
+import hashlib
 import json
 import re
 import subprocess
@@ -19,6 +21,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
+
+from image_fixtures import IMAGES
 
 
 class MockLlm(ThreadingHTTPServer):
@@ -85,6 +89,7 @@ class MockHandler(BaseHTTPRequestHandler):
                 return
             message, finish, action = mock_reply(body)
             record["action"] = action
+            record["images"] = image_summary(body)
             self.server.record(record)
             usage = {
                 "prompt_tokens": 1000,
@@ -167,14 +172,116 @@ class MockHandler(BaseHTTPRequestHandler):
             time.sleep(0.001)
 
 
+def image_summary(body):
+    images = []
+    for message in body["messages"]:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if block.get("type") == "image_url":
+                url = block["image_url"]["url"]
+                assert url.startswith("data:image/png;base64,"), (
+                    "image media type changed"
+                )
+                data = base64.b64decode(url.split(",", 1)[1], validate=True)
+                images.append(
+                    {
+                        "role": message["role"],
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                )
+    return images
+
+
+def tool_reply(body, name, arguments, call_id="call_mock_nonce"):
+    tools = {t["function"]["name"] for t in body.get("tools", [])}
+    assert name in tools, f"CLI did not supply the requested tool: {name}"
+    return (
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(arguments)},
+                }
+            ],
+        },
+        "tool_calls",
+        "invoke_" + name,
+    )
+
+
 def mock_reply(body):
+    user_blocks = [
+        block
+        for message in body["messages"]
+        if message["role"] == "user"
+        for block in (
+            message["content"]
+            if isinstance(message["content"], list)
+            else [{"type": "text", "text": message["content"]}]
+        )
+    ]
+    text = "\n".join(block["text"] for block in user_blocks if block["type"] == "text")
+    if "IMAGE_E2E_BEGIN" in text or "IMAGE_READ_E2E:" in text:
+        count = int(re.search(r"IMAGE_OK_([12])", text)[1])
+        images = image_summary(body)
+        expected = [hashlib.sha256(data).hexdigest() for data in IMAGES[:count]]
+        assert [image["sha256"] for image in images] == expected[: len(images)], (
+            "image bytes/order changed"
+        )
+        read = "IMAGE_READ_E2E:" in text
+        assert all(image["role"] == ("tool" if read else "user") for image in images), (
+            "image role changed"
+        )
+        if read:
+            paths = json.loads(
+                re.search(r"Read these PNG files in order: (\[.*?\])", text)[1]
+            )
+            assert len(paths) == count
+            if len(images) < count:
+                return tool_reply(
+                    body,
+                    "Read",
+                    {"file_path": paths[len(images)]},
+                    f"call_image_{len(images)}",
+                )
+        else:
+            # Check text/image interleaving, not just the image array's ordering.
+            sequence = []
+            for block in user_blocks:
+                if block["type"] == "image_url":
+                    sequence.append("image")
+                elif block["type"] == "text":
+                    sequence.extend(
+                        re.findall(r"IMAGE_E2E_(?:BEGIN|BETWEEN|END)", block["text"])
+                    )
+            assert sequence == (
+                ["IMAGE_E2E_BEGIN", "image", "IMAGE_E2E_END"]
+                if count == 1
+                else [
+                    "IMAGE_E2E_BEGIN",
+                    "image",
+                    "IMAGE_E2E_BETWEEN",
+                    "image",
+                    "IMAGE_E2E_END",
+                ]
+            ), sequence
+        assert len(images) == count, "image missing or duplicated"
+        return (
+            {"role": "assistant", "content": f"IMAGE_OK_{count}"},
+            "stop",
+            f"images_{'read' if read else 'input'}_{count}",
+        )
     tool_results = [m for m in body["messages"] if m["role"] == "tool"]
     if tool_results:
         match = re.search(r"LOCAL_NONCE_[0-9a-f]+", json.dumps(tool_results[-1]))
         assert match, "the real tool did not return the nonce"
         return {"role": "assistant", "content": match[0]}, "stop", "repeat_tool_nonce"
     user_text = json.dumps([m for m in body["messages"] if m["role"] == "user"])
-    tools = {t["function"]["name"]: t["function"] for t in body.get("tools", [])}
     if "Call mcp__nonce__read exactly once" in user_text:
         name, arguments = "mcp__nonce__read", {}
     elif "Use Read to read " in user_text:
@@ -184,22 +291,7 @@ def mock_reply(body):
     else:
         assert "Reply exactly CPU_OK." in user_text, "unexpected generation request"
         return {"role": "assistant", "content": "CPU_OK"}, "stop", "text"
-    assert name in tools, f"CLI did not supply the requested tool: {name}"
-    return (
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_mock_nonce",
-                    "type": "function",
-                    "function": {"name": name, "arguments": json.dumps(arguments)},
-                }
-            ],
-        },
-        "tool_calls",
-        "invoke_" + name,
-    )
+    return tool_reply(body, name, arguments)
 
 
 def main():
@@ -236,6 +328,8 @@ def main():
                 "--output",
                 str(output / mode),
             ]
+            if mode == "read":
+                command.append("--images")
             completed = subprocess.run(
                 command, capture_output=True, text=True, check=False
             )
@@ -266,7 +360,9 @@ def main():
                 )
                 if result and not result.get("is_error"):
                     client_usages.append(result["usage"])
-            client_usage_verified = len(client_usages) == 2 and all(
+            client_usage_verified = len(client_usages) == (
+                6 if mode == "read" else 2
+            ) and all(
                 usage.get("cache_read_input_tokens", 0) * 100
                 == 88
                 * (
@@ -340,6 +436,11 @@ def main():
             "credentials_stripped": all(
                 not r["client_credentials_forwarded"] for r in records
             ),
+            "image_checks": [
+                {"action": r["action"], "images": r["images"]}
+                for r in records
+                if r.get("action", "").startswith("images_")
+            ],
         }
         passed = (
             all(
@@ -356,6 +457,11 @@ def main():
                 for action in ["text", "invoke_mcp__nonce__read", "invoke_Read"]
             )
             and actions.count("repeat_tool_nonce") == 2
+            and all(
+                actions.count(f"images_{kind}_{count}") == 1
+                for kind in ["input", "read"]
+                for count in [1, 2]
+            )
         )
         report["passed"] = passed
         return 0 if passed else 1

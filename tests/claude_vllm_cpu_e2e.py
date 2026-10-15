@@ -11,6 +11,7 @@ Uses isolated Claude settings/workspace and fresh gateway/log databases. The
 default tool test reads a random nonce through a local stdio MCP server; use
 --tool-mode read for the more demanding built-in Read tool. Does not use cloud
 credentials. Reports and CLI transcripts go under ignored target/.
+Add --images to test single/multiple PNG input and Read replay with a vision model.
 """
 
 import argparse
@@ -27,6 +28,7 @@ import uuid
 from pathlib import Path
 
 from e2e_helpers import free_port, http
+from image_fixtures import IMAGES, image_blocks
 
 
 def wait_for(predicate, seconds=30):
@@ -51,6 +53,11 @@ def main():
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--skip-tools", action="store_true")
     parser.add_argument("--tool-mode", choices=["mcp", "read"], default="mcp")
+    parser.add_argument(
+        "--images",
+        action="store_true",
+        help="Also test single/multiple PNG input and Read replay",
+    )
     args = parser.parse_args()
     upstream = urllib.parse.urlsplit(args.upstream)
     if upstream.hostname not in {"127.0.0.1", "localhost", "::1"}:
@@ -64,6 +71,9 @@ def main():
     nonce = "LOCAL_NONCE_" + uuid.uuid4().hex[:12]
     fixture = workspace / "nonce.json"
     fixture.write_text(json.dumps({"nonce": nonce}) + "\n")
+    image_paths = [workspace / f"image-{index}.png" for index in range(len(IMAGES))]
+    for path, data in zip(image_paths, IMAGES, strict=True):
+        path.write_bytes(data)
     public, admin = free_port(), free_port()
     while admin == public:
         admin = free_port()
@@ -116,9 +126,11 @@ def main():
         )
         return [success(control + "/admin/api/logs/requests/" + r["id"]) for r in rows]
 
-    def claude(tools=False):
+    def claude(tools=False, image_count=0):
         alias = "cpu-chat"
         session = alias + ("-tools" if tools else "-text")
+        if image_count:
+            session += f"-images-{image_count}"
         env = {
             k: v
             for k, v in os.environ.items()
@@ -142,7 +154,7 @@ def main():
                 "NO_PROXY": "127.0.0.1,localhost,::1",
             }
         )
-        mcp = tools and args.tool_mode == "mcp"
+        mcp = tools and args.tool_mode == "mcp" and not image_count
         tool_name = "mcp__nonce__read" if mcp else "Read"
         mcp_config = {"mcpServers": {}}
         if mcp:
@@ -162,10 +174,17 @@ def main():
                 if mcp
                 else f"Use Read to read {fixture}. Return the value of its JSON nonce field. Ignore line numbers."
             )
+        if tools and image_count:
+            prompt = (
+                "IMAGE_READ_E2E: Read these PNG files in order: "
+                + json.dumps([str(path) for path in image_paths[:image_count]])
+                + f". After reading all, reply exactly IMAGE_OK_{image_count}."
+            )
+        direct_images = image_count and not tools
         command = [
             "claude",
             "-p",
-            prompt,
+            *([] if direct_images else [prompt]),
             "--model",
             alias,
             "--bare" if mcp else "--safe-mode",
@@ -185,6 +204,21 @@ def main():
             "--max-turns",
             "4",
         ]
+        stdin = None
+        if direct_images:
+            command.extend(["--input-format", "stream-json"])
+            stdin = (
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": image_blocks(image_count),
+                        },
+                    }
+                )
+                + "\n"
+            ).encode()
         if tools:
             command.extend(
                 ["--allowedTools", tool_name, "--permission-mode", "dontAsk"]
@@ -198,10 +232,11 @@ def main():
                 env=env,
                 stdout=out,
                 stderr=err,
+                stdin=subprocess.PIPE if direct_images else subprocess.DEVNULL,
                 start_new_session=True,
             )
             try:
-                process.wait(timeout=args.timeout)
+                process.communicate(input=stdin, timeout=args.timeout)
             except subprocess.TimeoutExpired:
                 raise AssertionError(
                     f"Claude timed out after {args.timeout}s; see {session}.jsonl"
@@ -220,9 +255,11 @@ def main():
             result,
             stderr[-2000:],
         )
-        expected = nonce if tools else "CPU_OK"
+        expected = (
+            f"IMAGE_OK_{image_count}" if image_count else nonce if tools else "CPU_OK"
+        )
         assert expected in result.get("result", ""), result
-        rows = details(session, minimum=2 if tools else 1)
+        rows = details(session, minimum=1 + (image_count or 1) if tools else 1)
         for detail in rows:
             request = detail["request"]
             assert request["http_status"] == 200 and request["outcome"] == "success", (
@@ -255,13 +292,34 @@ def main():
                 for p in d["payloads"]
                 if p["stage"] == "client_input"
             ]
-            assert any(
-                b.get("type") == "tool_result" and nonce in json.dumps(b)
-                for body in inputs
-                for message in body["messages"]
-                if isinstance(message["content"], list)
-                for b in message["content"]
-            ), inputs
+            # Log queries return newest requests first; select the fullest
+            # replay explicitly rather than depending on the response ordering.
+            tool_results = max(
+                (
+                    [
+                        block
+                        for message in body["messages"]
+                        if isinstance(message["content"], list)
+                        for block in message["content"]
+                        if block.get("type") == "tool_result"
+                    ]
+                    for body in inputs
+                ),
+                key=len,
+            )
+            if image_count:
+                assert (
+                    sum(
+                        block.get("type") == "image"
+                        for result in tool_results
+                        for block in result.get("content", [])
+                    )
+                    == image_count
+                ), tool_results
+            else:
+                assert any(nonce in json.dumps(result) for result in tool_results), (
+                    tool_results
+                )
         return {
             "requests": len(rows),
             "result": result.get("result"),
@@ -316,11 +374,28 @@ def main():
                 f"Claude Code {args.tool_mode} tool roundtrip through Chat",
                 lambda: claude(True),
             )
+        if args.images:
+            for count in [1, 2]:
+                check(
+                    f"Claude Code {count} image input through Chat",
+                    lambda count=count: claude(image_count=count),
+                )
+                if not args.skip_tools:
+                    check(
+                        f"Claude Code Read {count} image replay through Chat",
+                        lambda count=count: claude(True, count),
+                    )
 
         def logger_health():
             expected_sessions = ["cpu-chat-text"]
             if not args.skip_tools:
                 expected_sessions.append("cpu-chat-tools")
+            if args.images:
+                expected_sessions.extend(
+                    f"cpu-chat-{kind}-images-{count}"
+                    for count in [1, 2]
+                    for kind in (["text"] if args.skip_tools else ["text", "tools"])
+                )
             # Wait for final rows even when the CLI check failed before it could
             # inspect logs. Fast JSON errors can precede the writer's next flush.
             records = [

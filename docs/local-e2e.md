@@ -31,6 +31,14 @@ JSON arguments, tool-result history replay, usage accounting, session logs, and
 released scheduler reservations. The mock cannot read the random nonce file;
 only the real tool can supply the nonce in a subsequent Chat tool result.
 
+Image checks submit one and two distinct PNGs through Claude Code's streaming
+JSON input and through actual built-in `Read` calls. The mock verifies PNG media
+types, exact decoded bytes (SHA-256), image count/order, and interleaved text
+positions in Chat `image_url` blocks. Read results must retain their tool role
+and survive subsequent tool turns. This tests transport and protocol conversion;
+the mock does not perform visual recognition. To run the image scenarios against
+a local vision model, add `--images` to `claude_vllm_cpu_e2e.py`.
+
 Reports, CLI transcripts, and mock requests are written under
 `target/claude-mock-e2e/runs/`. The mock reports 1000 input tokens and 880 cached
 tokens to verify accounting; these fixtures do not measure a real KV-cache hit
