@@ -38,18 +38,6 @@ impl Event {
         &self.data
     }
 
-    pub(crate) fn name(&self) -> Option<&str> {
-        self.name.as_deref()
-    }
-
-    pub(crate) fn set_data(&mut self, data: String) {
-        self.data = data;
-    }
-
-    pub(crate) fn set_name(&mut self, name: String) {
-        self.name = Some(name);
-    }
-
     pub(crate) fn into_axum(self) -> AxumEvent {
         let mut event = AxumEvent::default();
         if let Some(name) = self.name {

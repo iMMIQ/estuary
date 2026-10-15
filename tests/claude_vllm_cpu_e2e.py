@@ -6,7 +6,7 @@ Build with cargo build --locked, start vLLM with an instruction/tool model and
 python3 tests/claude_vllm_cpu_e2e.py --upstream http://127.0.0.1:18000/v1 \
     --model qwen-cpu
 For llama.cpp (started with --jinja), use --provider openai. For Ollama's
-OpenAI-compatible endpoint, also select --protocols chat.
+OpenAI-compatible endpoint, use --provider openai.
 Uses isolated Claude settings/workspace and fresh gateway/log databases. The
 default tool test reads a random nonce through a local stdio MCP server; use
 --tool-mode read for the more demanding built-in Read tool. Does not use cloud
@@ -51,12 +51,6 @@ def main():
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--skip-tools", action="store_true")
     parser.add_argument("--tool-mode", choices=["mcp", "read"], default="mcp")
-    parser.add_argument(
-        "--protocols",
-        nargs="+",
-        choices=["native", "chat", "responses"],
-        default=["native", "chat"],
-    )
     args = parser.parse_args()
     upstream = urllib.parse.urlsplit(args.upstream)
     if upstream.hostname not in {"127.0.0.1", "localhost", "::1"}:
@@ -122,8 +116,8 @@ def main():
         )
         return [success(control + "/admin/api/logs/requests/" + r["id"]) for r in rows]
 
-    def claude(protocol, tools=False):
-        alias = "cpu-" + protocol
+    def claude(tools=False):
+        alias = "cpu-chat"
         session = alias + ("-tools" if tools else "-text")
         env = {
             k: v
@@ -221,21 +215,6 @@ def main():
             json.loads(line) for line in stdout.splitlines() if line.startswith("{")
         ]
         result = next((e for e in reversed(events) if e.get("type") == "result"), None)
-        if protocol == "responses":
-            assert process.returncode == 1 and result and result.get("is_error"), result
-            assert "output effort cannot be represented losslessly" in result.get(
-                "result", ""
-            ), result
-            rows = details(session)
-            assert all(
-                r["request"]["http_status"] == 400
-                and r["request"]["outcome"] == "error"
-                for r in rows
-            ), rows
-            return {
-                "expected_unsupported_feature": "Claude Code output effort",
-                "requests": len(rows),
-            }
         assert process.returncode == 0 and result and not result.get("is_error"), (
             process.returncode,
             result,
@@ -261,14 +240,8 @@ def main():
             if created is not None:
                 assert request["usage"]["cache_write_tokens"] == created, request
             assert len(request["attempts"]) == 1, request
-            assert (
-                request["attempts"][0]["adapter"]
-                == {
-                    "native": "native_anthropic",
-                    "chat": "chat_to_anthropic",
-                    "responses": "responses_to_anthropic",
-                }[protocol]
-            ), request
+            assert request["attempts"][0]["adapter"] == "chat_to_messages", request
+            assert request["attempts"][0]["endpoint"] == "chat/completions", request
             assert {p["stage"] for p in detail["payloads"]} == {
                 "client_input",
                 "upstream_input",
@@ -323,44 +296,31 @@ def main():
                 return None
 
         wait_for(ready)
-        for protocol in args.protocols:
-            node = success(
-                control + "/admin/api/nodes",
-                {
-                    "id": "cpu-" + protocol,
-                    "base_url": args.upstream,
-                    "models": {"cpu-" + protocol: args.model},
-                    "max_concurrency": 2,
-                    "provider": {
-                        "type": args.provider,
-                        "anthropic_protocol": protocol,
-                    },
-                },
-            )
-            report["provider_version"] = node["runtime"]["provider_version"]
-            if args.provider == "vllm":
-                report["vllm_version"] = report["provider_version"]
+        node = success(
+            control + "/admin/api/nodes",
+            {
+                "id": "cpu-chat",
+                "base_url": args.upstream,
+                "models": {"cpu-chat": args.model},
+                "max_concurrency": 2,
+                "provider": {"type": args.provider},
+            },
+        )
+        report["provider_version"] = node["runtime"]["provider_version"]
+        if args.provider == "vllm":
+            report["vllm_version"] = report["provider_version"]
         save()
-        for protocol in args.protocols:
-            if protocol == "responses":
-                check(
-                    "Claude Code unsupported Responses output effort is rejected",
-                    lambda: claude("responses"),
-                )
-                continue
-            check("Claude Code streaming " + protocol, lambda p=protocol: claude(p))
-            if not args.skip_tools:
-                check(
-                    f"Claude Code {args.tool_mode} tool roundtrip " + protocol,
-                    lambda p=protocol: claude(p, True),
-                )
+        check("Claude Code streaming through Chat", lambda: claude())
+        if not args.skip_tools:
+            check(
+                f"Claude Code {args.tool_mode} tool roundtrip through Chat",
+                lambda: claude(True),
+            )
 
         def logger_health():
-            expected_sessions = []
-            for protocol in args.protocols:
-                expected_sessions.append("cpu-" + protocol + "-text")
-                if protocol != "responses" and not args.skip_tools:
-                    expected_sessions.append("cpu-" + protocol + "-tools")
+            expected_sessions = ["cpu-chat-text"]
+            if not args.skip_tools:
+                expected_sessions.append("cpu-chat-tools")
             # Wait for final rows even when the CLI check failed before it could
             # inspect logs. Fast JSON errors can precede the writer's next flush.
             records = [

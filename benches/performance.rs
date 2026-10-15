@@ -10,9 +10,7 @@ use anyhow::Result;
 use axum::{Json, Router, body::Bytes, http::StatusCode, routing::post};
 use estuary::{
     Gateway, Settings,
-    config::{
-        AnthropicProtocol, NodeConfig, PrefixConfig, ProviderConfig, ProviderKind, RoutingConfig,
-    },
+    config::{NodeConfig, PrefixConfig, ProviderConfig, ProviderKind, RoutingConfig},
     kv_cache::{BlockHash, CacheMutation},
     node::Node,
     prefix::routing_text,
@@ -107,10 +105,6 @@ async fn chat_response(_: Bytes) -> &'static str {
     r#"{"id":"chatcmpl_bench","object":"chat.completion","model":"bench","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#
 }
 
-async fn responses_response(_: Bytes) -> &'static str {
-    r#"{"id":"resp_bench","object":"response","status":"completed","model":"bench","output":[{"id":"msg_bench","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1}}"#
-}
-
 async fn tokenize_response(_: Bytes) -> Json<Value> {
     Json(json!({"tokens": [1, 2, 3, 4]}))
 }
@@ -119,8 +113,6 @@ async fn mock_vllm() -> Result<Server> {
     Server::spawn(
         Router::new()
             .route("/v1/chat/completions", post(chat_response))
-            .route("/v1/messages", post(chat_response))
-            .route("/v1/responses", post(responses_response))
             .route("/tokenize", post(tokenize_response)),
     )
     .await
@@ -133,10 +125,6 @@ async fn gateway(upstream: &Server, node_count: usize) -> Result<Server> {
             base_url: format!("http://{}/v1", upstream.address),
             models: HashMap::from([("bench".to_owned(), "bench".to_owned())]),
             max_concurrency: 1,
-            provider: estuary::config::ProviderConfig {
-                anthropic_protocol: AnthropicProtocol::Chat,
-                ..estuary::config::ProviderConfig::default()
-            },
             ..NodeConfig::default()
         })
         .collect();

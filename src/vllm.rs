@@ -9,7 +9,6 @@ use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::Client;
-use semver::Version;
 use serde_json::Value as JsonValue;
 use tokio::{
     sync::{Notify, watch},
@@ -30,46 +29,13 @@ mod monitor;
 use monitor::run_node_monitor;
 mod tokenization;
 use tokenization::{
-    TokenizationCache, pretokenized_completion, request_tokenization, tokenization_key,
-    tokenize_payload,
+    TokenizationCache, prepare_tokenization, pretokenized_completion, request_tokenization,
+    tokenization_key,
 };
 mod kv_events;
 use kv_events::run_event_supervisor;
 pub use monitor::preflight_vllm;
 
-const MIN_VLLM_VERSION: Version = Version::new(0, 25, 0);
-
-fn release_prefix(raw: &str) -> &str {
-    raw.trim()
-        .trim_start_matches('v')
-        .split(|ch: char| !ch.is_ascii_digit() && ch != '.')
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches('.')
-}
-
-fn release_version(raw: &str) -> Option<Version> {
-    let mut components = release_prefix(raw).split('.');
-    let major = components.next()?.parse().ok()?;
-    let minor = components.next()?.parse().ok()?;
-    let patch = components
-        .next()
-        .and_then(|part| part.parse().ok())
-        .unwrap_or(0);
-    Some(Version::new(major, minor, patch))
-}
-
-pub(crate) fn supports_native_anthropic_thinking(raw: &str) -> bool {
-    let normalized = raw.trim().trim_start_matches('v');
-    let prefix = release_prefix(raw);
-    let suffix = &normalized[prefix.len()..];
-    // Admission tolerates opaque and prerelease versions, but they do not prove
-    // that a feature has shipped. Only stable releases (with optional build IDs)
-    // can retire the older thinking shim.
-    (suffix.is_empty() || suffix.starts_with('+'))
-        && matches!(prefix.split('.').count(), 2 | 3)
-        && release_version(raw).is_some_and(|version| version >= Version::new(0, 31, 0))
-}
 const MAX_MANAGEMENT_BODY_BYTES: usize = 8 * 1024 * 1024;
 const VERSION_RECHECK_TICKS: u64 = 30;
 const KV_HEALTH_POLL_MAX: Duration = Duration::from_millis(250);
@@ -94,6 +60,7 @@ pub struct VllmManager {
 #[derive(Debug)]
 pub struct RoutingTokenization {
     pub tokens: Option<Vec<u64>>,
+    pub node_ids: Option<Vec<String>>,
     pub outcome: &'static str,
     pub elapsed: Duration,
 }
@@ -102,16 +69,9 @@ impl RoutingTokenization {
     fn new(tokens: Option<Vec<u64>>, outcome: &'static str, started: Instant) -> Self {
         Self {
             tokens,
+            node_ids: None,
             outcome,
             elapsed: started.elapsed(),
-        }
-    }
-
-    pub(crate) fn skipped(outcome: &'static str) -> Self {
-        Self {
-            tokens: None,
-            outcome,
-            elapsed: Duration::ZERO,
         }
     }
 }
@@ -294,6 +254,8 @@ impl VllmManager {
         }
     }
 
+    /// Tokenize the final upstream payload after client protocol conversion.
+    #[allow(clippy::too_many_lines)]
     pub async fn tokenize_for_routing(
         &self,
         client: &Client,
@@ -317,9 +279,6 @@ impl VllmManager {
         if !allow_remote {
             return RoutingTokenization::new(None, "prefix_gate", started);
         }
-        let Some(base_payload) = tokenize_payload(endpoint, body) else {
-            return RoutingTokenization::new(None, "unsupported", started);
-        };
 
         let mut candidates = self
             .scheduler
@@ -341,29 +300,55 @@ impl VllmManager {
         }
         candidates.sort_by_key(|node| (node.scheduling_load(), node.id().to_owned()));
 
-        let Some(node) = candidates.into_iter().next() else {
+        let Some(node) = candidates.first() else {
             return RoutingTokenization::new(None, "unavailable", started);
+        };
+        let Some(mut prompt) = prepare_tokenization(endpoint, body, &node.provider().tokenize_path)
+        else {
+            return RoutingTokenization::new(None, "unsupported_payload", started);
         };
         let Some(Some(upstream_model)) = node.upstream_model(Some(public_model)) else {
             return RoutingTokenization::new(None, "unavailable", started);
         };
-        let mut payload = base_payload;
-        payload.insert("model".to_owned(), JsonValue::String(upstream_model));
+        // A public-model pool must use equivalent tokenizers and templates.
+        // Every candidate receives this same normalized prompt, with its model alias.
+        let node_ids = candidates
+            .iter()
+            .map(|node| node.id().to_owned())
+            .collect::<Vec<_>>();
+        let mut payload = prompt.payload;
+        payload.insert(
+            "model".to_owned(),
+            JsonValue::String(upstream_model.clone()),
+        );
+        if let Some(fallback) = &mut prompt.fallback {
+            fallback.insert("model".to_owned(), JsonValue::String(upstream_model));
+        }
         let key = tokenization_key(
-            endpoint,
+            &prompt.path,
             public_model,
             node.id(),
             node.provider_generation(),
             &payload,
         );
         if let Some(tokens) = self.token_cache.lock().get(&key) {
-            return RoutingTokenization::new(Some(tokens), "cache_hit", started);
+            let mut result = RoutingTokenization::new(Some(tokens), "cache_hit", started);
+            result.node_ids = Some(node_ids);
+            return result;
         }
         let timeout = Duration::from_millis(node.provider().request_timeout_ms);
-        match tokio::time::timeout(timeout, request_tokenization(client, &node, payload)).await {
+        match tokio::time::timeout(
+            timeout,
+            request_tokenization(client, node, &prompt.path, payload, prompt.fallback),
+        )
+        .await
+        {
             Ok(Ok(tokens)) if !node.is_retired() => {
                 self.token_cache.lock().insert(key, tokens.clone());
-                RoutingTokenization::new(Some(tokens), "upstream_success", started)
+                let mut result =
+                    RoutingTokenization::new(Some(tokens), "upstream_success", started);
+                result.node_ids = Some(node_ids);
+                result
             }
             Ok(Ok(_)) => RoutingTokenization::new(None, "node_retired", started),
             Ok(Err(error)) => {

@@ -271,10 +271,6 @@ export function NodeDetails({
                 value={isVllm ? "vLLM 0.25+" : t("upstreams.openaiCompatible")}
               />
               <DataRow
-                label={t("details.anthropicProtocol")}
-                value={t(`protocol.${node.config.provider.anthropic_protocol}`)}
-              />
-              <DataRow
                 label={t("details.bearerCredential")}
                 value={
                   node.credentials.api_key_source === "database"
@@ -450,8 +446,8 @@ export function NodeDetails({
             {modelMappings.map(([model]) => (
               <div className="protocol-review" key={model}>
                 <strong>{model}</strong>
-                <span>Codex: {protocolPaths(node.config).responses}</span>
-                <span>Claude: {protocolPaths(node.config).messages}</span>
+                <span>Codex: {protocolPaths.responses}</span>
+                <span>Claude: {protocolPaths.messages}</span>
               </div>
             ))}
           </section>

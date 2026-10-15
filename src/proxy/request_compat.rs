@@ -1,9 +1,8 @@
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::error::GatewayError;
 
 pub(super) const CLAUDE_CODE_BILLING_PREFIX: &str = "x-anthropic-billing-header:";
-pub(super) const THINKING_BUDGET_WARNING: &str = "approximated-by-max-tokens";
 
 pub(super) fn normalize_context_management(body: &mut Value) -> Result<bool, GatewayError> {
     let object = body.as_object_mut().ok_or_else(|| {
@@ -53,58 +52,6 @@ pub(super) fn normalize_context_management(body: &mut Value) -> Result<bool, Gat
     }
     object.remove("context_management");
     Ok(true)
-}
-
-pub(super) fn apply_vllm_native_thinking_compat(
-    object: &mut Map<String, Value>,
-) -> Result<bool, GatewayError> {
-    let Some(thinking) = object.get("thinking").filter(|value| !value.is_null()) else {
-        return Ok(false);
-    };
-    let thinking = thinking.as_object().ok_or_else(|| {
-        GatewayError::InvalidRequest("Anthropic thinking must be an object".to_owned())
-    })?;
-    let kind = thinking
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            GatewayError::InvalidRequest("Anthropic thinking.type must be a string".to_owned())
-        })?;
-    let (enable_thinking, approximated_budget) = match kind {
-        "disabled" => (false, false),
-        "adaptive" => (true, false),
-        "enabled" => {
-            thinking
-                .get("budget_tokens")
-                .and_then(Value::as_u64)
-                .filter(|budget| *budget > 0)
-                .ok_or_else(|| {
-                    GatewayError::InvalidRequest(
-                        "Anthropic enabled thinking requires positive budget_tokens".to_owned(),
-                    )
-                })?;
-            (true, true)
-        }
-        _ => {
-            return Err(GatewayError::InvalidRequest(format!(
-                "unsupported Anthropic thinking type '{kind}'"
-            )));
-        }
-    };
-    let template_kwargs = object
-        .entry("chat_template_kwargs".to_owned())
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| {
-            GatewayError::InvalidRequest("vLLM chat_template_kwargs must be an object".to_owned())
-        })?;
-    template_kwargs.insert("enable_thinking".to_owned(), Value::Bool(enable_thinking));
-    if let Some(thinking) = object.get_mut("thinking").and_then(Value::as_object_mut)
-        && thinking.get("display").and_then(Value::as_str) == Some("omitted")
-    {
-        thinking.remove("display");
-    }
-    Ok(approximated_budget)
 }
 
 pub(super) fn strip_claude_code_billing_blocks(body: &mut Value) -> bool {

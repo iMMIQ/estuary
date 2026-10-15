@@ -29,13 +29,9 @@ describe("node config mapping", () => {
     expect(draftToConfig(draft).model_capabilities["*"].multimodal).toBeFalse();
   });
 
-  test("generic protocol paths resolve provider defaults and explicit settings", () => {
-    const config = draftToConfig(createDraft("vllm"));
-    expect(protocolPaths(config).messages).toBe("Messages → Messages");
-    config.provider.type = "openai";
-    expect(protocolPaths(config).messages).toBe("Messages → Chat Completions → Messages");
-    config.provider.anthropic_protocol = "responses";
-    expect(protocolPaths(config).messages).toBe("Messages → Responses → Messages");
+  test("all models use Chat protocol paths", () => {
+    expect(protocolPaths.messages).toBe("Messages → Chat Completions → Messages");
+    expect(protocolPaths.responses).toBe("Responses → Chat Completions → Responses");
   });
 
   test("catch-all model mapping retains capabilities for individual public aliases", () => {
@@ -62,13 +58,6 @@ describe("node config mapping", () => {
 
   test("new vLLM nodes use a finite waiting watermark", () => {
     expect(createDraft("vllm").provider.waiting_threshold).toBe(8);
-    expect(createDraft("vllm").provider.anthropic_protocol).toBe("auto");
-  });
-
-  test("preserves an explicit Anthropic upstream protocol", () => {
-    const draft = createDraft("openai");
-    draft.provider.anthropic_protocol = "responses";
-    expect(draftToConfig(draft).provider.anthropic_protocol).toBe("responses");
   });
 
   test("keeps image capabilities independent on a mixed node", () => {
@@ -89,20 +78,6 @@ describe("node config mapping", () => {
     expect(draftToConfig(draft).model_capabilities).toEqual({
       text: { multimodal: false },
     });
-  });
-
-  test("defaults legacy node records to automatic Anthropic routing", () => {
-    const config = draftToConfig(createDraft("openai"));
-    const legacyProvider = { ...config.provider } as Partial<typeof config.provider>;
-    delete legacyProvider.anthropic_protocol;
-    delete legacyProvider.flatten_codex_namespaces;
-    const record = {
-      config: { ...config, provider: legacyProvider },
-      credentials: { api_key_source: "none" },
-    };
-    const draft = recordToDraft(record as Parameters<typeof recordToDraft>[0]);
-    expect(draft.provider.anthropic_protocol).toBe("auto");
-    expect(draft.provider.flatten_codex_namespaces).toBeFalse();
   });
 
   test("stores a directly entered Bearer key and drops the legacy fallback", () => {

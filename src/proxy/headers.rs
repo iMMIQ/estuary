@@ -2,8 +2,6 @@ use std::collections::HashSet;
 
 use axum::http::{HeaderMap, HeaderName, header::CONTENT_LENGTH};
 
-use crate::config::AnthropicProtocol;
-
 pub(super) fn copy_response_headers(source: &HeaderMap, destination: &mut HeaderMap) {
     let connection_headers = connection_header_names(source);
     for (name, value) in source {
@@ -38,13 +36,8 @@ pub(super) fn should_forward_request_header(name: &HeaderName) -> bool {
         )
 }
 
-pub(super) fn should_forward_protocol_header(
-    name: &HeaderName,
-    protocol: Option<AnthropicProtocol>,
-) -> bool {
-    protocol.is_none_or(|protocol| {
-        protocol == AnthropicProtocol::Native || !name.as_str().starts_with("anthropic-")
-    })
+pub(super) fn should_forward_protocol_header(name: &HeaderName) -> bool {
+    !name.as_str().starts_with("anthropic-")
 }
 
 pub(super) fn should_forward_response_header(name: &HeaderName) -> bool {

@@ -18,6 +18,7 @@ pub struct PrefixInput {
     text: String,
     char_count: usize,
     token_ids: Option<Arc<[u64]>>,
+    token_node_ids: Option<Arc<[String]>>,
     estimated_tokens: usize,
     estimated_affinity_tokens: usize,
     output_limit: Option<usize>,
@@ -100,6 +101,22 @@ impl PrefixInput {
 
     pub fn set_token_ids(&mut self, token_ids: Vec<u64>) {
         self.token_ids = Some(token_ids.into());
+        self.token_node_ids = None;
+    }
+
+    pub(crate) fn set_scoped_token_ids(
+        &mut self,
+        token_ids: Vec<u64>,
+        node_ids: Option<Vec<String>>,
+    ) {
+        self.set_token_ids(token_ids);
+        self.token_node_ids = node_ids.map(Into::into);
+    }
+
+    pub(crate) fn tokens_apply_to_node(&self, node_id: &str) -> bool {
+        self.token_node_ids
+            .as_ref()
+            .is_none_or(|nodes| nodes.iter().any(|id| id == node_id))
     }
 
     pub fn token_ids(&self) -> Option<&[u64]> {
@@ -576,6 +593,14 @@ pub fn routing_text(
         "response_format",
         "parallel_tool_calls",
         "reasoning",
+        "reasoning_effort",
+        "chat_template",
+        "chat_template_kwargs",
+        "add_generation_prompt",
+        "continue_final_message",
+        "add_special_tokens",
+        "documents",
+        "cache_salt",
     ] {
         if let Some(value) = body.get(key) {
             canonical.append_segment(key, value);
@@ -1083,5 +1108,42 @@ mod tests {
         let first = routing_text("chat/completions", Some("model"), Some(&first), &config);
         let second = routing_text("chat/completions", Some("model"), Some(&second), &config);
         assert_eq!(first.text, second.text);
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use crate::chat_bridge::prepare;
+    use serde_json::json;
+    #[test]
+    fn equivalent_clients_share_the_final_chat_prefix_and_thinking_changes_it() {
+        let messages =
+            json!({"model":"m","max_tokens":64,"messages":[{"role":"user","content":"hello"}]});
+        let responses = json!({"model":"m","input":"hello"});
+        let chat = json!({"model":"m","messages":[{"role":"user","content":"hello"}]});
+        let config = crate::config::PrefixConfig::default();
+        let mut prefixes = Vec::new();
+        for (endpoint, source) in [
+            ("messages", messages.clone()),
+            ("responses", responses),
+            ("chat/completions", chat),
+        ] {
+            let (body, _) = prepare(endpoint, &source).unwrap();
+            prefixes.push(crate::prefix::routing_text(
+                "chat/completions",
+                Some("m"),
+                Some(&body),
+                &config,
+            ));
+        }
+        assert_eq!(prefixes[0].text, prefixes[1].text);
+        assert_eq!(prefixes[1].text, prefixes[2].text);
+        let mut thinking = messages;
+        thinking["thinking"] = json!({"type":"enabled","budget_tokens":32});
+        let (body, _) = prepare("messages", &thinking).unwrap();
+        assert_ne!(
+            prefixes[0].text,
+            crate::prefix::routing_text("chat/completions", Some("m"), Some(&body), &config).text
+        );
     }
 }

@@ -109,8 +109,12 @@ pub(super) fn write_payloads(
         if payload.bytes.is_empty() {
             continue;
         }
+        // Backend counters now always use Chat semantics. Only client payloads
+        // can carry Anthropic's separate cached and uncached input counters.
+        let anthropic =
+            payload.stage.starts_with("client_") && record.protocol == "anthropic_messages";
         let (content, usage, representation) =
-            inspect::prepare(&payload.bytes, payload.streaming, payload.anthropic);
+            inspect::prepare(&payload.bytes, payload.streaming, anthropic);
         if payload.stage == "upstream_output"
             && !usage.is_null()
             && let Some(attempt) = record

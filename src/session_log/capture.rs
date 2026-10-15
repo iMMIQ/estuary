@@ -24,7 +24,6 @@ pub(super) struct CapturedPayload {
     pub bytes_seen: usize,
     pub state: String,
     pub streaming: bool,
-    pub anthropic: bool,
     budget: Arc<AtomicUsize>,
 }
 
@@ -131,7 +130,7 @@ impl Observation {
                 .timings_us
                 .insert("body_read".to_owned(), elapsed);
         }
-        self.capture("client_input", 0, body, false, false);
+        self.capture("client_input", 0, body, false);
     }
 
     pub(crate) fn parsed(&self, body: Option<&Value>) {
@@ -156,14 +155,7 @@ impl Observation {
         }
     }
 
-    pub(crate) fn capture(
-        &self,
-        stage: &str,
-        attempt: usize,
-        bytes: &[u8],
-        streaming: bool,
-        anthropic: bool,
-    ) {
+    pub(crate) fn capture(&self, stage: &str, attempt: usize, bytes: &[u8], streaming: bool) {
         if !self.sink.config.capture_content {
             return;
         }
@@ -178,7 +170,6 @@ impl Observation {
                 bytes_seen: 0,
                 state: "complete".to_owned(),
                 streaming,
-                anthropic,
                 budget: Arc::clone(&self.sink.content_bytes),
             });
         capture.bytes_seen = capture.bytes_seen.saturating_add(bytes.len());
@@ -246,7 +237,7 @@ impl Observation {
 
     pub(crate) fn downstream_bytes(&self, bytes: &[u8], streaming: bool) {
         self.pending.lock().record.response_bytes += bytes.len() as u64;
-        self.capture("client_output", 0, bytes, streaming, false);
+        self.capture("client_output", 0, bytes, streaming);
     }
 
     pub(crate) fn downstream_done(&self, consumed: bool) {
@@ -322,14 +313,14 @@ impl AttemptGuard {
     pub(crate) fn update(&self, change: impl FnOnce(&mut AttemptRecord)) {
         change(&mut self.observation.pending.lock().record.attempts[self.index]);
     }
-    pub(crate) fn capture(&self, body: &[u8], streaming: bool, anthropic: bool) {
+    pub(crate) fn capture(&self, body: &[u8], streaming: bool) {
         let number = self.index + 1;
         self.observation
-            .capture("upstream_output", number, body, streaming, anthropic);
+            .capture("upstream_output", number, body, streaming);
     }
     pub(crate) fn input(&self, body: &[u8]) {
         self.observation
-            .capture("upstream_input", self.index + 1, body, false, false);
+            .capture("upstream_input", self.index + 1, body, false);
     }
     pub(crate) fn first_output(&self) {
         let elapsed = super::micros(self.started.elapsed());

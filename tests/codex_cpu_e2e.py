@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in real Codex Responses test through Estuary to a local CPU server.
 
-Start a Responses-compatible llama.cpp server, build Estuary, then run:
+Start a Chat-compatible llama.cpp server, build Estuary, then run:
 python3 tests/codex_cpu_e2e.py --upstream http://127.0.0.1:18000/v1 \
     --model qwen35-cpu
 Uses --ignore-user-config, --ignore-rules, --ephemeral, a small replacement
@@ -31,7 +31,6 @@ def main():
     parser.add_argument("--upstream", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--provider", choices=["openai", "vllm"], default="openai")
-    parser.add_argument("--flatten-namespaces", action="store_true")
     parser.add_argument("--binary", type=Path, default=Path("target/debug/estuary"))
     parser.add_argument(
         "--output", type=Path, default=Path("target/codex-cpu-e2e/runs")
@@ -65,7 +64,6 @@ def main():
         "upstream": args.upstream,
         "model": args.model,
         "provider": args.provider,
-        "flatten_codex_namespaces": args.flatten_namespaces,
         "codex_version": subprocess.check_output(
             ["codex", "--version"], text=True
         ).strip(),
@@ -312,7 +310,6 @@ def main():
                     "max_concurrency": 1,
                     "provider": {
                         "type": args.provider,
-                        "flatten_codex_namespaces": args.flatten_namespaces,
                     },
                 },
             )

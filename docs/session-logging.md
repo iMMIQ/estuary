@@ -177,7 +177,7 @@ requests; `truncated` counts stage/attempt payloads rather than whole requests.
 
 Coverage includes real HTTP requests through the gateway for growing history,
 reused request IDs, retries, stream usage, missing terminal markers, client drops,
-Responses passthrough and Messages conversion, partial content and protected
+Responses and Messages conversion through Chat, partial content and protected
 admin reads. Storage tests cover branches, compaction, unknown JSON fields, sensitive
 fields in partial JSON, reference-counted retention, saturated capture budgets,
 recovery and overlapping writers. Desktop/mobile browser tests exercise the

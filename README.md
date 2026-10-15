@@ -11,8 +11,7 @@ using concurrency, observed load, latency, errors, and prompt-prefix locality.
 ## Features
 
 - OpenAI Chat Completions, Responses, Completions, Embeddings, and Models APIs.
-- Anthropic Messages and token counting through native Messages, Responses, or
-  Chat Completions upstream protocols.
+- Messages and Responses compatibility through a shared Chat Completions backend.
 - Per-node model mappings, concurrency limits, weights, health checks, circuit
   breakers, and bounded retries.
 - Optional session logs in a separate database, with content deduplication and request/attempt inspection.
@@ -32,11 +31,11 @@ using concurrency, observed load, latency, errors, and prompt-prefix locality.
 | `GET /v1/models` | Lists configured public model names. |
 | `GET /v1/models/{model}` | Returns one configured public model. |
 | `POST /v1/chat/completions` | Buffered or SSE Chat Completions forwarding. |
-| `POST /v1/responses` | Foreground buffered or SSE Responses forwarding. |
+| `POST /v1/responses` | Foreground buffered or SSE Responses adapted through Chat Completions. |
 | `POST /v1/completions` | Completions forwarding. |
 | `POST /v1/embeddings` | Embeddings forwarding. |
 | `POST /v1/messages` | Anthropic Messages, including tools, thinking, and SSE. |
-| `POST /v1/messages/count_tokens` | Token counting through a native Messages upstream. |
+| `POST /v1/messages/count_tokens` | Token counting through the Chat render endpoint. |
 | `HEAD /api/hello` | Claude Code gateway capability probe. |
 
 Inference routes are an allowlist. Other `/v1/*` operations return a
@@ -95,8 +94,8 @@ required fields are:
 - at least one public-to-upstream model mapping;
 - a positive per-process concurrency limit.
 
-Select `openai` for a generic OpenAI-compatible server or `vllm` for the native
-vLLM integration. Upstream Bearer keys and custom headers can be stored with the
+Select `openai` for a generic OpenAI-compatible server or `vllm` for vLLM
+telemetry and KV routing. Upstream Bearer keys and custom headers can be stored with the
 node. Model mappings rewrite the public request model before forwarding; a
 mapping value of `*` preserves the requested name.
 

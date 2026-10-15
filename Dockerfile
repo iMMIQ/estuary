@@ -29,6 +29,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
 COPY deploy/build-version.sh ./deploy/build-version.sh
 COPY src/ ./src/
+COPY vendor/ ./vendor/
 COPY examples/ ./examples/
 COPY benches/ ./benches/
 COPY --from=web-builder /build/web/dist ./web/dist/

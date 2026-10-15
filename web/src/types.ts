@@ -1,7 +1,6 @@
 import type { ModelCapabilityConfig, NodeConfig, ProviderKind } from "./generated/config";
 
 export type {
-  AnthropicProtocol,
   ModelCapabilityConfig,
   NodeConfig,
   ProviderKind,

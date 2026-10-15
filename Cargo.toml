@@ -48,6 +48,8 @@ ts-rs = { version = "12.0.1", features = ["no-serde-warnings"], optional = true 
 url = "2.5"
 uuid = { version = "1.24", features = ["v7"] }
 zeromq = { version = "0.6", default-features = false, features = ["tcp-transport", "tokio-runtime"] }
+deepseek-recipe = { path = "vendor/deepseek-recipe/deepseek-recipe" }
+deepseek-recipe-core = { path = "vendor/deepseek-recipe/deepseek-recipe-core" }
 
 [profile.release]
 lto = "thin"

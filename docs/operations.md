@@ -68,15 +68,15 @@ Each node contains:
 | `api_key` / `api_key_env` | Stored Bearer key or legacy environment-variable reference. |
 | `headers` / `headers_from_env` | Stored custom headers or environment-backed values. Hop-by-hop and gateway-owned headers are rejected. |
 | `provider.type` | `openai` or `vllm`. |
-| `provider.anthropic_protocol` | `auto`, `native`, `responses`, or `chat`. |
 | `provider.kv_events` | Optional vLLM ZMQ KV-event connection and memory limits. |
 
 Model capability `family` selectors are retired. Existing SQLite records and
 imported configurations still accept this field, but ignore it and omit it when
-saved. Model names do not select protocol adapters. Backends used by Codex must
-provide a Responses endpoint; Messages can use the node's configured Chat,
-Responses, or native protocol. There is no model-specific Responses-to-Chat
-conversion.
+saved. Old SQLite records discard `provider.anthropic_protocol` and
+`flatten_codex_namespaces` when loaded; omit these fields in new configurations.
+Messages, Responses and Chat
+clients use the Chat Completions backend for every model. Node and model settings
+no longer choose between backend protocols.
 
 Create and update operations validate the complete document and probe the
 candidate before changing the active scheduler. Updates and deletes drain the
@@ -147,10 +147,9 @@ by field name, and choosing the merge retains local values for those fields.
 Review the resulting configuration before saving again.
 
 The Models tab and save preview show each model's effective Responses and
-Messages conversion paths. Responses use the upstream Responses endpoint;
-Messages use the node's Anthropic protocol setting. Connection tests validate
-configuration and probe health/provider compatibility; they do not run an inference request or verify
-generation protocol conversion. Editing the draft invalidates the previous
+Messages conversion paths. Both use the Chat Completions backend for every
+model. Connection tests validate configuration and probe health/provider
+compatibility; they do not run inference or verify generation protocol conversion. Editing the draft invalidates the previous
 connection-test result.
 
 The overview includes measured TTFT, pending prefill/decode token reservations,

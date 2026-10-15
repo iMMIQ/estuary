@@ -13,8 +13,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    anthropic, codex,
-    config::AnthropicProtocol,
+    anthropic, chat_bridge,
     error::GatewayError,
     prefix::{PrefixInput, routing_text},
     server::{AppState, RequestId},
@@ -27,8 +26,6 @@ use request_compat::{
     normalize_context_management, reject_stateful_responses, replace_unsupported_images,
     strip_claude_code_billing_blocks,
 };
-mod payload;
-use payload::AnthropicPayloads;
 mod response;
 mod streaming;
 
@@ -223,7 +220,6 @@ async fn proxy_inner(
     if endpoint == "responses" {
         reject_stateful_responses(parsed.as_ref())?;
     }
-    let codex_request = endpoint == "responses" && codex::is_request(&headers, parsed.as_ref());
     let mut body_changed = false;
     if matches!(endpoint.as_str(), "messages" | "messages/count_tokens") {
         body_changed |= normalize_context_management(
@@ -248,121 +244,49 @@ async fn proxy_inner(
         body_changed |= replace_unsupported_images(parsed, model) > 0;
     }
 
-    let original_body = if body_changed {
-        sonic_rs::to_vec(parsed.as_ref().expect("parsed body exists"))
+    let count_tokens = endpoint == "messages/count_tokens";
+    let protocol = if matches!(endpoint.as_str(), "messages" | "messages/count_tokens") {
+        ClientProtocol::Anthropic
+    } else {
+        ClientProtocol::OpenAi
+    };
+    let (converted, bridge_context) =
+        chat_bridge::prepare(&endpoint, parsed.as_ref().expect("validated JSON"))?;
+    let endpoint = if bridge_context.is_some() {
+        "chat/completions".to_owned()
+    } else {
+        endpoint
+    };
+    parsed = Some(converted);
+    let original_body = if body_changed || bridge_context.is_some() {
+        sonic_rs::to_vec(parsed.as_ref().expect("validated JSON"))
             .map(Bytes::from)
             .map_err(|_| GatewayError::Internal)?
     } else {
         body
     };
-
-    let mut anthropic_payloads = None;
-    let (protocol, record_prefix) = if endpoint == "messages" {
-        anthropic::validate_request_shape(
-            parsed.as_ref().expect("inference JSON was validated above"),
-            true,
-        )?;
-        anthropic_payloads = Some(AnthropicPayloads {
-            allow_adapters: true,
-            responses: None,
-            chat: None,
-            expose_thinking: anthropic::thinking_requested(
-                parsed.as_ref().expect("inference JSON was validated above"),
-            ),
-        });
-        (ClientProtocol::Anthropic, true)
-    } else if endpoint == "messages/count_tokens" {
-        anthropic::validate_request_shape(
-            parsed.as_ref().expect("inference JSON was validated above"),
-            false,
-        )?;
-        anthropic_payloads = Some(AnthropicPayloads {
-            allow_adapters: false,
-            responses: None,
-            chat: None,
-            expose_thinking: false,
-        });
-        (ClientProtocol::Anthropic, false)
-    } else {
-        (ClientProtocol::OpenAi, true)
-    };
-    let routing_parsed = (endpoint == "messages/count_tokens")
-        .then(|| {
-            anthropic::convert_count_request(
-                parsed.as_ref().expect("inference JSON was validated above"),
-            )
-            .ok()
-        })
-        .flatten();
-    let streaming = parsed
-        .as_ref()
-        .and_then(|value| value.get("stream"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let record_prefix = !count_tokens;
+    let streaming = !count_tokens
+        && parsed
+            .as_ref()
+            .and_then(|value| value.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     let mut prefix_input = routing_text(
         &endpoint,
         public_model.as_deref(),
-        routing_parsed.as_ref().or(parsed.as_ref()),
+        parsed.as_ref(),
         &state.settings.routing.prefix,
     );
-    if endpoint != "messages/count_tokens"
-        && let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_ref())
+    if !count_tokens && let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_ref())
     {
-        let salted = parsed
-            .get("cache_salt")
-            .is_some_and(|value| !value.is_null());
-        let exact_cache_available = state.vllm.has_exact_cache_for_model(model);
-        let prefix_worth_tokenizing = exact_cache_available
-            && state
-                .scheduler
-                .approximate_prefix_worth_tokenizing(&prefix_input);
-        let tokenization = if protocol == ClientProtocol::Anthropic {
-            if salted {
-                crate::vllm::RoutingTokenization::skipped("cache_salt")
-            } else if !exact_cache_available {
-                crate::vllm::RoutingTokenization::skipped("directory_unavailable")
-            } else if !prefix_worth_tokenizing {
-                crate::vllm::RoutingTokenization::skipped("prefix_gate")
-            } else {
-                match anthropic_payloads
-                    .as_mut()
-                    .expect("Anthropic requests have adapter state")
-                    .prepare(AnthropicProtocol::Chat, parsed)
-                {
-                    Ok(Some(payload)) => {
-                        state
-                            .vllm
-                            .tokenize_for_routing(
-                                &state.client,
-                                &payload.endpoint,
-                                model,
-                                &payload.parsed,
-                                true,
-                            )
-                            .await
-                    }
-                    Ok(None) => unreachable!("Chat preparation produces a payload"),
-                    Err(_) => crate::vllm::RoutingTokenization::skipped("adapter_unsupported"),
-                }
-            }
-        } else if salted {
-            crate::vllm::RoutingTokenization::skipped("cache_salt")
-        } else if !matches!(endpoint.as_str(), "chat/completions" | "completions") {
-            crate::vllm::RoutingTokenization::skipped("unsupported")
-        } else if !exact_cache_available {
-            crate::vllm::RoutingTokenization::skipped("directory_unavailable")
-        } else {
-            state
-                .vllm
-                .tokenize_for_routing(
-                    &state.client,
-                    &endpoint,
-                    model,
-                    parsed,
-                    prefix_worth_tokenizing,
-                )
-                .await
-        };
+        let allow_remote = state
+            .scheduler
+            .approximate_prefix_worth_tokenizing(&prefix_input);
+        let tokenization = state
+            .vllm
+            .tokenize_for_routing(&state.client, &endpoint, model, parsed, allow_remote)
+            .await;
         state
             .metrics
             .tokenization(tokenization.outcome, tokenization.elapsed);
@@ -374,7 +298,7 @@ async fn proxy_inner(
             log.event(tokenization.outcome);
         }
         if let Some(tokens) = tokenization.tokens {
-            prefix_input.set_token_ids(tokens);
+            prefix_input.set_scoped_token_ids(tokens, tokenization.node_ids);
         }
     }
 
@@ -393,8 +317,8 @@ async fn proxy_inner(
             streaming,
             request_id,
             client_protocol: protocol,
-            anthropic_payloads,
-            codex_request,
+            bridge_context,
+            count_tokens,
             record_prefix,
             observation,
         },
@@ -414,8 +338,8 @@ struct ProxyRequest {
     streaming: bool,
     request_id: RequestId,
     client_protocol: ClientProtocol,
-    anthropic_payloads: Option<AnthropicPayloads>,
-    codex_request: bool,
+    bridge_context: Option<chat_bridge::Context>,
+    count_tokens: bool,
     record_prefix: bool,
     observation: Option<Arc<crate::session_log::Observation>>,
 }
@@ -429,53 +353,25 @@ enum ClientProtocol {
 #[derive(Clone, Debug)]
 enum UpstreamResponseMode {
     Passthrough,
-    Codex {
-        namespaces: Arc<codex::NamespaceMap>,
-    },
-    ChatToAnthropic {
-        expose_thinking: bool,
-    },
-    ResponsesToAnthropic {
-        expose_thinking: bool,
-    },
-    NativeAnthropic {
-        expose_thinking: bool,
-        thinking_budget_approximated: bool,
-    },
+    ChatBridge { context: Arc<chat_bridge::Context> },
+    TokenCount,
 }
 
 impl UpstreamResponseMode {
     fn name(&self) -> &'static str {
         match self {
             Self::Passthrough => "passthrough",
-            Self::Codex { .. } => "codex_responses",
-            Self::ChatToAnthropic { .. } => "chat_to_anthropic",
-            Self::ResponsesToAnthropic { .. } => "responses_to_anthropic",
-            Self::NativeAnthropic { .. } => "native_anthropic",
+            Self::ChatBridge { context } if context.messages => "chat_to_messages",
+            Self::ChatBridge { .. } => "chat_to_responses",
+            Self::TokenCount => "chat_token_count",
         }
     }
-
     fn is_anthropic(&self) -> bool {
-        matches!(
-            self,
-            Self::ChatToAnthropic { .. }
-                | Self::ResponsesToAnthropic { .. }
-                | Self::NativeAnthropic { .. }
-        )
+        matches!(self, Self::ChatBridge { context } if context.messages)
+            || matches!(self, Self::TokenCount)
     }
-
     fn rewrites_body(&self) -> bool {
         !matches!(self, Self::Passthrough)
-    }
-
-    fn thinking_budget_approximated(&self) -> bool {
-        matches!(
-            self,
-            Self::NativeAnthropic {
-                thinking_budget_approximated: true,
-                ..
-            }
-        )
     }
 }
 

@@ -46,19 +46,17 @@ routing; use the `vllm` provider for those interfaces.
 
 ## Claude Code
 
-Run native Messages and Chat conversion against the server above:
+Run Claude Code Messages conversion against the Chat backend above:
 
 ```bash
 python3 tests/claude_vllm_cpu_e2e.py \
   --provider openai --upstream http://127.0.0.1:18000/v1 \
-  --model qwen35-cpu --protocols native chat \
+  --model qwen35-cpu \
   --output target/local-e2e/claude
 ```
 
-The script creates a separate node for each protocol. The default tool fixture
-uses MCP; `--tool-mode read` tests the CLI's built-in `Read` tool. Adding
-`responses` to `--protocols` tests the explicit rejection of Claude Code's
-unsupported output effort setting, rather than successful Responses generation.
+The default tool fixture uses MCP; `--tool-mode read` tests the CLI's built-in
+`Read` tool. Both text and tool checks use the Chat backend.
 
 ## Codex
 
@@ -68,15 +66,13 @@ instruction file:
 ```bash
 python3 tests/codex_cpu_e2e.py \
   --upstream http://127.0.0.1:18000/v1 --model qwen35-cpu \
-  --flatten-namespaces --output target/local-e2e/codex
+  --output target/local-e2e/codex
 ```
 
-For backends that cannot consume Codex's Responses `namespace` tool groups,
-enable `provider.flatten_codex_namespaces` or **Codex namespace tool
-compatibility** in the node editor. Estuary flattens function definitions and
-replayed calls, collision-checks names, and restores namespaces in JSON and
-streamed responses. This option defaults to `false` for generic providers; the
-vLLM provider applies the conversion automatically.
+Codex Responses requests are converted into Chat for every provider. Namespace
+conversion is automatic.
+Definitions and replayed calls use safe function names that are restored in the
+client's JSON and SSE responses.
 
 The script disables web search and shell tools and preapproves only the fixed
 local nonce tool for unattended execution.
@@ -113,7 +109,7 @@ Use a tool-capable model on Ollama's loopback
 ```bash
 python3 tests/claude_vllm_cpu_e2e.py \
   --provider openai --upstream http://127.0.0.1:11434/v1 \
-  --model MODEL --protocols chat --output target/local-e2e/ollama
+  --model MODEL --output target/local-e2e/ollama
 ```
 
 For every backend, the context window must fit the CLI's environment and tool

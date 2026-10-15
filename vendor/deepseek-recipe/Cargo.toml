@@ -1,0 +1,22 @@
+[workspace]
+members = ["deepseek-recipe", "deepseek-recipe-core"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/deepseek-ai/deepseek-recipe"
+
+[workspace.dependencies]
+async-stream = "0.3.6"
+base64 = "0.22.1"
+deepseek-recipe-core = { version = "0.1.0", path = "deepseek-recipe-core" }
+itertools = "0.14.0"
+jsonschema = { version = "0.18.3", default-features = false }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+strum_macros = "0.28.0"
+tokenizers = { version = "0.23.2", features = ["http"] }
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
+tokio-stream = "0.1.17"

@@ -20,7 +20,7 @@ use futures_util::{Stream, StreamExt};
 use tokio::sync::mpsc;
 
 use crate::{
-    anthropic, anthropic_responses, codex,
+    anthropic, chat_bridge,
     error::GatewayError,
     metrics::Metrics,
     node::{Node, NodeLease},
@@ -30,37 +30,6 @@ use crate::{
 
 use super::headers::copy_response_headers;
 use super::{MAX_SSE_EVENT_BYTES, UpstreamResponseMode};
-
-use super::response::set_thinking_budget_warning;
-
-pub(super) enum ResponseStreamAdapter {
-    Codex(codex::StreamRewriter),
-    Chat(anthropic::StreamConverter),
-    Responses(anthropic_responses::StreamConverter),
-    Native(anthropic::NativeStreamRewriter),
-}
-
-impl ResponseStreamAdapter {
-    pub(super) fn push_event(
-        &mut self,
-        event: sse::Event,
-    ) -> Result<Vec<sse::Event>, GatewayError> {
-        match self {
-            Self::Codex(rewriter) => rewriter.push_event(event),
-            Self::Chat(converter) => converter.push_event(&event),
-            Self::Responses(converter) => converter.push_event(&event),
-            Self::Native(rewriter) => rewriter.push_event(event),
-        }
-    }
-
-    pub(super) fn finish(&mut self) -> Result<Vec<sse::Event>, GatewayError> {
-        match self {
-            Self::Codex(_) | Self::Native(_) => Ok(Vec::new()),
-            Self::Chat(converter) => converter.finish(),
-            Self::Responses(converter) => converter.finish(),
-        }
-    }
-}
 
 pub(super) enum StreamingInput {
     Raw(Bytes),
@@ -193,7 +162,6 @@ pub(super) fn streaming_response(
     let pump_failure = Arc::clone(&terminal_failure);
     let is_anthropic = response_mode.is_anthropic();
     let rewrites_body = response_mode.rewrites_body();
-    let thinking_budget_approximated = response_mode.thinking_budget_approximated();
 
     tokio::spawn(async move {
         let mut guard = BodyGuard::new(
@@ -203,8 +171,6 @@ pub(super) fn streaming_response(
             header_latency,
             upstream_started,
         );
-        guard.anthropic_usage =
-            matches!(&response_mode, UpstreamResponseMode::NativeAnthropic { .. });
         guard.log_attempt = log_attempt;
         let needs_keepalive = is_anthropic;
         let keepalive_period = Duration::from_secs(10);
@@ -219,24 +185,10 @@ pub(super) fn streaming_response(
         let mut idle_deadline = tokio::time::Instant::now() + stream_idle_timeout;
         let mut stream_adapter = match response_mode {
             UpstreamResponseMode::Passthrough => None,
-            UpstreamResponseMode::Codex { namespaces } => Some(ResponseStreamAdapter::Codex(
-                codex::StreamRewriter::new(namespaces),
-            )),
-            UpstreamResponseMode::ChatToAnthropic { expose_thinking } => {
-                Some(ResponseStreamAdapter::Chat(
-                    anthropic::StreamConverter::new(public_model, expose_thinking),
-                ))
-            }
-            UpstreamResponseMode::ResponsesToAnthropic { expose_thinking } => {
-                Some(ResponseStreamAdapter::Responses(
-                    anthropic_responses::StreamConverter::new(public_model, expose_thinking),
-                ))
-            }
-            UpstreamResponseMode::NativeAnthropic {
-                expose_thinking, ..
-            } => Some(ResponseStreamAdapter::Native(
-                anthropic::NativeStreamRewriter::new(public_model, expose_thinking),
-            )),
+            UpstreamResponseMode::ChatBridge { context } => Some(
+                chat_bridge::StreamConverter::new((*context).clone(), public_model),
+            ),
+            UpstreamResponseMode::TokenCount => unreachable!("token counting is buffered"),
         };
         let raw_body = upstream.bytes_stream();
         let mut body: Pin<Box<dyn Stream<Item = Result<StreamingInput, String>> + Send>> =
@@ -348,9 +300,10 @@ pub(super) fn streaming_response(
                     }
                     let output = match (input, stream_adapter.as_mut()) {
                         (StreamingInput::Raw(bytes), None) => Ok(StreamingOutput::Raw(bytes)),
-                        (StreamingInput::Event(event), Some(adapter)) => {
-                            adapter.push_event(event).map(StreamingOutput::Events)
-                        }
+                        (StreamingInput::Event(event), Some(adapter)) => adapter
+                            .push_event(&event)
+                            .await
+                            .map(StreamingOutput::Events),
                         _ => Err(GatewayError::InvalidUpstreamResponse),
                     };
                     match output {
@@ -378,7 +331,7 @@ pub(super) fn streaming_response(
                 }
                 None => {
                     if let Some(adapter) = stream_adapter.as_mut() {
-                        match adapter.finish() {
+                        match adapter.finish().await {
                             Ok(events) if !events.is_empty() => {
                                 permit.send(StreamingOutput::Events(events));
                             }
@@ -454,7 +407,6 @@ pub(super) fn streaming_response(
     if is_anthropic {
         anthropic::set_anthropic_content_type(&mut response, true);
     }
-    set_thinking_budget_warning(thinking_budget_approximated, response.headers_mut());
     if let Some(value) = upstream_request_id {
         response
             .headers_mut()
@@ -524,7 +476,6 @@ pub(super) struct BodyGuard {
     pub(super) first_token_observed: bool,
     pub(super) terminal: bool,
     pub(super) log_attempt: Option<crate::session_log::AttemptGuard>,
-    anthropic_usage: bool,
 }
 
 impl BodyGuard {
@@ -545,7 +496,6 @@ impl BodyGuard {
             first_token_observed: false,
             terminal: false,
             log_attempt: None,
-            anthropic_usage: false,
         }
     }
 
@@ -559,7 +509,7 @@ impl BodyGuard {
                     "upstream_done".to_owned(),
                     crate::session_log::micros(self.upstream_started.elapsed()),
                 );
-                attempt.usage = self.observation.usage.log_value(self.anthropic_usage);
+                attempt.usage = self.observation.usage.log_value();
                 self.observation
                     .provider_timings
                     .write_to(&mut attempt.timings_us);
@@ -602,14 +552,14 @@ impl BodyGuard {
                     .or_insert(elapsed);
             });
             match input {
-                StreamingInput::Raw(bytes) => log.capture(bytes, true, self.anthropic_usage),
+                StreamingInput::Raw(bytes) => log.capture(bytes, true),
                 StreamingInput::Event(event) => {
                     for line in event.data().split('\n') {
-                        log.capture(b"data: ", true, self.anthropic_usage);
-                        log.capture(line.as_bytes(), true, self.anthropic_usage);
-                        log.capture(b"\n", true, self.anthropic_usage);
+                        log.capture(b"data: ", true);
+                        log.capture(line.as_bytes(), true);
+                        log.capture(b"\n", true);
                     }
-                    log.capture(b"\n", true, self.anthropic_usage);
+                    log.capture(b"\n", true);
                 }
             }
         }

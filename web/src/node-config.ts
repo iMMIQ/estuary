@@ -44,23 +44,10 @@ export function effectiveModelMappings(config: NodeConfig): [string, string][] {
   return entries;
 }
 
-export function protocolPaths(config: NodeConfig): { responses: string; messages: string } {
-  const protocol =
-    config.provider.anthropic_protocol === "auto"
-      ? config.provider.type === "vllm"
-        ? "native"
-        : "chat"
-      : config.provider.anthropic_protocol;
-  return {
-    responses: "Responses → Responses",
-    messages:
-      protocol === "native"
-        ? "Messages → Messages"
-        : protocol === "responses"
-          ? "Messages → Responses → Messages"
-          : "Messages → Chat Completions → Messages",
-  };
-}
+export const protocolPaths = {
+  responses: "Responses → Chat Completions → Responses",
+  messages: "Messages → Chat Completions → Messages",
+};
 
 function modelPairs(node: NodeRecord): Pair[] {
   const pairs = Object.entries(node.config.models).map(([key, value]) => ({
@@ -89,8 +76,6 @@ export function recordToDraft(node: NodeRecord): NodeDraft {
     provider: {
       ...structuredClone(defaults.node.provider),
       ...structuredClone(node.config.provider),
-      anthropic_protocol:
-        node.config.provider.anthropic_protocol ?? defaults.node.provider.anthropic_protocol,
     },
     api_key: "",
     preserve_api_key: node.credentials.api_key_source === "database",

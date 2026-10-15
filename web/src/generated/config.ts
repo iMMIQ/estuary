@@ -110,8 +110,6 @@ export type NodeConfig = {
 
 export type ProviderConfig = {
   type: ProviderKind;
-  anthropic_protocol: AnthropicProtocol;
-  flatten_codex_namespaces: boolean;
   version_path: string;
   metrics_path: string;
   tokenize_path: string;
@@ -126,8 +124,6 @@ export type ProviderConfig = {
 export type ModelCapabilityConfig = { multimodal: boolean };
 
 export type ProviderKind = "openai" | "vllm";
-
-export type AnthropicProtocol = "auto" | "native" | "responses" | "chat";
 
 export type VllmKvEventsConfig = {
   endpoint: string;

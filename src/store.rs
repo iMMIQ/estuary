@@ -279,7 +279,20 @@ fn insert_node(connection: &Connection, config: &NodeConfig) -> Result<StoredNod
 
 fn decode_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNode> {
     let encoded: String = row.get(0)?;
-    let config = serde_json::from_str(&encoded).map_err(|error| {
+    let decode = || -> serde_json::Result<NodeConfig> {
+        let mut value: serde_json::Value = serde_json::from_str(&encoded)?;
+        // Keep old persisted nodes readable without carrying retired switches
+        // through runtime configuration or accepting them in new API requests.
+        if let Some(provider) = value
+            .get_mut("provider")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            provider.remove("anthropic_protocol");
+            provider.remove("flatten_codex_namespaces");
+        }
+        serde_json::from_value(value)
+    };
+    let config = decode().map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
             encoded.len(),
             rusqlite::types::Type::Text,
@@ -416,6 +429,53 @@ mod tests {
                 .model_capabilities["*"]
                 .multimodal
         );
+    }
+
+    #[test]
+    fn retired_provider_fields_are_discarded_only_when_loading_old_records() {
+        let store = NodeStore::memory().unwrap();
+        store.insert(&node()).unwrap();
+        let mut legacy = serde_json::to_value(node()).unwrap();
+        legacy["provider"]["anthropic_protocol"] = "native".into();
+        legacy["provider"]["flatten_codex_namespaces"] = true.into();
+        assert!(serde_json::from_value::<NodeConfig>(legacy.clone()).is_err());
+        store
+            .connection
+            .lock()
+            .execute(
+                "UPDATE node_configs SET config_json=?1 WHERE id='node-a'",
+                [legacy.to_string()],
+            )
+            .unwrap();
+        let stored = store.get("node-a").unwrap().unwrap();
+        assert_eq!(stored.config.provider.kind, node().provider.kind);
+        assert_eq!(store.list().unwrap().len(), 1);
+        store
+            .update("node-a", stored.revision, &stored.config)
+            .unwrap()
+            .unwrap();
+        let encoded: String = store
+            .connection
+            .lock()
+            .query_row(
+                "SELECT config_json FROM node_configs WHERE id='node-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!encoded.contains("anthropic_protocol"));
+        assert!(!encoded.contains("flatten_codex_namespaces"));
+        // Unknown settings must still fail rather than being silently dropped.
+        legacy["provider"]["misspelled_option"] = true.into();
+        store
+            .connection
+            .lock()
+            .execute(
+                "UPDATE node_configs SET config_json=?1 WHERE id='node-a'",
+                [legacy.to_string()],
+            )
+            .unwrap();
+        assert!(store.get("node-a").is_err());
     }
 
     #[test]

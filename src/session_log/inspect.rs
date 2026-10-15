@@ -211,12 +211,7 @@ fn usage(value: &Value, anthropic: bool) -> Value {
         .or_else(|| raw.pointer("/prompt_tokens_details/cached_tokens"))
         .or_else(|| raw.pointer("/input_tokens_details/cached_tokens"))
         .and_then(Value::as_u64);
-    let write = raw
-        .get("cache_creation_input_tokens")
-        .or_else(|| raw.pointer("/input_tokens_details/cache_write_tokens"))
-        .or_else(|| raw.pointer("/prompt_tokens_details/created_cache_tokens"))
-        .or_else(|| raw.pointer("/input_tokens_details/created_cache_tokens"))
-        .and_then(Value::as_u64);
+    let write = crate::inference_stats::cache_write_tokens(raw);
     let total_input = input.map(|n| {
         if anthropic {
             n.saturating_add(read.unwrap_or_default())

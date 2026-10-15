@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use prometheus_parse::{Scrape, Value as MetricValue};
 use reqwest::Client;
+use semver::Version;
 use serde::Deserialize;
 use tokio::{
     sync::{Notify, watch},
@@ -22,10 +23,7 @@ use crate::{
     prefix::PrefixDirectory,
 };
 
-use super::{
-    MAX_MANAGEMENT_BODY_BYTES, MIN_VLLM_VERSION, VERSION_RECHECK_TICKS, read_bounded_response,
-    release_version,
-};
+use super::{MAX_MANAGEMENT_BODY_BYTES, VERSION_RECHECK_TICKS, read_bounded_response};
 
 pub(super) async fn run_node_monitor(
     client: Client,
@@ -150,6 +148,25 @@ pub(super) async fn fetch_version(client: &Client, node: &Node) -> Result<String
         );
     }
     Ok(response.version)
+}
+
+const MIN_VLLM_VERSION: Version = Version::new(0, 25, 0);
+
+fn release_version(raw: &str) -> Option<Version> {
+    let normalized = raw.trim().trim_start_matches('v');
+    let prefix = normalized
+        .split(|ch: char| !ch.is_ascii_digit() && ch != '.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.');
+    let mut components = prefix.split('.');
+    let major = components.next()?.parse().ok()?;
+    let minor = components.next()?.parse().ok()?;
+    let patch = components
+        .next()
+        .and_then(|part| part.parse().ok())
+        .unwrap_or(0);
+    Some(Version::new(major, minor, patch))
 }
 
 pub(super) fn is_supported_vllm_version(raw: &str) -> bool {

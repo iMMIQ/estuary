@@ -18,71 +18,46 @@ pub(crate) struct Usage {
 }
 
 impl Usage {
-    pub fn log_value(self, anthropic: bool) -> Value {
+    pub fn log_value(self) -> Value {
         let mut value = serde_json::to_value(self).unwrap_or_default();
-        if anthropic {
-            value["input_tokens"] = self
-                .input_tokens
-                .map(|n| {
-                    n.saturating_add(self.cached_tokens.unwrap_or_default())
-                        .saturating_add(self.cache_write_tokens.unwrap_or_default())
-                })
-                .into();
-        }
         value["source"] = "provider_observer".into();
         value["normalization_version"] = 1.into();
         value
     }
-    pub fn from_response(bytes: &[u8]) -> Self {
-        // Ignore response content while deserializing, avoiding a second large response allocation.
-        let mut usage = Self::default();
-        if let Ok(envelope) = serde_json::from_slice::<UsageEnvelope>(bytes) {
-            for reported in [
-                envelope.usage,
-                envelope.message.and_then(|nested| nested.usage),
-                envelope.response.and_then(|nested| nested.usage),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                merge(
-                    &mut usage.input_tokens,
-                    reported.prompt_tokens.or(reported.input_tokens),
-                );
-                merge(
-                    &mut usage.output_tokens,
-                    reported.completion_tokens.or(reported.output_tokens),
-                );
-                merge(
-                    &mut usage.cache_write_tokens,
-                    reported.cache_creation_input_tokens.or_else(|| {
-                        reported
-                            .prompt_tokens_details
-                            .or(reported.input_tokens_details)
-                            .and_then(|details| {
-                                details.cache_write_tokens.or(details.created_cache_tokens)
-                            })
-                    }),
-                );
-                merge(
-                    &mut usage.reasoning_tokens,
-                    reported
-                        .completion_tokens_details
-                        .or(reported.output_tokens_details)
-                        .and_then(|details| details.reasoning_tokens),
-                );
-                merge(
-                    &mut usage.cached_tokens,
-                    reported
-                        .prompt_tokens_details
-                        .or(reported.input_tokens_details)
-                        .and_then(|details| details.cached_tokens)
-                        .or(reported.cache_read_input_tokens)
-                        .or(reported.prompt_cache_hit_tokens),
-                );
-            }
-        }
-        usage
+    fn observe_reported(&mut self, reported: &ReportedUsage) {
+        merge(
+            &mut self.input_tokens,
+            reported.prompt_tokens.or(reported.input_tokens),
+        );
+        merge(
+            &mut self.output_tokens,
+            reported.completion_tokens.or(reported.output_tokens),
+        );
+        merge(
+            &mut self.cache_write_tokens,
+            reported.cache_creation_input_tokens.or_else(|| {
+                reported
+                    .prompt_tokens_details
+                    .or(reported.input_tokens_details)
+                    .and_then(|details| details.cache_write_tokens.or(details.created_cache_tokens))
+            }),
+        );
+        merge(
+            &mut self.reasoning_tokens,
+            reported
+                .completion_tokens_details
+                .or(reported.output_tokens_details)
+                .and_then(|details| details.reasoning_tokens),
+        );
+        merge(
+            &mut self.cached_tokens,
+            reported
+                .prompt_tokens_details
+                .or(reported.input_tokens_details)
+                .and_then(|details| details.cached_tokens)
+                .or(reported.cache_read_input_tokens)
+                .or(reported.prompt_cache_hit_tokens),
+        );
     }
     pub fn observe(&mut self, value: &Value) {
         for usage in [
@@ -103,14 +78,7 @@ impl Usage {
             );
             merge(
                 &mut self.cache_write_tokens,
-                count(usage, "cache_creation_input_tokens").or_else(|| {
-                    usage
-                        .pointer("/input_tokens_details/cache_write_tokens")
-                        .or_else(|| usage.pointer("/prompt_tokens_details/created_cache_tokens"))
-                        .or_else(|| usage.pointer("/input_tokens_details/created_cache_tokens"))
-                        .and_then(Value::as_u64)
-                        .and_then(|n| usize::try_from(n).ok())
-                }),
+                cache_write_tokens(usage).and_then(|n| usize::try_from(n).ok()),
             );
             merge(
                 &mut self.reasoning_tokens,
@@ -134,16 +102,48 @@ impl Usage {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct UsageEnvelope {
-    usage: Option<ReportedUsage>,
-    message: Option<NestedUsage>,
-    response: Option<NestedUsage>,
+/// Parse a buffered body once for both usage and engine timings, ignoring
+/// response content while deserializing to avoid a second large allocation.
+pub(crate) fn observe_response(bytes: &[u8]) -> (Usage, ProviderTimings) {
+    let mut usage = Usage::default();
+    let mut timings = ProviderTimings::default();
+    if let Ok(envelope) = serde_json::from_slice::<Envelope<'_>>(bytes) {
+        for nested in [
+            Some(&envelope),
+            envelope.message.as_deref(),
+            envelope.response.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(reported) = nested.usage.as_ref() {
+                usage.observe_reported(reported);
+            }
+        }
+        // Engine timings live on Chat bodies and Responses `response` envelopes.
+        for raw in [
+            envelope.metrics,
+            envelope
+                .response
+                .as_deref()
+                .and_then(|response| response.metrics),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            timings.observe_raw(raw);
+        }
+    }
+    (usage, timings)
 }
 
 #[derive(serde::Deserialize)]
-struct NestedUsage {
+struct Envelope<'a> {
     usage: Option<ReportedUsage>,
+    #[serde(borrow)]
+    metrics: Option<&'a RawValue>,
+    message: Option<Box<Envelope<'a>>>,
+    response: Option<Box<Envelope<'a>>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -160,7 +160,7 @@ struct ReportedUsage {
     completion_tokens_details: Option<ReasoningUsage>,
     output_tokens_details: Option<ReasoningUsage>,
 }
-#[derive(serde::Deserialize)]
+#[derive(Clone, Copy, serde::Deserialize)]
 struct ReasoningUsage {
     reasoning_tokens: Option<usize>,
 }
@@ -188,25 +188,6 @@ const PROVIDER_TIMING_FIELDS: [(&str, &str); 4] = [
 ];
 
 impl ProviderTimings {
-    pub fn from_response(bytes: &[u8]) -> Self {
-        let mut timings = Self::default();
-        // Borrow metrics without allocating response content or unbounded metric
-        // objects. Unknown, malformed and oversized metrics are observational.
-        if let Ok(envelope) = serde_json::from_slice::<TimingEnvelope<'_>>(bytes) {
-            for raw in [envelope.metrics, envelope.response.and_then(|r| r.metrics)]
-                .into_iter()
-                .flatten()
-            {
-                if raw.get().len() <= MAX_OBSERVATION_BYTES
-                    && let Ok(value) = serde_json::from_str(raw.get())
-                {
-                    timings.observe_metrics(&value);
-                }
-            }
-        }
-        timings
-    }
-
     pub fn observe(&mut self, value: &Value) {
         for metrics in [value.get("metrics"), value.pointer("/response/metrics")]
             .into_iter()
@@ -216,13 +197,33 @@ impl ProviderTimings {
         }
     }
 
+    /// Borrow metrics without allocating response content or unbounded metric
+    /// objects. Unknown, malformed and oversized metrics are observational.
+    fn observe_raw(&mut self, raw: &RawValue) {
+        if raw.get().len() <= MAX_OBSERVATION_BYTES
+            && let Ok(reported) = serde_json::from_str::<ReportedTimings>(raw.get())
+        {
+            // Field order matches PROVIDER_TIMING_FIELDS.
+            let milliseconds = [
+                reported.time_to_first_token_ms,
+                reported.generation_time_ms,
+                reported.queue_time_ms,
+                reported.mean_itl_ms,
+            ];
+            for (slot, milliseconds) in self.values.iter_mut().zip(milliseconds) {
+                if let Some(micros) = milliseconds.and_then(micros_from_ms) {
+                    *slot = Some(micros);
+                }
+            }
+        }
+    }
+
     fn observe_metrics(&mut self, metrics: &Value) {
         for (slot, (source, _)) in self.values.iter_mut().zip(PROVIDER_TIMING_FIELDS) {
             if let Some(micros) = metrics
                 .get(source)
                 .and_then(Value::as_f64)
-                .and_then(|ms| Duration::try_from_secs_f64(ms / 1000.0).ok())
-                .and_then(|duration| u64::try_from(duration.as_micros()).ok())
+                .and_then(micros_from_ms)
             {
                 *slot = Some(micros);
             }
@@ -239,17 +240,32 @@ impl ProviderTimings {
 }
 
 #[derive(serde::Deserialize)]
-struct TimingEnvelope<'a> {
-    #[serde(borrow)]
-    metrics: Option<&'a RawValue>,
-    #[serde(borrow)]
-    response: Option<NestedTimings<'a>>,
+#[allow(clippy::struct_field_names)]
+struct ReportedTimings {
+    time_to_first_token_ms: Option<f64>,
+    generation_time_ms: Option<f64>,
+    queue_time_ms: Option<f64>,
+    mean_itl_ms: Option<f64>,
 }
 
-#[derive(serde::Deserialize)]
-struct NestedTimings<'a> {
-    #[serde(borrow)]
-    metrics: Option<&'a RawValue>,
+/// Milliseconds as `timings_us` microseconds, sharing the session-log
+/// conversion; invalid durations are ignored.
+fn micros_from_ms(milliseconds: f64) -> Option<u64> {
+    Duration::try_from_secs_f64(milliseconds / 1000.0)
+        .ok()
+        .map(crate::session_log::micros)
+}
+
+/// Cache-write token aliases across providers, in priority order: the
+/// Anthropic top-level field, Responses `cache_write_tokens`, then the legacy
+/// Chat/Responses `created_cache_tokens` details.
+pub(crate) fn cache_write_tokens(usage: &Value) -> Option<u64> {
+    usage
+        .get("cache_creation_input_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cache_write_tokens"))
+        .or_else(|| usage.pointer("/prompt_tokens_details/created_cache_tokens"))
+        .or_else(|| usage.pointer("/input_tokens_details/created_cache_tokens"))
+        .and_then(Value::as_u64)
 }
 
 fn count(value: &Value, key: &str) -> Option<usize> {
@@ -499,27 +515,27 @@ mod tests {
 
     #[test]
     fn buffered_usage_ignores_content_and_extracts_native_and_responses_fields() {
-        let usage = Usage::from_response(br#"{"content":[{"text":"answer"}],"usage":{"input_tokens":12,"cache_read_input_tokens":8,"output_tokens":4}}"#);
+        let usage = observe_response(br#"{"content":[{"text":"answer"}],"usage":{"input_tokens":12,"cache_read_input_tokens":8,"output_tokens":4}}"#).0;
         assert_eq!(usage.input_tokens, Some(12));
         assert_eq!(usage.cached_tokens, Some(8));
         assert_eq!(usage.output_tokens, Some(4));
-        let usage = Usage::from_response(br#"{"response":{"usage":{"input_tokens":20,"input_tokens_details":{"cached_tokens":16},"output_tokens":5}}}"#);
+        let usage = observe_response(br#"{"response":{"usage":{"input_tokens":20,"input_tokens_details":{"cached_tokens":16},"output_tokens":5}}}"#).0;
         assert_eq!(usage.cached_tokens, Some(16));
         assert_eq!(usage.output_tokens, Some(5));
-        assert_eq!(Usage::from_response(b"invalid").output_tokens, None);
+        assert_eq!(observe_response(b"invalid").0.output_tokens, None);
     }
 
     #[test]
     fn vllm_cache_creation_is_observed_in_buffered_and_streamed_usage() {
         let value = serde_json::json!({"usage":{"prompt_tokens":100,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":40,"created_cache_tokens":32}}});
-        let buffered = Usage::from_response(&serde_json::to_vec(&value).unwrap());
+        let buffered = observe_response(&serde_json::to_vec(&value).unwrap()).0;
         let mut streamed = Usage::default();
         streamed.observe(&value);
         for usage in [buffered, streamed] {
             assert_eq!(usage.input_tokens, Some(100));
             assert_eq!(usage.cached_tokens, Some(40));
             assert_eq!(usage.cache_write_tokens, Some(32));
-            assert_eq!(usage.log_value(false)["input_tokens"], 100);
+            assert_eq!(usage.log_value()["input_tokens"], 100);
         }
     }
 
@@ -532,17 +548,15 @@ mod tests {
                 serde_json::json!({"type":"response.completed","response":response}),
             ] {
                 let bytes = serde_json::to_vec(&value).unwrap();
+                let (buffered_usage, buffered_timings) = observe_response(&bytes);
                 let mut streamed = StreamObservation::default();
                 streamed.observe_json(&bytes);
-                for usage in [Usage::from_response(&bytes), streamed.usage] {
+                for usage in [buffered_usage, streamed.usage] {
                     assert_eq!(usage.cache_write_tokens, Some(writes));
                     assert_eq!(usage.cached_tokens, Some(40));
-                    assert_eq!(usage.log_value(false)["input_tokens"], 100);
+                    assert_eq!(usage.log_value()["input_tokens"], 100);
                 }
-                for timings in [
-                    ProviderTimings::from_response(&bytes),
-                    streamed.provider_timings,
-                ] {
+                for timings in [buffered_timings, streamed.provider_timings] {
                     let mut recorded = BTreeMap::from([("total".to_owned(), 123)]);
                     timings.write_to(&mut recorded);
                     assert_eq!(recorded.len(), 5);
@@ -564,10 +578,11 @@ mod tests {
                 &serde_json::json!({"usage":{"input_tokens":7},"metrics":metrics}),
             )
             .unwrap();
+            let (usage, timings) = observe_response(&bytes);
             let mut recorded = BTreeMap::new();
-            ProviderTimings::from_response(&bytes).write_to(&mut recorded);
+            timings.write_to(&mut recorded);
             assert!(recorded.is_empty());
-            assert_eq!(Usage::from_response(&bytes).input_tokens, Some(7));
+            assert_eq!(usage.input_tokens, Some(7));
         }
     }
 }

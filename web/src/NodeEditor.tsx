@@ -28,7 +28,6 @@ import {
 } from "./node-config";
 import { PairEditor } from "./PairEditor";
 import type {
-  AnthropicProtocol,
   KvEventsConfig,
   NodeDraft,
   NodeRecord,
@@ -209,10 +208,6 @@ export function NodeEditor({
       },
     }));
 
-  const anthropicProtocols = (["auto", "native", "responses", "chat"] as AnthropicProtocol[]).map(
-    (value) => ({ value, label: t(`protocol.${value}` as TranslationKey) }),
-  );
-
   return (
     <div className="editor-page page-frame">
       <button className="breadcrumb-button" type="button" disabled={busy} onClick={requestClose}>
@@ -313,37 +308,6 @@ export function NodeEditor({
                     value={draft.provider.type}
                     onChange={(value) => setProvider(value as ProviderKind | null)}
                   />
-                  <Select
-                    label={t("editor.anthropicProtocol")}
-                    description={t("editor.anthropicDescription")}
-                    required
-                    data={anthropicProtocols}
-                    value={draft.provider.anthropic_protocol}
-                    onChange={(value) =>
-                      value &&
-                      update((current) => ({
-                        ...current,
-                        provider: {
-                          ...current.provider,
-                          anthropic_protocol: value as AnthropicProtocol,
-                        },
-                      }))
-                    }
-                  />
-                  {draft.provider.type === "openai" && (
-                    <Switch
-                      label={t("editor.flattenCodexNamespaces")}
-                      description={t("editor.flattenCodexNamespacesDescription")}
-                      checked={draft.provider.flatten_codex_namespaces}
-                      onChange={(event) => {
-                        const checked = event.currentTarget.checked;
-                        update((current) => ({
-                          ...current,
-                          provider: { ...current.provider, flatten_codex_namespaces: checked },
-                        }));
-                      }}
-                    />
-                  )}
                   <NumberInput
                     label={t("editor.maxConcurrency")}
                     required
@@ -666,10 +630,6 @@ export function NodeEditor({
                     draft.provider.type === "vllm" ? "vLLM 0.25+" : t("upstreams.openaiCompatible")
                   }
                 />
-                <ReviewRow
-                  label={t("details.anthropicProtocol")}
-                  value={t(`protocol.${draft.provider.anthropic_protocol}` as TranslationKey)}
-                />
                 <ReviewRow label={t("editor.maxConcurrency")} value={draft.max_concurrency} />
                 <ReviewRow label={t("editor.schedulingWeight")} value={draft.weight} />
                 <ReviewRow
@@ -679,8 +639,8 @@ export function NodeEditor({
                 {effectiveModelMappings(draftToConfig(draft)).map(([model]) => (
                   <div className="protocol-review" key={model}>
                     <strong>{model}</strong>
-                    <span>Codex: {protocolPaths(draftToConfig(draft)).responses}</span>
-                    <span>Claude: {protocolPaths(draftToConfig(draft)).messages}</span>
+                    <span>Codex: {protocolPaths.responses}</span>
+                    <span>Claude: {protocolPaths.messages}</span>
                   </div>
                 ))}
                 <ReviewRow label={t("editor.healthPath")} value={draft.health_path} />

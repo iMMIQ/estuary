@@ -221,7 +221,6 @@ fn defaults_waiting_watermark_for_existing_vllm_json() {
     }))
     .unwrap();
     assert_eq!(provider.waiting_threshold, 8);
-    assert_eq!(provider.anthropic_protocol, AnthropicProtocol::Auto);
 }
 
 #[test]
@@ -300,4 +299,14 @@ fn retired_family_is_input_only_and_other_capability_fields_stay_strict() {
         serde_json::from_value::<ModelCapabilityConfig>(serde_json::json!({"multimodal":null}))
             .is_err()
     );
+}
+
+#[test]
+fn provider_rejects_retired_protocol_settings_in_new_configuration() {
+    for value in [
+        serde_json::json!({"anthropic_protocol":"native"}),
+        serde_json::json!({"flatten_codex_namespaces":true}),
+    ] {
+        assert!(serde_json::from_value::<ProviderConfig>(value).is_err());
+    }
 }

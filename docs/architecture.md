@@ -142,48 +142,47 @@ per-node character budget. Per-node leaves are evicted by recency. Generic model
 servers cannot report real KV eviction, so approximate ownership may contain
 false positives or false negatives and is lost on restart.
 
-Native vLLM nodes can add authoritative token-block state from `/tokenize` and
-ZMQ KV events. Exact state is also process-local and falls back to approximate
-routing whenever telemetry, tokenization, event continuity, or memory authority
-is unavailable. See [the vLLM provider guide](vllm.md).
+vLLM nodes can add authoritative token-block state from Chat `/render`,
+`/tokenize`, and ZMQ KV events. Messages, Responses, and Chat requests enter the
+same routing pipeline after conversion to the final Chat payload. Token IDs are
+scoped to compatible node payloads. Exact state is process-local and falls back
+to approximate routing when telemetry, tokenization, event continuity, or memory
+authority is unavailable. See [the vLLM provider guide](vllm.md).
 
 ## Protocol Handling
 
-OpenAI-compatible request objects retain unknown fields. Estuary rewrites the
-selected model and otherwise forwards supported Chat Completions, Responses,
-Completions, and Embeddings requests. OpenAI response bodies and SSE normally
-pass through without reconstruction.
+Client `/v1/messages`, `/v1/responses`, and `/v1/chat/completions` all use upstream
+`/v1/chat/completions`, for every model and provider. Conversion happens before
+prefix lookup and node selection. Chat requests retain unknown fields;
+Messages and Responses use the vendored MIT-licensed deepseek-recipe protocol
+adapters and shared conversation types. No DeepSeek prompt encoder, tokenizer,
+image preprocessor, or demo server is used. Upstream revision and the optional
+tokenizer patch are recorded in `vendor/deepseek-recipe/ESTUARY.md`.
 
-Foreground Responses are supported. Stateful Responses features are rejected:
+Buffered and streaming Chat results are reconstructed into the original client
+protocol. Tool history, images, reasoning text and backend usage are preserved.
+Protocol output and tool argument accumulation is capped at 16 MiB per response.
+Parallel tool argument fragments are buffered until tool completion.
+Namespaces are encoded as collision-checked Chat names and restored in Responses.
+The gateway does not condition protocol conversion on User-Agent or model family.
+Completions and Embeddings retain their existing endpoints.
 
-- `background: true`;
-- non-null `previous_response_id`;
-- non-null `conversation`;
-- retrieve, delete, or cancel operations under `/v1/responses/{id}`.
+Stateful Responses (`background`, `previous_response_id`, `conversation`, and
+retrieve/delete/cancel operations), server search, document/file input, and
+encrypted-only reasoning are rejected explicitly. They require backend services
+or state that the Chat API cannot supply. Unknown unsupported content blocks also
+fail instead of silently discarding their contents.
 
-Anthropic Messages selects an upstream protocol per node:
+Messages errors keep Anthropic envelopes and streams receive keep-alive pings.
+`/v1/messages/count_tokens` uses the Chat render endpoint without generating an
+answer. The retired `anthropic_protocol` and `flatten_codex_namespaces` config
+fields are discarded at the SQLite read boundary and omitted when saved. New
+configuration requests reject these fields.
 
-| Setting | Upstream behavior |
-| --- | --- |
-| `auto` | Native Messages for vLLM; Chat Completions for generic nodes. |
-| `native` | `/v1/messages` or `/v1/messages/count_tokens`. |
-| `responses` | Convert Messages to OpenAI Responses and convert the result back. |
-| `chat` | Convert Messages to Chat Completions and convert the result back. |
-
-Conversion is lazy and node-specific. If a request cannot be represented by a
-node's selected protocol, that node is excluded without consuming an upstream
-attempt. Anthropic responses use Anthropic error envelopes, model names are
-mapped back to public names, and streams receive bounded keep-alive ping events.
-
-The gateway removes only Claude Code's standalone single-line billing marker and
-the `clear_thinking_20251015` edit with `keep: all`. Other context-management
-edits fail explicitly. User content, tool instructions, environment details,
-ordinary system text, and multiline text are preserved.
-
-For detected Codex requests routed to vLLM, namespace tool names are flattened
-before forwarding and restored in buffered JSON or SSE responses. Unsupported
-vLLM Responses shapes fail explicitly; generic Responses traffic remains on the
-normal pass-through path.
+The gateway removes Claude Code's standalone single-line billing marker and the
+no-op `clear_thinking_20251015` edit with `keep: all`. Other context edits fail.
+Inline system reminders stay in their original conversation position as user
+system-reminder blocks rather than being merged into the leading system prompt.
 
 ## Persistence and Node Lifecycle
 

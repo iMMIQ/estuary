@@ -13,6 +13,78 @@ use super::{
     read_bounded_response,
 };
 
+pub(super) struct PreparedTokenization {
+    pub(super) path: String,
+    pub(super) payload: Map<String, JsonValue>,
+    pub(super) fallback: Option<Map<String, JsonValue>>,
+}
+
+/// Prepare the actual Chat or Completions payload once for the selected pool.
+pub(super) fn prepare_tokenization(
+    endpoint: &str,
+    body: &JsonValue,
+    tokenize_path: &str,
+) -> Option<PreparedTokenization> {
+    // Token IDs alone cannot describe multimodal cache keys (extra_keys).
+    if has_media(body) {
+        return None;
+    }
+    let fallback = if endpoint == "chat/completions"
+        && ![
+            "tool_choice",
+            "parallel_tool_calls",
+            "reasoning_effort",
+            "response_format",
+            "structured_outputs",
+            "truncate_prompt_tokens",
+        ]
+        .iter()
+        .any(|key| body.get(*key).is_some_and(|value| !value.is_null()))
+    {
+        tokenize_payload(endpoint, body)
+    } else {
+        None
+    };
+    let (path, mut payload) = if endpoint == "chat/completions" {
+        let mut payload = body.as_object()?.clone();
+        payload.insert("return_mm_kwargs".into(), false.into());
+        ("/v1/chat/completions/render".to_owned(), payload)
+    } else {
+        (tokenize_path.to_owned(), tokenize_payload(endpoint, body)?)
+    };
+    payload.remove("model");
+    Some(PreparedTokenization {
+        path,
+        payload,
+        fallback,
+    })
+}
+
+fn has_media(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::Array(items) => items.iter().any(has_media),
+        JsonValue::Object(object) => {
+            matches!(
+                object.get("type").and_then(JsonValue::as_str),
+                Some(
+                    "image"
+                        | "image_url"
+                        | "input_image"
+                        | "audio"
+                        | "input_audio"
+                        | "audio_url"
+                        | "video"
+                        | "video_url"
+                        | "input_video"
+                        | "file"
+                        | "input_file"
+                )
+            ) || object.values().any(has_media)
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn tokenize_payload(endpoint: &str, body: &JsonValue) -> Option<Map<String, JsonValue>> {
     let object = body.as_object()?;
     let mut payload = Map::new();
@@ -64,20 +136,26 @@ pub(super) fn pretokenized_completion(body: &JsonValue) -> Option<Vec<u64>> {
 
 #[derive(Deserialize)]
 pub(super) struct TokenizeResponse {
+    #[serde(alias = "token_ids")]
     pub(super) tokens: Vec<u64>,
 }
 
 pub(super) async fn request_tokenization(
     client: &Client,
     node: &Node,
+    path: &str,
     payload: Map<String, JsonValue>,
+    fallback: Option<Map<String, JsonValue>>,
 ) -> Result<Vec<u64>> {
-    let url = node.provider_url(&node.provider().tokenize_path)?;
-    let mut request = client.post(url).json(&payload);
-    for (name, value) in node.headers() {
-        request = request.header(name, value);
+    let mut response = send_tokenization(client, node, path, &payload).await?;
+    // Retry the representable Chat prompt through /tokenize on the same node.
+    if matches!(response.status().as_u16(), 403 | 404 | 405 | 501)
+        && let Some(fallback) = fallback
+    {
+        response =
+            send_tokenization(client, node, &node.provider().tokenize_path, &fallback).await?;
     }
-    let response = request.send().await?.error_for_status()?;
+    let response = response.error_for_status()?;
     if response
         .content_length()
         .is_some_and(|length| length > MAX_MANAGEMENT_BODY_BYTES as u64)
@@ -85,9 +163,26 @@ pub(super) async fn request_tokenization(
         bail!("vLLM tokenize response is too large");
     }
     let body = read_bounded_response(response, "vLLM tokenize response").await?;
-    Ok(serde_json::from_slice::<TokenizeResponse>(&body)
-        .context("invalid /tokenize JSON")?
-        .tokens)
+    let response: TokenizeResponse =
+        serde_json::from_slice(&body).context("invalid tokenization JSON")?;
+    if response.tokens.is_empty() {
+        bail!("tokenization returned no tokens");
+    }
+    Ok(response.tokens)
+}
+
+async fn send_tokenization(
+    client: &Client,
+    node: &Node,
+    path: &str,
+    payload: &Map<String, JsonValue>,
+) -> Result<reqwest::Response> {
+    let url = node.provider_url(path)?;
+    let mut request = client.post(url).json(payload);
+    for (name, value) in node.headers() {
+        request = request.header(name, value);
+    }
+    Ok(request.send().await?)
 }
 
 pub(super) fn tokenization_key(

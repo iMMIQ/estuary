@@ -521,30 +521,6 @@ async fn accepts_supported_vllm_versions_in_monitor_and_preflight() {
     }
 }
 
-#[test]
-fn native_thinking_capability_tracks_confirmed_releases_and_version_changes() {
-    let node = vllm_node("http://127.0.0.1:8000");
-    for (version, native) in [
-        ("0.31.0", true),
-        (" v0.31 ", true),
-        ("0.31.0+gabcdef", true),
-        ("1.0.0", true),
-        ("0.30.9", false),
-        ("dev", false),
-        ("main+gabcdef", false),
-        ("0.31.0.dev123", false),
-        ("0.31.0-rc1", false),
-        ("0.31.0rc1", false),
-        ("0.31.0.1", false),
-    ] {
-        node.record_vllm_ready(version.to_owned());
-        assert_eq!(node.vllm_native_anthropic_thinking(), native, "{version}");
-    }
-    node.record_vllm_ready("0.31.0".to_owned());
-    node.record_vllm_incompatible(Some("0.31.0".to_owned()), "probe failed".to_owned());
-    assert!(!node.vllm_native_anthropic_thinking());
-}
-
 #[tokio::test]
 async fn rejects_vllm_below_v025() {
     let client = Client::new();
@@ -626,6 +602,253 @@ async fn tokenizes_chat_with_the_upstream_model_name() {
     assert_eq!(tokens.tokens, Some(vec![1, 2, 3]));
     assert_eq!(tokens.outcome, "upstream_success");
     server.abort();
+}
+
+fn seed_exact_cache(scheduler: &Scheduler, node: &Node) {
+    scheduler.exact_cache_directory().configure_node_owned(
+        node.id(),
+        10,
+        usize::MAX,
+        node.instance_id(),
+    );
+    scheduler
+        .exact_cache_directory()
+        .apply_owned(
+            node.id(),
+            node.instance_id(),
+            vec![CacheMutation::Store {
+                hashes: vec![BlockHash::Integer(1)],
+                parent: None,
+                token_ids: vec![1, 2],
+                block_size: 2,
+                group: 0,
+            }],
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn chat_versions_share_render_cache_gating_and_exact_routing() {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut router = Router::new();
+    {
+        let endpoint = "chat/completions";
+        let sender = sender.clone();
+        router = router.route(
+            &format!("/v1/{endpoint}/render"),
+            post(move |Json(body): Json<JsonValue>| {
+                let sender = sender.clone();
+                async move {
+                    sender.send((endpoint, body)).unwrap();
+                    Json(json!({"token_ids":[1,2,3]}))
+                }
+            }),
+        );
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let node = vllm_node(&format!("http://{address}"));
+    node.record_vllm_ready("0.30.0".into());
+    let scheduler = Arc::new(Scheduler::new(
+        vec![Arc::clone(&node)],
+        crate::config::RoutingConfig::default(),
+    ));
+    let manager = VllmManager::new(Arc::clone(&scheduler));
+    seed_exact_cache(&scheduler, &node);
+    let client = Client::new();
+    for (endpoint, version) in [
+        ("chat/completions", "0.29.0"),
+        ("chat/completions", "0.30.0"),
+        ("chat/completions", "0.25.0"),
+    ] {
+        node.record_vllm_ready(version.into());
+        let body = if endpoint == "responses" {
+            json!({"model":"public", "instructions":"system", "input":"hello"})
+        } else {
+            json!({"model":"public", "max_tokens":128, "messages":[{"role":"user", "content":"hello"}]})
+        };
+        let skipped = manager
+            .tokenize_for_routing(&client, endpoint, "public", &body, false)
+            .await;
+        assert_eq!(skipped.outcome, "prefix_gate");
+        assert!(receiver.try_recv().is_err());
+        let result = manager
+            .tokenize_for_routing(&client, endpoint, "public", &body, true)
+            .await;
+        assert_eq!(result.outcome, "upstream_success");
+        assert_eq!(result.tokens, Some(vec![1, 2, 3]));
+        assert_eq!(result.node_ids, Some(vec![node.id().to_owned()]));
+        let (actual_endpoint, payload) = receiver.try_recv().unwrap();
+        assert_eq!(actual_endpoint, endpoint);
+        assert_eq!(payload["model"], "upstream");
+        let cached = manager
+            .tokenize_for_routing(&client, endpoint, "public", &body, true)
+            .await;
+        assert_eq!(cached.outcome, "cache_hit");
+        assert!(receiver.try_recv().is_err());
+        let mut input = crate::prefix::routing_text(
+            endpoint,
+            Some("public"),
+            Some(&body),
+            &PrefixConfig::default(),
+        );
+        input.set_scoped_token_ids(result.tokens.unwrap(), result.node_ids);
+        let selected = scheduler
+            .acquire(
+                Some("public"),
+                input,
+                &std::collections::HashSet::new(),
+                128,
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.prefix_match_tokens, 2);
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn unconverted_client_protocols_do_not_call_native_renderers() {
+    let (base_url, calls, server) = tokenize_server(true, Duration::ZERO).await;
+    let node = vllm_node(&base_url);
+    node.record_vllm_ready("0.31.0".into());
+    let scheduler = Arc::new(Scheduler::new(
+        vec![Arc::clone(&node)],
+        crate::config::RoutingConfig::default(),
+    ));
+    let manager = VllmManager::new(Arc::clone(&scheduler));
+    seed_exact_cache(&scheduler, &node);
+    for endpoint in ["messages", "responses"] {
+        let result = manager
+            .tokenize_for_routing(
+                &Client::new(),
+                endpoint,
+                "public",
+                &json!({"input":"hello"}),
+                true,
+            )
+            .await;
+        assert_eq!(result.outcome, "unsupported");
+        assert!(result.tokens.is_none());
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn token_ids_are_shared_by_normalized_model_pool_candidates() {
+    let (base_url, server) = management_server("0.25.0").await;
+    let first = vllm_node_with_id("a-chat", &base_url, 500);
+    let other = vllm_node_with_id("b-chat", &base_url, 500);
+    for node in [&first, &other] {
+        node.record_vllm_ready("0.25.0".into());
+    }
+    let scheduler = Arc::new(Scheduler::new(
+        vec![Arc::clone(&first), Arc::clone(&other)],
+        crate::config::RoutingConfig::default(),
+    ));
+    let manager = VllmManager::new(Arc::clone(&scheduler));
+    for node in [&first, &other] {
+        seed_exact_cache(&scheduler, node);
+    }
+    let body = json!({"messages":[{"role":"user", "content":"hello"}]});
+    let result = manager
+        .tokenize_for_routing(&Client::new(), "chat/completions", "public", &body, true)
+        .await;
+    assert_eq!(result.tokens, Some(vec![1, 2, 3]));
+    assert_eq!(
+        result.node_ids,
+        Some(vec!["a-chat".into(), "b-chat".into()])
+    );
+    server.abort();
+}
+
+#[test]
+fn multimodal_prompts_do_not_claim_exact_token_only_cache_matches() {
+    let body = json!({"messages":[{"role":"user", "content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}]});
+    assert!(prepare_tokenization("chat/completions", &body, "/tokenize").is_none());
+}
+
+#[test]
+fn chat_tokenization_fallback_requires_representable_prompt_options() {
+    let body = json!({"messages":[{"role":"user","content":"hello"}]});
+    assert!(
+        prepare_tokenization("chat/completions", &body, "/tokenize")
+            .unwrap()
+            .fallback
+            .is_some()
+    );
+    for (key, value) in [
+        ("reasoning_effort", json!("high")),
+        ("tool_choice", json!("none")),
+        ("response_format", json!({"type":"json_object"})),
+        ("truncate_prompt_tokens", json!(10)),
+    ] {
+        let mut body = body.clone();
+        body[key] = value;
+        let prompt = prepare_tokenization("chat/completions", &body, "/tokenize").unwrap();
+        assert_eq!(prompt.path, "/v1/chat/completions/render");
+        assert!(prompt.fallback.is_none(), "{key}");
+    }
+}
+
+#[tokio::test]
+async fn chat_keeps_legacy_tokenization_when_renderer_is_disabled() {
+    for status in [403, 404, 405, 501] {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let render_sender = sender.clone();
+        let router = Router::new()
+            .route(
+                "/v1/chat/completions/render",
+                post(move || {
+                    let sender = render_sender.clone();
+                    async move {
+                        sender.send("render").unwrap();
+                        StatusCode::from_u16(status).unwrap()
+                    }
+                }),
+            )
+            .route(
+                "/tokenize",
+                post(move |Json(body): Json<JsonValue>| {
+                    let sender = sender.clone();
+                    async move {
+                        assert_eq!(body["model"], "upstream");
+                        assert_eq!(body["messages"][0]["content"], "hello");
+                        sender.send("tokenize").unwrap();
+                        Json(json!({"tokens":[1,2,3]}))
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let node = vllm_node(&format!("http://{address}"));
+        node.record_vllm_ready("0.30.0".into());
+        let scheduler = Arc::new(Scheduler::new(
+            vec![Arc::clone(&node)],
+            crate::config::RoutingConfig::default(),
+        ));
+        let manager = VllmManager::new(Arc::clone(&scheduler));
+        seed_exact_cache(&scheduler, &node);
+        let body = json!({"messages":[{"role":"user", "content":"hello"}]});
+        for expected in ["upstream_success", "cache_hit"] {
+            let result = manager
+                .tokenize_for_routing(&Client::new(), "chat/completions", "public", &body, true)
+                .await;
+            assert_eq!(result.outcome, expected);
+            assert_eq!(result.tokens, Some(vec![1, 2, 3]));
+        }
+        assert_eq!(receiver.try_recv().unwrap(), "render");
+        assert_eq!(receiver.try_recv().unwrap(), "tokenize");
+        assert!(receiver.try_recv().is_err());
+        server.abort();
+    }
 }
 
 #[tokio::test]
@@ -723,7 +946,8 @@ async fn tokenization_uses_one_total_deadline() {
         .await;
 
     assert_eq!(result.outcome, "deadline");
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    // The shared deadline may expire before the legacy fallback starts.
+    assert!(calls.load(Ordering::Relaxed) <= 1);
     assert!(result.elapsed < Duration::from_millis(150));
     server.abort();
 }

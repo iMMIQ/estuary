@@ -1,9 +1,9 @@
-# Native vLLM Provider
+# vLLM Provider
 
 [Documentation index](README.md) | [Architecture](architecture.md) |
 [Configuration and operations](operations.md)
 
-Estuary's native provider targets vLLM 0.25.0 and newer, including development
+Estuary's vLLM provider targets vLLM 0.25.0 and newer, including development
 builds. The origin-root `/version` gate compares the numeric release prefix,
 accepting versions such as `0.25`, `v0.25.0`, `0.25.0.dev123+gabcdef`, and
 `0.25.0-rc1`. Recognizable releases below 0.25.0 are rejected, including builds
@@ -19,6 +19,7 @@ and failed version probes still fail the check.
 | `GET /version` | Version gate and reported provider version. |
 | `GET /metrics` | Running, waiting, KV utilization, throughput, cache hit, and preemption telemetry. |
 | `POST /tokenize` | Exact token sequence for supported Chat and Completions requests. |
+| `POST /v1/chat/completions/render` | Final Chat prompt token IDs for cache routing, without generation. |
 | ZMQ KV publisher | Block store, removal, and clear events. |
 | ZMQ replay router | Contiguous recovery after startup, disconnect, or sequence gap. |
 
@@ -43,7 +44,6 @@ settings are equivalent to:
 ```json
 {
   "type": "vllm",
-  "anthropic_protocol": "auto",
   "version_path": "/version",
   "metrics_path": "/metrics",
   "tokenize_path": "/tokenize",
@@ -56,8 +56,9 @@ settings are equivalent to:
 }
 ```
 
-`auto` selects vLLM's native Anthropic Messages endpoint. Set `responses` or
-`chat` only when that conversion is required by the selected server.
+Client Messages and Responses requests are converted to Chat Completions before
+routing. All models use `/v1/chat/completions`; no native Messages or Responses
+backend is required.
 
 ## KV Events
 
@@ -68,6 +69,12 @@ vllm serve MODEL \
   --kv-events-config \
   '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","topic":"kv-events","buffer_steps":10000}'
 ```
+
+On vLLM 0.30+, enable the renderer endpoints with
+`vllm serve MODEL --enable-scale-out` (alongside the KV-event configuration
+above). The flag does not exist in 0.25–0.29; those versions register the Chat
+render endpoint without it. Intermediate development builds may instead use
+`VLLM_ENABLE_SCALE_OUT_ENDPOINTS`; consult that build's configuration.
 
 The vLLM arguments are bind addresses. Estuary requires concrete addresses that
 it can connect to:
@@ -104,16 +111,30 @@ clears authority rather than leaving a partially trusted directory active.
 Remote tokenization is attempted only when the approximate match already exceeds
 `routing.prefix.cache_threshold` and at least one authoritative exact directory
 contains blocks. Pre-tokenized Completions do not need this initial gate. The
-least-loaded tokenizer's process-local LRU is checked before one `/tokenize`
-request is sent; failure or timeout falls back immediately to approximate
-routing.
+least-loaded compatible tokenizer's process-local LRU is checked before sending
+a request. Rendering and any legacy tokenization fallback stay on one node and
+share one total deadline; failure or timeout falls back to approximate routing.
+
+All client protocols share the same final Chat payload, tokenization gate,
+bounded LRU, one-node request deadline, exact KV matching, scheduler scoring,
+and approximate fallback. The token source is `/v1/chat/completions/render`
+on vLLM 0.25 and newer. Render routes may require `--enable-scale-out` on
+versions that gate them. A renderer must return a nonempty `token_ids` sequence.
+
+When render access is unavailable, representable Chat requests can fall back to
+`/tokenize`. Tool-choice, reasoning-effort, structured-output and truncation
+options that cannot be reproduced by `/tokenize` disable that exact fallback.
+Multimodal requests retain approximate routing: token IDs alone do not identify
+multimodal cache keys. Tokens apply only to nodes with compatible preprocessing.
 
 The exact directory is conservative:
 
 - only local GPU block events are accepted;
 - LoRA events and non-null `extra_keys` are ignored;
-- Chat Completions and single string or pre-tokenized Completions can use exact
-  matching;
+- text-only Messages, Responses, Chat Completions, and single string or
+  pre-tokenized Completions can use exact matching when their token source is
+  available; multimodal prompts retain approximate routing because token IDs
+  alone do not describe multimodal cache keys;
 - unsupported or failed tokenization uses character-prefix affinity;
 - removals and clear events delete exact state instead of estimating eviction;
 - an authoritative zero or partial match overrides character history for that
@@ -131,52 +152,28 @@ different public model names.
 
 ## Anthropic Messages
 
-vLLM 0.25+ exposes native `/v1/messages` and `/v1/messages/count_tokens` routes.
-Estuary removes Claude Code's standalone billing marker, removes its no-op
-`clear_thinking` edit, and rewrites the model alias.
-The Chat and Responses adapters also preserve Claude Code's inline text-only
-`role: system` messages, including environment context, in their original order.
+Client Messages requests use the shared protocol adapter and become generic Chat
+requests before scheduling. Text, images, tool calls/results and thinking history
+are preserved. Inline system reminders become user system-reminder messages in
+place. Cache-control annotations do not affect the normalized prompt key.
 
-For confirmed stable vLLM 0.31+ versions (including `0.31`, `v0.31.0`, and
-`0.31.0+BUILD`), Estuary passes native `thinking` through, including enabled
-budgets, disabled/adaptive modes and `display`. It does not inject template
-enablement or an approximation header. vLLM validates and implements these
-settings; exact budget support still depends on the selected model/runner.
-The capability is refreshed with the node's existing version probe.
+Thinking enablement maps to `chat_template_kwargs.enable_thinking`; a requested
+budget is passed as `chat_template_kwargs.thinking_budget`. Support and precise
+budget behavior depend on the model's template. `max_tokens` remains the overall
+output limit. Reasoning effort is preserved without DeepSeek-specific remapping.
+No model-specific prompt encoding is applied by Estuary.
 
-For 0.25–0.30, prereleases and opaque labels such as `dev`, Estuary retains the
-compatibility shim: thinking enablement maps to
-`chat_template_kwargs.enable_thinking`, `display: omitted` is removed, and an
-enabled budget adds `x-estuary-thinking-budget: approximated-by-max-tokens`.
-`budget_tokens` is preserved, with `max_tokens` as the total output ceiling.
-These labels remain accepted by the version gate; they do not prove that the
-native thinking feature has shipped. Generated thinking is retained so Claude
-Code can carry it into the next turn. Unsupported context edits and
-file-download requests return explicit Anthropic errors.
+`messages/count_tokens` sends the same normalized Chat request to the Chat render
+endpoint and counts returned token IDs. This requires render access. On vLLM
+versions that gate render routes behind `--enable-scale-out`, enable that flag
+when using token counting or exact rendered-prefix routing.
 
-`messages/count_tokens` requires a node using native Messages. The Responses and
-Chat adapters cannot provide this native token count.
+Tools require a tool-capable model and the appropriate vLLM tool parser options,
+such as `--enable-auto-tool-choice --tool-call-parser PARSER`. Empty/default tool
+declarations are omitted. Documents, server search, encrypted-only reasoning and
+unsupported context edits fail with explicit client-protocol errors.
 
-Claude Code tool calls require a tool-capable model and vLLM's
-`--enable-auto-tool-choice --tool-call-parser PARSER` options (for example,
-`hermes` for Qwen2.5). Empty `tools: []` lists with default/automatic tool choice
-are omitted in native requests and converted payloads, so text-only calls do not
-require a tool parser.
-
-See [Local end-to-end tests](local-e2e.md) for reusable Claude Code, Codex,
-and OpenCode checks, including prebuilt llama.cpp and Ollama alternatives.
-For a running vLLM CPU server, build Estuary and use the default `vllm` provider:
-
-```bash
-cargo build --locked
-python3 tests/claude_vllm_cpu_e2e.py \
-  --upstream http://127.0.0.1:18000/v1 --model MODEL
-```
-
-The model needs enough context for the CLI's environment and tool definitions.
-Use `--protocols native chat responses` to also check the explicit rejection of
-Claude Code's `output_config.effort` in the Responses adapter. Its semantics
-cannot be represented losslessly; use native or Chat for these requests.
+See [Local end-to-end tests](local-e2e.md) for CLI checks. Old database protocol settings are discarded when loaded.
 
 ## Codex Responses
 
@@ -194,22 +191,13 @@ wire_api = "responses"
 requires_openai_auth = false
 ```
 
-For Codex requests selected onto vLLM, Estuary collision-checks and flattens
-namespace tools, then restores namespace and name fields in buffered and SSE
-responses. Standard functions, structured output, image input, full-history
-replay, and `prompt_cache_key` retain their Responses shapes.
-This conversion remains necessary for GPT-OSS/Harmony in vLLM 0.31 even though
-ordinary Responses models support namespace tools; a server version alone does
-not establish support for every model's tool parser.
-
-Generic OpenAI-compatible backends can opt into the same namespace conversion
-with `provider.flatten_codex_namespaces: true`, for example when using llama.cpp.
-This flag does not enable vLLM telemetry or apply its other tool restrictions.
-
-Responses Lite custom calls, tool-search items, `additional_tools`, and web
-search are rejected because vLLM's Harmony path cannot represent them. These
-checks apply only to detected Codex requests routed to vLLM; other Responses
-traffic uses the normal pass-through path.
+Responses uses the same Chat backend for Codex and other clients. Namespace tools
+are converted into safe Chat function names and restored in buffered and SSE
+responses. Standard functions, the supported `apply_patch` custom tool, structured
+output, image input, and plaintext full-history reasoning are adapted through the
+shared library. Parallel tool calls are returned after their arguments complete.
+The old namespace-flattening and Anthropic protocol settings no longer affect
+backend selection. Server search and stateful provider features are unsupported.
 
 ## Per-request measurements
 

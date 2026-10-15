@@ -107,7 +107,6 @@ struct CircuitTicket {
 struct ProviderRuntime {
     state: Option<ProviderState>,
     version: Option<String>,
-    native_anthropic_thinking: bool,
     running: usize,
     waiting: usize,
     kv_cache_usage: Option<f64>,
@@ -511,15 +510,8 @@ impl Node {
             self.bump_provider_generation();
         }
         runtime.state = Some(ProviderState::Ready);
-        runtime.native_anthropic_thinking =
-            crate::vllm::supports_native_anthropic_thinking(&version);
         runtime.version = Some(version);
         runtime.compatibility_error = None;
-    }
-
-    pub(crate) fn vllm_native_anthropic_thinking(&self) -> bool {
-        let runtime = self.provider_runtime.lock();
-        runtime.state == Some(ProviderState::Ready) && runtime.native_anthropic_thinking
     }
 
     pub fn record_vllm_incompatible(&self, version: Option<String>, error: String) -> bool {

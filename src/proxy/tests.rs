@@ -1,7 +1,6 @@
 use super::headers::{connection_header_names, should_forward_request_header};
-use super::request_compat::apply_vllm_native_thinking_compat;
 use super::streaming::{LimitedSseInput, SseInputError};
-use super::upstream::{NativeMessagesCompat, mapped_body};
+use super::upstream::mapped_body;
 use axum::http::{HeaderName, HeaderValue};
 use std::io;
 
@@ -282,132 +281,34 @@ fn removes_only_noop_claude_context_management() {
 }
 
 #[test]
-fn anthropic_adapter_payloads_are_built_only_when_selected() {
-    let source = json!({
-        "model": "claude",
-        "max_tokens": 128,
-        "messages": [{"role": "user", "content": "hello"}]
-    });
-    let mut payloads = AnthropicPayloads {
-        allow_adapters: true,
-        responses: None,
-        chat: None,
-        expose_thinking: false,
-    };
-
-    assert!(
-        payloads
-            .prepare(AnthropicProtocol::Native, &source)
-            .unwrap()
-            .is_none()
+fn chat_mapping_changes_only_model_and_render_options() {
+    let source = json!({"model":"public","messages":[{"role":"user","content":"hello"}],"chat_template_kwargs":{"enable_thinking":true}});
+    let original = Bytes::from(serde_json::to_vec(&source).unwrap());
+    assert_eq!(
+        mapped_body(
+            &original,
+            Some(&source),
+            Some("public"),
+            Some("public"),
+            false
+        )
+        .unwrap(),
+        original
     );
-    assert!(payloads.chat.is_none());
-    assert!(payloads.responses.is_none());
-
-    let endpoint = payloads
-        .prepare(AnthropicProtocol::Responses, &source)
-        .unwrap()
-        .unwrap()
-        .endpoint
-        .clone();
-    assert_eq!(endpoint, "responses");
-    assert!(payloads.responses.is_some());
-    assert!(payloads.chat.is_none());
-}
-
-#[test]
-fn native_vllm_request_reuses_an_unchanged_body() {
-    let original = Bytes::from_static(
-        br#"{"model":"model","max_tokens":128,"messages":[{"role":"user","content":"hello"}]}"#,
-    );
-    let parsed = serde_json::from_slice(&original).unwrap();
-    let (mapped, approximated, namespaces) = mapped_body(
+    let mapped = mapped_body(
         &original,
-        Some(&parsed),
-        Some("model"),
-        Some("model"),
-        NativeMessagesCompat::Legacy,
-        false,
-        false,
+        Some(&source),
+        Some("upstream"),
+        Some("public"),
+        true,
     )
     .unwrap();
-
-    assert_eq!(mapped.as_ptr(), original.as_ptr());
-    assert!(!approximated);
-    assert!(namespaces.is_none());
-}
-
-#[test]
-fn native_vllm_empty_tools_do_not_require_a_tool_parser() {
-    for choice in [None, Some(json!(null)), Some(json!({"type":"auto"}))] {
-        let mut request =
-            json!({"model":"m","tools":[],"messages":[{"role":"user","content":"hello"}]});
-        if let Some(choice) = choice {
-            request["tool_choice"] = choice;
-        }
-        let original = Bytes::from(serde_json::to_vec(&request).unwrap());
-        let (body, _, _) = mapped_body(
-            &original,
-            Some(&request),
-            Some("m"),
-            Some("m"),
-            NativeMessagesCompat::Legacy,
-            false,
-            false,
-        )
-        .unwrap();
-        let mapped: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(mapped.get("tools").is_none());
-        assert!(mapped.get("tool_choice").is_none());
-        assert_eq!(mapped["messages"], request["messages"]);
-        let (passthrough, _, _) = mapped_body(
-            &original,
-            Some(&request),
-            Some("m"),
-            Some("m"),
-            NativeMessagesCompat::None,
-            false,
-            false,
-        )
-        .unwrap();
-        assert_eq!(passthrough.as_ptr(), original.as_ptr());
-    }
-    for request in [
-        json!({"tools":[],"tool_choice":{"type":"any"}}),
-        json!({"tools":[],"tool_choice":{"type":"tool","name":"Read"}}),
-        json!({"tools":[],"tool_choice":{"type":"none"}}),
-        json!({"tools":[{"name":"Read"}]}),
-        json!({"tools":"invalid"}),
-    ] {
-        let original = Bytes::from(serde_json::to_vec(&request).unwrap());
-        let (mapped, _, _) = mapped_body(
-            &original,
-            Some(&request),
-            None,
-            None,
-            NativeMessagesCompat::Legacy,
-            false,
-            false,
-        )
-        .unwrap();
-        assert_eq!(mapped.as_ptr(), original.as_ptr());
-    }
-}
-
-#[test]
-fn maps_anthropic_thinking_to_vllm_template_control() {
-    let mut enabled = json!({
-        "max_tokens": 32000,
-        "thinking": {"type": "enabled", "budget_tokens": 31999, "display": "omitted"},
-        "chat_template_kwargs": {"custom": true}
-    });
-    let approximated = apply_vllm_native_thinking_compat(enabled.as_object_mut().unwrap()).unwrap();
-    assert!(approximated);
-    assert!(enabled["thinking"].get("display").is_none());
-    assert_eq!(enabled["chat_template_kwargs"]["enable_thinking"], true);
-    assert_eq!(enabled["chat_template_kwargs"]["custom"], true);
-
-    let mut disabled = json!({"thinking": {"type": "disabled"}});
-    assert!(!apply_vllm_native_thinking_compat(disabled.as_object_mut().unwrap()).unwrap());
-    assert_eq!(disabled["chat_template_kwargs"]["enable_thinking"], false);
+    let mapped: Value = serde_json::from_slice(&mapped).unwrap();
+    assert_eq!(mapped["model"], "upstream");
+    assert_eq!(mapped["messages"], source["messages"]);
+    assert_eq!(
+        mapped["chat_template_kwargs"],
+        source["chat_template_kwargs"]
+    );
+    assert_eq!(mapped["return_mm_kwargs"], false);
 }

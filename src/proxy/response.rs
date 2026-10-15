@@ -3,7 +3,7 @@ use std::{io, sync::Arc, time::Duration};
 use axum::{
     Json,
     body::Body,
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::CONTENT_LENGTH},
+    http::{HeaderName, HeaderValue, StatusCode, header::CONTENT_LENGTH},
     response::{IntoResponse, Response},
 };
 use bytes::{Bytes, BytesMut};
@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use crate::{
-    anthropic, anthropic_responses, codex,
+    anthropic, chat_bridge,
     error::GatewayError,
     metrics::Metrics,
     node::{Node, NodeLease},
@@ -21,7 +21,6 @@ use crate::{
 
 use super::ClientProtocol;
 use super::headers::copy_response_headers;
-use super::request_compat::THINKING_BUDGET_WARNING;
 use super::{MAX_ERROR_BODY_BYTES, UpstreamResponseMode};
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -70,26 +69,29 @@ pub(super) async fn buffered_success_response(
         mut reservation,
     } = buffered;
     if let Some(log) = &log_attempt {
-        log.capture(
-            &upstream_body,
-            false,
-            matches!(response_mode, UpstreamResponseMode::NativeAnthropic { .. }),
-        );
+        log.capture(&upstream_body, false);
     }
     let body = match response_mode {
         UpstreamResponseMode::Passthrough => Ok(upstream_body.clone()),
-        UpstreamResponseMode::Codex { namespaces } => {
-            codex::rewrite_response(&upstream_body, namespaces)
+        UpstreamResponseMode::ChatBridge { context } => {
+            chat_bridge::convert_response(&upstream_body, context, public_model).await
         }
-        UpstreamResponseMode::ChatToAnthropic { expose_thinking } => {
-            anthropic::convert_response(&upstream_body, public_model, *expose_thinking)
-        }
-        UpstreamResponseMode::ResponsesToAnthropic { expose_thinking } => {
-            anthropic_responses::convert_response(&upstream_body, public_model, *expose_thinking)
-        }
-        UpstreamResponseMode::NativeAnthropic {
-            expose_thinking, ..
-        } => anthropic::rewrite_native_response(&upstream_body, public_model, *expose_thinking),
+        UpstreamResponseMode::TokenCount => (|| {
+            let value: Value = serde_json::from_slice(&upstream_body)
+                .map_err(|_| GatewayError::InvalidUpstreamResponse)?;
+            let tokens = value["token_ids"]
+                .as_array()
+                .or_else(|| value["tokens"].as_array())
+                .ok_or(GatewayError::InvalidUpstreamResponse)?;
+            if tokens.iter().any(|token| token.as_u64().is_none()) {
+                return Err(GatewayError::InvalidUpstreamResponse);
+            }
+            let count = tokens.len();
+            Ok(Bytes::from(
+                serde_json::to_vec(&json!({"input_tokens":count}))
+                    .map_err(|_| GatewayError::Internal)?,
+            ))
+        })(),
     };
     let body = match body {
         Ok(body) => body,
@@ -108,20 +110,15 @@ pub(super) async fn buffered_success_response(
         );
         return Err(GatewayError::InvalidUpstreamResponse);
     }
-    let usage = crate::inference_stats::Usage::from_response(&upstream_body);
+    let (usage, provider_timings) = crate::inference_stats::observe_response(&upstream_body);
     if let Some(tokens) = usage.output_tokens {
         lease.record_output_tokens(tokens);
     }
     metrics.observe_usage(usage);
     if let Some(log) = log_attempt.as_mut() {
-        let provider_timings =
-            crate::inference_stats::ProviderTimings::from_response(&upstream_body);
         log.update(|attempt| {
             provider_timings.write_to(&mut attempt.timings_us);
-            attempt.usage = usage.log_value(matches!(
-                response_mode,
-                UpstreamResponseMode::NativeAnthropic { .. }
-            ));
+            attempt.usage = usage.log_value();
         });
         log.finish("success", None);
     }
@@ -140,10 +137,6 @@ pub(super) async fn buffered_success_response(
     if response_mode.is_anthropic() {
         anthropic::set_anthropic_content_type(&mut response, false);
     }
-    set_thinking_budget_warning(
-        response_mode.thinking_budget_approximated(),
-        response.headers_mut(),
-    );
     if let Some(value) = upstream_request_id {
         response
             .headers_mut()
@@ -183,7 +176,7 @@ pub(super) async fn proxy_error_response(
     .await?;
     let body = &buffered.bytes;
     if let Some(log) = &mut log_attempt {
-        log.capture(body, false, false);
+        log.capture(body, false);
         log.terminal_error("upstream", "upstream_status");
         log.finish("error", Some("upstream_status"));
     }
@@ -306,13 +299,4 @@ pub(super) fn hold_response_buffer(
         }
     });
     response
-}
-
-pub(super) fn set_thinking_budget_warning(approximated: bool, headers: &mut HeaderMap) {
-    if approximated {
-        headers.insert(
-            HeaderName::from_static("x-estuary-thinking-budget"),
-            HeaderValue::from_static(THINKING_BUDGET_WARNING),
-        );
-    }
 }

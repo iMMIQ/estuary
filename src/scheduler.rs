@@ -399,6 +399,7 @@ impl Scheduler {
                 if let Some(tokens) = exact_match
                     .as_ref()
                     .and_then(|matched| matched.matched_tokens.get(candidate.node.id()))
+                    .filter(|_| prefix_input.tokens_apply_to_node(candidate.node.id()))
                 {
                     // A trustworthy zero is evidence of a miss, not permission to reuse stale history.
                     candidate.prefix_match_tokens = *tokens;
@@ -931,6 +932,31 @@ mod tests {
             .unwrap();
         assert_eq!(selected.node.id(), "z-partial");
         assert_eq!(selected.prefix_match_tokens, 4);
+    }
+
+    #[tokio::test]
+    async fn exact_tokens_do_not_override_history_outside_the_tokenizer_cohort() {
+        let scheduler = Scheduler::new(
+            vec![node("a-rendered", 4), node("z-other-cohort", 4)],
+            RoutingConfig::default(),
+        );
+        let mut input = prompt("shared long prompt");
+        for id in ["a-rendered", "z-other-cohort"] {
+            scheduler.exact_cache.configure_node(id, 10);
+        }
+        // The other cohort has an authoritative zero for this token sequence,
+        // but these IDs are not scoped to it. Its history must survive.
+        scheduler
+            .prefix_directory()
+            .record("z-other-cohort", &input);
+        input.set_scoped_token_ids(vec![1, 2, 3, 4], Some(vec!["a-rendered".into()]));
+        let selected = scheduler
+            .acquire(Some("model"), input, &HashSet::new(), 128)
+            .await
+            .unwrap();
+        assert_eq!(selected.node.id(), "z-other-cohort");
+        assert_eq!(selected.prefix_match_tokens, 0);
+        assert!(selected.prefix_match_chars > 0);
     }
 
     #[tokio::test]

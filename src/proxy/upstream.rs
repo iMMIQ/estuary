@@ -12,30 +12,21 @@ use bytes::Bytes;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::{codex, config::AnthropicProtocol, error::GatewayError, server::AppState};
+use crate::{error::GatewayError, server::AppState};
 
 use super::headers::{
     connection_header_names, should_forward_protocol_header, should_forward_request_header,
 };
-use super::request_compat::apply_vllm_native_thinking_compat;
 use super::response::{buffered_success_response, proxy_error_response};
 use super::streaming::streaming_response;
 use super::{ProxyRequest, UpstreamResponseMode};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum NativeMessagesCompat {
-    None,
-    Legacy,
-    NativeThinking,
-}
-
 #[allow(clippy::too_many_lines)]
 pub(super) async fn proxy_with_retries(
     state: Arc<AppState>,
-    mut request: ProxyRequest,
+    request: ProxyRequest,
 ) -> Result<Response, GatewayError> {
     let mut excluded = HashSet::new();
-    let mut adapter_errors = Vec::new();
     let mut attempt = 0usize;
     loop {
         let queue_started = Instant::now();
@@ -61,127 +52,41 @@ pub(super) async fn proxy_with_retries(
             .observe_prefix_match_tokens(selection.prefix_match_tokens);
 
         let node = Arc::clone(&selection.node);
-        let selected_protocol = request.anthropic_payloads.as_ref().map(|_| {
-            node.provider()
-                .anthropic_protocol
-                .resolve(node.provider().kind)
-        });
-        let selected_payload = if let Some(protocol) = selected_protocol {
-            let source = request
-                .parsed_body
-                .as_ref()
-                .expect("Anthropic inference requests contain parsed JSON");
-            match request
-                .anthropic_payloads
-                .as_mut()
-                .expect("Anthropic requests have adapter state")
-                .prepare(protocol, source)
-            {
-                Ok(payload) => payload,
-                Err(error) => {
-                    adapter_errors.push(format!("{} ({protocol:?}): {error}", node.id()));
-                    for candidate in state.scheduler.nodes() {
-                        if candidate
-                            .provider()
-                            .anthropic_protocol
-                            .resolve(candidate.provider().kind)
-                            == protocol
-                        {
-                            excluded.insert(candidate.id().to_owned());
-                        }
-                    }
-                    drop(selection.lease);
-                    if state
-                        .scheduler
-                        .has_alternative(request.public_model.as_deref(), &excluded)
-                    {
-                        continue;
-                    }
-                    return Err(GatewayError::InvalidRequest(format!(
-                        "no configured upstream protocol can represent this Anthropic request: {}",
-                        adapter_errors.join("; ")
-                    )));
-                }
-            }
+        let upstream_endpoint = if request.count_tokens {
+            "chat/completions/render"
         } else {
-            None
+            &request.endpoint
         };
-        let (upstream_endpoint, upstream_original, upstream_parsed, upstream_query) =
-            selected_payload.map_or_else(
-                || {
-                    (
-                        request.endpoint.as_str(),
-                        &request.original_body,
-                        request.parsed_body.as_ref(),
-                        request.query.as_deref(),
-                    )
-                },
-                |payload| {
-                    (
-                        payload.endpoint.as_str(),
-                        &payload.body,
-                        Some(&payload.parsed),
-                        payload.query.as_deref(),
-                    )
-                },
-            );
         let upstream_url = node
-            .upstream_url(upstream_endpoint, upstream_query)
+            .upstream_url(upstream_endpoint, request.query.as_deref())
             .map_err(|error| {
-                warn!(node = node.id(), error = %error, "failed to build upstream URL");
+                warn!(node=node.id(), error=%error, "failed to build upstream URL");
                 GatewayError::Internal
             })?;
-        let native_vllm_messages = selected_protocol == Some(AnthropicProtocol::Native)
-            && node.provider().kind == crate::config::ProviderKind::Vllm
-            && upstream_endpoint == "messages";
-        let vllm_codex_responses = request.codex_request
-            && selected_protocol.is_none()
-            && node.provider().kind == crate::config::ProviderKind::Vllm
-            && upstream_endpoint == "responses";
-        let flatten_codex_namespaces = request.codex_request
-            && node.provider().flatten_codex_namespaces
-            && upstream_endpoint == "responses";
         let upstream_endpoint_log = upstream_endpoint.to_owned();
-        let (upstream_body, thinking_budget_approximated, codex_namespaces) = mapped_body(
-            upstream_original,
-            upstream_parsed,
+        let upstream_body = mapped_body(
+            &request.original_body,
+            request.parsed_body.as_ref(),
             selection.upstream_model.as_deref(),
             request.public_model.as_deref(),
-            if !native_vllm_messages {
-                NativeMessagesCompat::None
-            } else if node.vllm_native_anthropic_thinking() {
-                NativeMessagesCompat::NativeThinking
-            } else {
-                NativeMessagesCompat::Legacy
-            },
-            vllm_codex_responses,
-            flatten_codex_namespaces,
+            request.count_tokens,
         )?;
-        let expose_thinking = request
-            .anthropic_payloads
-            .as_ref()
-            .is_some_and(|payloads| payloads.expose_thinking);
-        let response_mode = match selected_protocol {
-            None => codex_namespaces.map_or(UpstreamResponseMode::Passthrough, |namespaces| {
-                UpstreamResponseMode::Codex { namespaces }
-            }),
-            Some(AnthropicProtocol::Native) => UpstreamResponseMode::NativeAnthropic {
-                expose_thinking: native_vllm_messages || expose_thinking,
-                thinking_budget_approximated,
-            },
-            Some(AnthropicProtocol::Responses) => {
-                UpstreamResponseMode::ResponsesToAnthropic { expose_thinking }
-            }
-            Some(AnthropicProtocol::Chat) => {
-                UpstreamResponseMode::ChatToAnthropic { expose_thinking }
-            }
-            Some(AnthropicProtocol::Auto) => unreachable!("Anthropic protocol must be resolved"),
-        };
+        let response_mode =
+            if request.count_tokens {
+                UpstreamResponseMode::TokenCount
+            } else {
+                request.bridge_context.as_ref().map_or(
+                    UpstreamResponseMode::Passthrough,
+                    |context| UpstreamResponseMode::ChatBridge {
+                        context: Arc::new(context.clone()),
+                    },
+                )
+            };
         let mut upstream_headers = HeaderMap::new();
         let connection_headers = connection_header_names(&request.headers);
         for (name, value) in &request.headers {
             if should_forward_request_header(name)
-                && should_forward_protocol_header(name, selected_protocol)
+                && should_forward_protocol_header(name)
                 && !connection_headers.contains(name)
             {
                 upstream_headers.append(name, value.clone());
@@ -429,58 +334,23 @@ pub(super) fn mapped_body(
     parsed: Option<&Value>,
     upstream_model: Option<&str>,
     public_model: Option<&str>,
-    native_messages: NativeMessagesCompat,
-    vllm_codex_responses: bool,
-    flatten_codex_namespaces: bool,
-) -> Result<(Bytes, bool, Option<Arc<codex::NamespaceMap>>), GatewayError> {
-    let rewrite_native_thinking = native_messages == NativeMessagesCompat::Legacy
-        && parsed
-            .and_then(|value| value.get("thinking"))
-            .is_some_and(|value| !value.is_null());
-    let remove_empty_native_tools = native_messages != NativeMessagesCompat::None
-        && parsed
-            .and_then(Value::as_object)
-            .is_some_and(crate::anthropic::empty_tools_are_noop);
-    if !rewrite_native_thinking
-        && !remove_empty_native_tools
-        && !vllm_codex_responses
-        && !flatten_codex_namespaces
-        && (upstream_model == public_model || upstream_model.is_none())
-    {
-        return Ok((original.clone(), false, None));
+    count_tokens: bool,
+) -> Result<Bytes, GatewayError> {
+    if upstream_model == public_model && !count_tokens {
+        return Ok(original.clone());
     }
     let mut value = parsed.cloned().ok_or(GatewayError::InvalidJson)?;
     let object = value.as_object_mut().ok_or_else(|| {
         GatewayError::InvalidRequest("JSON request body must be an object".to_owned())
     })?;
-    let thinking_budget_approximated = if rewrite_native_thinking {
-        apply_vllm_native_thinking_compat(object)?
-    } else {
-        false
-    };
-    if remove_empty_native_tools {
-        // vLLM treats tools: [] as auto tool choice and requires a parser even
-        // for a text-only Claude Code request. Omitting both keeps its meaning.
-        object.remove("tools");
-        object.remove("tool_choice");
+    if let Some(model) = upstream_model {
+        object.insert("model".into(), model.into());
     }
-    let codex_namespaces = if vllm_codex_responses {
-        codex::normalize_vllm_request(&mut value)?
-    } else if flatten_codex_namespaces {
-        codex::normalize_namespace_request(&mut value)?
-    } else {
-        None
-    };
-    let object = value.as_object_mut().ok_or_else(|| {
-        GatewayError::InvalidRequest("JSON request body must be an object".to_owned())
-    })?;
-    if upstream_model != public_model
-        && let Some(upstream_model) = upstream_model
-    {
-        object.insert("model".to_owned(), Value::String(upstream_model.to_owned()));
+    if count_tokens {
+        object.insert("return_mm_kwargs".into(), false.into());
+        object.insert("stream".into(), false.into());
     }
-    let body = sonic_rs::to_vec(&value)
+    sonic_rs::to_vec(&value)
         .map(Bytes::from)
-        .map_err(|_| GatewayError::Internal)?;
-    Ok((body, thinking_budget_approximated, codex_namespaces))
+        .map_err(|_| GatewayError::Internal)
 }

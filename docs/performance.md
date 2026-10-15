@@ -16,8 +16,8 @@ cargo bench --bench performance
 
 The benchmark runs:
 
-- OpenAI Chat Completions, Anthropic Messages through the Chat adapter, and
-  Codex Responses;
+- OpenAI Chat Completions, Anthropic Messages, and Codex Responses, all through
+  the same Chat backend;
 - 2 KiB, 128 KiB, and 1 MiB prompts;
 - 1, 8, and 32 configured nodes;
 - concurrency at four times aggregate node capacity;
