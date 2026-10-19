@@ -131,7 +131,10 @@ export function Upstreams({
         </div>
       </header>
 
-      {observabilityPanel}
+      <details className="page-metrics">
+        <summary>{t("metrics.title")}</summary>
+        {observabilityPanel}
+      </details>
 
       <TextInput
         className="node-search"
@@ -186,10 +189,10 @@ export function Upstreams({
                   <th>{t("upstreams.statusAdmission")}</th>
                   <th>{t("upstreams.providerTelemetry")}</th>
                   <th>{t("upstreams.engine")}</th>
-                  <th>{t("upstreams.tokenRate")}</th>
+                  <th title={t("metrics.nodeOutput")}>{t("upstreams.output")}</th>
                   <th>{t("upstreams.activeLimit")}</th>
                   <th>{t("upstreams.kvCache")}</th>
-                  <th>{t("upstreams.latency")}</th>
+                  <th title={t("metrics.nodeTtft")}>{t("upstreams.ttft")}</th>
                   <th />
                 </tr>
               </thead>
@@ -225,13 +228,13 @@ export function Upstreams({
                         <strong>{node.config.id}</strong>
                         <span>{node.config.base_url}</span>
                       </td>
-                      <td data-label={t("upstreams.admission")}>
+                      <td
+                        data-label={t("upstreams.admission")}
+                        title={t(`admission.${node.admission.state}`, {
+                          defaultValue: node.admission.reason,
+                        })}
+                      >
                         <StatusBadge value={node.admission.state} />
-                        <span>
-                          {t(`admission.${node.admission.state}`, {
-                            defaultValue: node.admission.reason,
-                          })}
-                        </span>
                       </td>
                       <td data-label={t("upstreams.provider")}>
                         <strong>
@@ -247,29 +250,19 @@ export function Upstreams({
                             : t("upstreams.genericProvider")}
                         </span>
                       </td>
-                      <td data-label={t("upstreams.engine")}>
+                      <td data-label={t("upstreams.engine")} title={t("upstreams.runningWaiting")}>
                         <strong>
                           {running} / {waiting}
                         </strong>
-                        <span>{t("upstreams.runningWaiting")}</span>
                       </td>
-                      <td data-label={t("upstreams.tokenRateShort")}>
+                      <td
+                        data-label={t("upstreams.tokenRateShort")}
+                        title={t("metrics.nodeOutput")}
+                      >
                         <strong>
-                          {formatRate(
-                            telemetry ? node.runtime.prompt_tokens_per_second : null,
-                            locale,
-                          )}{" "}
-                          /{" "}
-                          {formatRate(
-                            telemetry ? node.runtime.generation_tokens_per_second : null,
-                            locale,
-                          )}
+                          {formatRate(measured?.rates.output.smoothed, locale)}{" "}
+                          <span className="table-unit">tok/s</span>
                         </strong>
-                        <span>{t("upstreams.promptGeneration")}</span>
-                        <span>
-                          {t("metrics.nodeOutput")}:{" "}
-                          {formatRate(measured?.rates.output.smoothed, locale)} tok/s
-                        </span>
                       </td>
                       <td data-label={t("upstreams.localLoad")}>
                         <ProgressValue
@@ -277,19 +270,10 @@ export function Upstreams({
                           total={node.runtime.max_concurrency}
                         />
                       </td>
-                      <td data-label={t("upstreams.kvCacheShort")}>
-                        <strong>
-                          {node.config.provider.type === "vllm"
-                            ? t("upstreams.used", {
-                                value: formatPercent(
-                                  telemetry ? node.runtime.kv_cache_usage : null,
-                                  "--",
-                                ),
-                              })
-                            : "--"}
-                        </strong>
-                        <span>
-                          {node.config.provider.type === "vllm"
+                      <td
+                        data-label={t("upstreams.kvCacheShort")}
+                        title={
+                          node.config.provider.type === "vllm"
                             ? t("upstreams.kvDetail", {
                                 hit: formatPercent(
                                   telemetry ? node.runtime.prefix_cache_hit_rate : null,
@@ -300,25 +284,21 @@ export function Upstreams({
                                   ? t("upstreams.synced")
                                   : t("upstreams.fallback"),
                               })
-                            : t("upstreams.noTelemetry")}
-                        </span>
-                      </td>
-                      <td data-label={t("upstreams.latency")}>
+                            : t("upstreams.noTelemetry")
+                        }
+                      >
                         <strong>
-                          {t("metrics.nodeTtft")}:{" "}
+                          {node.config.provider.type === "vllm"
+                            ? formatPercent(telemetry ? node.runtime.kv_cache_usage : null, "--")
+                            : "--"}
+                        </strong>
+                      </td>
+                      <td data-label={t("upstreams.ttft")} title={t("metrics.nodeTtft")}>
+                        <strong>
                           {measured?.latency.ttft.p95 == null
                             ? "—"
                             : `${Math.round(measured.latency.ttft.p95 * 1000)} ms`}
                         </strong>
-                        <strong>
-                          {node.runtime.ttft_ewma_ms == null
-                            ? "--"
-                            : `${Math.round(node.runtime.ttft_ewma_ms)} ms`}
-                        </strong>
-                        <span>
-                          {t("scheduler.ttft")} · {t("upstreams.headerEwma")}:{" "}
-                          {Math.round(node.runtime.latency_ewma_ms)} ms
-                        </span>
                       </td>
                       <td
                         className="row-menu-cell"

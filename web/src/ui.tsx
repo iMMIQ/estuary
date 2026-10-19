@@ -1,3 +1,6 @@
+import { Popover } from "@mantine/core";
+import { CircleHelp } from "lucide-react";
+import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import type { TranslationKey } from "./i18n";
 
@@ -54,4 +57,29 @@ export function formatTimestamp(value: number | null, locale = "en", never = "Ne
     dateStyle: "medium",
     timeStyle: "medium",
   }).format(new Date(value));
+}
+
+export function HelpTip({ subject, children }: { subject: string; children: ReactNode }) {
+  const { t } = useTranslation();
+  const label = t("common.help", { subject });
+  return (
+    <Popover
+      width={320}
+      position="bottom-start"
+      withArrow
+      shadow="md"
+      withinPortal
+      trapFocus
+      returnFocus
+    >
+      <Popover.Target>
+        <button type="button" className="help-trigger" aria-label={label}>
+          <CircleHelp size={14} />
+        </button>
+      </Popover.Target>
+      <Popover.Dropdown className="help-content" role="dialog" aria-label={label} tabIndex={0}>
+        {children}
+      </Popover.Dropdown>
+    </Popover>
+  );
 }

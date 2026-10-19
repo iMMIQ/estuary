@@ -72,31 +72,29 @@ export function Overview({
       <header className="page-title-row">
         <div>
           <h1>{t("nav.overview")}</h1>
-          <p>{t("overview.subtitle")}</p>
         </div>
+        <section className="status-strip">
+          <span>{t("overview.gateway")}</span>
+          {status ? (
+            <StatusBadge value={status.ready ? "ready" : "not_ready"} />
+          ) : (
+            <span>{t("common.unavailable")}</span>
+          )}
+          <i />
+          <span>Estuary v{status?.version ?? "--"}</span>
+          <i />
+          <span>{relativeSync(lastSync, t)}</span>
+          <Button
+            variant="default"
+            size="compact-sm"
+            leftSection={<RefreshCw className={refreshing ? "spin" : ""} size={13} />}
+            disabled={refreshing}
+            onClick={onRefresh}
+          >
+            {t("common.refresh")}
+          </Button>
+        </section>
       </header>
-
-      <section className="status-strip">
-        <span>{t("overview.gateway")}</span>
-        {status ? (
-          <StatusBadge value={status.ready ? "ready" : "not_ready"} />
-        ) : (
-          <span>{t("common.unavailable")}</span>
-        )}
-        <i />
-        <span>Estuary v{status?.version ?? "--"}</span>
-        <i />
-        <span>{relativeSync(lastSync, t)}</span>
-        <Button
-          variant="default"
-          size="compact-sm"
-          leftSection={<RefreshCw className={refreshing ? "spin" : ""} size={13} />}
-          disabled={refreshing}
-          onClick={onRefresh}
-        >
-          {t("common.refresh")}
-        </Button>
-      </section>
 
       {attention.length > 0 && (
         <div className="data-status" role="status">
@@ -113,9 +111,16 @@ export function Overview({
           </Button>
         </div>
       )}
-      {observabilityPanel}
       <section className="dashboard-panel fleet-summary-panel">
-        <h2>{t("overview.fleetSummary")}</h2>
+        <div className="fleet-summary-heading">
+          <h2>{t("overview.fleetSummary")}</h2>
+          {nodesLoaded && attention.length === 0 && (
+            <span className="fleet-health">
+              <Check size={14} />
+              {t("overview.nominal")}
+            </span>
+          )}
+        </div>
         <div className="fleet-summary-grid">
           <MetricBox label={t("overview.totalNodes")} value={status?.fleet.total_nodes ?? null} />
           <MetricBox
@@ -140,20 +145,12 @@ export function Overview({
         </div>
       </section>
 
-      <div className="attention-actions-grid">
-        <section className="dashboard-panel attention-panel-dark">
-          <h2>{t("overview.attention")}</h2>
-          {!nodesLoaded ? (
-            <div className="empty-state">{t("common.unavailable")}</div>
-          ) : attention.length === 0 ? (
-            <div className="all-clear">
-              <Check size={16} />
-              <span>
-                <strong>{t("overview.nominal")}</strong>
-                {t("overview.noAttention")}
-              </span>
-            </div>
-          ) : (
+      {observabilityPanel}
+
+      <div className={`operations-grid${attention.length > 0 ? " has-attention" : ""}`}>
+        {attention.length > 0 && (
+          <section className="dashboard-panel attention-panel-dark">
+            <h2>{t("overview.attention")}</h2>
             <div className="attention-rows">
               {attention.slice(0, 5).map((node) => (
                 <button type="button" key={node.config.id} onClick={() => onSelectNode(node)}>
@@ -170,38 +167,44 @@ export function Overview({
                 </button>
               ))}
             </div>
-          )}
-        </section>
+          </section>
+        )}
         <section className="dashboard-panel quick-actions">
-          <h2>{t("overview.routingSignals")}</h2>
-          <div className="routing-signal">
-            <span>{t("overview.exactDirectories")}</span>
-            <strong>
-              {vllm.exactReady} / {vllm.nodes}
-            </strong>
+          <div className="routing-heading">
+            <h2>{t("overview.routingSignals")}</h2>
+            <div className="heading-actions">
+              <Button variant="default" size="compact-sm" onClick={onShowNodes}>
+                {t("overview.viewAll")}
+              </Button>
+              <Button size="compact-sm" leftSection={<Plus size={14} />} onClick={onAdd}>
+                {t("overview.addUpstream")}
+              </Button>
+            </div>
           </div>
-          <div className="routing-signal">
-            <span>{t("overview.waitingWatermark")}</span>
-            <strong className={vllm.waitingBlocked ? "metric-amber" : ""}>
-              {vllm.waitingBlocked}
-            </strong>
+          <div className="routing-signals">
+            <div className="routing-signal">
+              <span>{t("overview.exactDirectories")}</span>
+              <strong>
+                {vllm.exactReady} / {vllm.nodes}
+              </strong>
+            </div>
+            <div className="routing-signal">
+              <span>{t("overview.waitingWatermark")}</span>
+              <strong className={vllm.waitingBlocked ? "metric-amber" : ""}>
+                {vllm.waitingBlocked}
+              </strong>
+            </div>
+            <div className="routing-signal">
+              <span>{t("overview.kvPressure")}</span>
+              <strong className={vllm.kvPressure ? "metric-amber" : ""}>{vllm.kvPressure}</strong>
+            </div>
+            <div className="routing-signal">
+              <span>{t("overview.preemptions")}</span>
+              <strong>
+                {vllm.preemptions === null ? "--" : formatCompactNumber(vllm.preemptions, locale)}
+              </strong>
+            </div>
           </div>
-          <div className="routing-signal">
-            <span>{t("overview.kvPressure")}</span>
-            <strong className={vllm.kvPressure ? "metric-amber" : ""}>{vllm.kvPressure}</strong>
-          </div>
-          <div className="routing-signal">
-            <span>{t("overview.preemptions")}</span>
-            <strong>
-              {vllm.preemptions === null ? "--" : formatCompactNumber(vllm.preemptions, locale)}
-            </strong>
-          </div>
-          <Button fullWidth leftSection={<Plus size={14} />} onClick={onAdd}>
-            {t("overview.addUpstream")}
-          </Button>
-          <Button fullWidth variant="default" onClick={onShowNodes}>
-            {t("overview.viewAll")}
-          </Button>
         </section>
       </div>
 
@@ -315,7 +318,6 @@ export function Overview({
       <section className="dashboard-panel ip-connections-panel">
         <div className="panel-heading">
           <h2>{t("overview.ipConnections")}</h2>
-          <span>{t("overview.currentConnections")}</span>
         </div>
         <div className="ip-connections-grid">
           <div className="ip-ranking">

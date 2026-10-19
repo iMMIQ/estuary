@@ -17,7 +17,7 @@ import { useTranslation } from "react-i18next";
 import { metricNumber } from "./metric-series";
 import { effectiveCapability, effectiveModelMappings, protocolPaths } from "./node-config";
 import type { NodeRecord } from "./types";
-import { formatPercent, formatTimestamp, StatusBadge } from "./ui";
+import { formatPercent, formatTimestamp, HelpTip, StatusBadge } from "./ui";
 
 function metricRate(
   value: number | null | undefined,
@@ -445,8 +445,10 @@ export function NodeDetails({
             </table>
           </section>
           <section className="protocol-panel">
-            <h3>{t("protocol.effective")}</h3>
-            <p>{t("protocol.routing")}</p>
+            <div className="section-title">
+              <h3>{t("protocol.effective")}</h3>
+              <HelpTip subject={t("protocol.effective")}>{t("protocol.routing")}</HelpTip>
+            </div>
             {modelMappings.map(([model]) => (
               <div className="protocol-review" key={model}>
                 <strong>{model}</strong>

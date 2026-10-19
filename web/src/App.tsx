@@ -306,7 +306,6 @@ export default function App() {
         <div className="sidebar-footer">
           <LanguageSwitch />
           <div className="system-status">
-            <span>{t("controlPlane.label")}</span>
             <div>
               <i className={connectionError ? "down" : ""} />
               <strong>
@@ -316,7 +315,6 @@ export default function App() {
                     ? t("controlPlane.disconnected")
                     : t("controlPlane.connected")}
               </strong>
-              <small>estuary-admin</small>
             </div>
           </div>
         </div>

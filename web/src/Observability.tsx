@@ -9,7 +9,7 @@ import {
   nearestSample,
 } from "./metric-series";
 import type { HistoryPoint, Observability, ScopeMetrics } from "./observability-types";
-import { formatBytes } from "./ui";
+import { formatBytes, HelpTip } from "./ui";
 
 type Line = { label: string; read: (point: HistoryPoint) => number | null; dashed?: boolean };
 
@@ -173,11 +173,27 @@ function Value({
   detail?: string;
   title?: string;
 }) {
+  const unit = value.match(/^(.*) (tok\/s|req\/s|ms|s)$/);
   return (
-    <div className="metric-summary" title={title}>
-      <span>{label}</span>
-      <strong>{value}</strong>
-      {detail && <small>{detail}</small>}
+    <div className="metric-summary">
+      <div className="metric-label">
+        <span>{label}</span>
+        {(title || detail) && (
+          <HelpTip subject={label}>
+            {title && <p>{title}</p>}
+            {detail && <p>{detail}</p>}
+          </HelpTip>
+        )}
+      </div>
+      <strong>
+        {unit ? (
+          <>
+            {unit[1]} <span className="metric-unit">{unit[2]}</span>
+          </>
+        ) : (
+          value
+        )}
+      </strong>
     </div>
   );
 }
@@ -240,7 +256,6 @@ export function ObservabilityPanel({
             {t("metrics.title")}
             {nodeId ? ` · ${nodeId}` : model ? ` · ${model}` : ""}
           </h2>
-          <p>{t("metrics.scopeHint")}</p>
         </div>
         <Group gap="xs">
           {!nodeId && (
@@ -315,44 +330,17 @@ export function ObservabilityPanel({
           detail={samples("queue")}
         />
       </div>
-      <div className="metrics-quality" role="status">
-        <Badge variant="light">{t("metrics.smoothed")}</Badge>
-        <span>{t("metrics.covered", { seconds: number(scope?.observed_seconds) })}</span>
-        <span>
-          {t("metrics.usageCoverage")} {percent(scope?.usage_coverage)}
-        </span>
-        <span>
-          {t("metrics.telemetryCoverage")} {scope?.pressure.fresh_nodes ?? 0}/
-          {scope?.pressure.provider_nodes ?? 0}
-        </span>
-        {(scope?.latency.ttft.samples ?? 0) < 20 && <span>{t("metrics.lowSamples")}</span>}
-      </div>
-      {scope && scope.engine.expected_nodes > 0 && (
-        <div className="engine-summary">
-          <h3>{t("metrics.engine")}</h3>
-          <p className="metrics-note">{t("metrics.engineHint")}</p>
-          <div className="observability-extra">
-            <Value
-              label={t("metrics.input")}
-              value={`${number(scope.engine.input.smoothed)} tok/s`}
-              detail={`${t("metrics.reporting")} ${scope.engine.input_nodes}/${scope.engine.expected_nodes}`}
-            />
-            <Value
-              label={t("metrics.output")}
-              value={`${number(scope.engine.output.smoothed)} tok/s`}
-              detail={`${t("metrics.reporting")} ${scope.engine.output_nodes}/${scope.engine.expected_nodes}`}
-            />
-            <Value
-              label={t("metrics.completed")}
-              value={`${number(scope.engine.requests.smoothed)} req/s`}
-              detail={`${t("metrics.reporting")} ${scope.engine.request_nodes}/${scope.engine.expected_nodes}`}
-            />
-          </div>
+      {scope && scope.latency.ttft.samples < 20 && (
+        <div className="metrics-sample-warning" role="status" title={t("metrics.lowSamples")}>
+          <Badge color="yellow" variant="light">
+            {t("metrics.sampleWarning")}
+          </Badge>
+          <HelpTip subject={t("metrics.sampleWarning")}>{t("metrics.lowSamples")}</HelpTip>
         </div>
       )}
       {data && matches && (
         <>
-          <div className="metrics-section-label">{t("metrics.history")}</div>
+          <div className="metrics-section-label">{t("metrics.trendTitle")}</div>
           <div className="metric-trends">
             <Trend
               title={t("metrics.output")}
@@ -361,8 +349,12 @@ export function ObservabilityPanel({
               selectedAt={inspection}
               onInspect={setInspection}
               lines={[
-                { label: t("metrics.rawPeak"), read: (point) => point.peaks.output, dashed: true },
-                { label: t("metrics.smoothed"), read: (point) => point.rates.output.smoothed },
+                {
+                  label: t("metrics.peakLabel"),
+                  read: (point) => point.peaks.output,
+                  dashed: true,
+                },
+                { label: t("metrics.smoothLabel"), read: (point) => point.rates.output.smoothed },
               ]}
             />
             <Trend
@@ -548,6 +540,29 @@ export function ObservabilityPanel({
       {scope && scope.engine.expected_nodes > 0 && (
         <details className="metrics-details">
           <summary>{t("metrics.engineDetails")}</summary>
+          <div className="engine-summary">
+            <div className="section-title">
+              <h3>{t("metrics.engine")}</h3>
+              <HelpTip subject={t("metrics.engine")}>{t("metrics.engineHint")}</HelpTip>
+            </div>
+            <div className="observability-extra">
+              <Value
+                label={t("metrics.input")}
+                value={`${number(scope.engine.input.smoothed)} tok/s`}
+                detail={`${t("metrics.reporting")} ${scope.engine.input_nodes}/${scope.engine.expected_nodes}`}
+              />
+              <Value
+                label={t("metrics.output")}
+                value={`${number(scope.engine.output.smoothed)} tok/s`}
+                detail={`${t("metrics.reporting")} ${scope.engine.output_nodes}/${scope.engine.expected_nodes}`}
+              />
+              <Value
+                label={t("metrics.completed")}
+                value={`${number(scope.engine.requests.smoothed)} req/s`}
+                detail={`${t("metrics.reporting")} ${scope.engine.request_nodes}/${scope.engine.expected_nodes}`}
+              />
+            </div>
+          </div>
           {data && matches && (
             <div className="metric-trends">
               <Trend
@@ -631,7 +646,25 @@ export function ObservabilityPanel({
           </Table.ScrollContainer>
         </details>
       )}
-      <p className="metrics-note">{t("metrics.semantics")}</p>
+      <details className="metrics-details metrics-definitions">
+        <summary>{t("metrics.definitions")}</summary>
+        <p className="metrics-note">{t("metrics.scopeHint")}</p>
+        <div className="metrics-quality" role="status">
+          <Badge variant="light">{t("metrics.smoothed")}</Badge>
+          <span>{t("metrics.covered", { seconds: number(scope?.observed_seconds) })}</span>
+          <span>
+            {t("metrics.usageCoverage")} {percent(scope?.usage_coverage)}
+          </span>
+          <span>
+            {t("metrics.telemetryCoverage")} {scope?.pressure.fresh_nodes ?? 0}/
+            {scope?.pressure.provider_nodes ?? 0}
+          </span>
+          {(scope?.latency.ttft.samples ?? 0) < 20 && <span>{t("metrics.lowSamples")}</span>}
+        </div>
+        <p className="metrics-note">{t("metrics.history")}</p>
+        <p className="metrics-note">{t("metrics.rawPeak")}</p>
+        <p className="metrics-note">{t("metrics.semantics")}</p>
+      </details>
     </section>
   );
 }

@@ -8,7 +8,7 @@ import {
   Switch,
   TextInput,
 } from "@mantine/core";
-import { ArrowLeft, Check, FlaskConical, Info, LoaderCircle, Trash2, X } from "lucide-react";
+import { ArrowLeft, Check, FlaskConical, LoaderCircle, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import * as api from "./api";
@@ -34,6 +34,7 @@ import type {
   PreflightResponse,
   ProviderKind,
 } from "./types";
+import { HelpTip } from "./ui";
 
 export type EditorState =
   | { mode: "create"; draft: NodeDraft; revision: null }
@@ -225,18 +226,9 @@ export function NodeEditor({
         className="node-stepper"
         size="sm"
       >
-        <Stepper.Step
-          label={t("editor.stepBasic")}
-          description={t("editor.stepBasicDescription")}
-        />
-        <Stepper.Step
-          label={t("editor.stepAdvanced")}
-          description={t("editor.stepAdvancedDescription")}
-        />
-        <Stepper.Step
-          label={t("editor.stepReview")}
-          description={t("editor.stepReviewDescription")}
-        />
+        <Stepper.Step label={t("editor.stepBasic")} />
+        <Stepper.Step label={t("editor.stepAdvanced")} />
+        <Stepper.Step label={t("editor.stepReview")} />
       </Stepper>
 
       <form
@@ -274,12 +266,21 @@ export function NodeEditor({
               <section className="wizard-section">
                 <div className="section-title">
                   <h2>{t("editor.basicInformation")}</h2>
-                  <span>{t("editor.basicDescription")}</span>
+                  <HelpTip subject={t("editor.basicInformation")}>
+                    <p>
+                      {t("editor.nodeId")}: {t("editor.nodeIdDescription")}
+                    </p>
+                    <p>
+                      {t("editor.baseUrl")}: {t("editor.baseUrlDescription")}
+                    </p>
+                    <p>
+                      {t("editor.schedulingWeight")}: {t("editor.weightDescription")}
+                    </p>
+                  </HelpTip>
                 </div>
                 <div className="wizard-grid">
                   <TextInput
                     label={t("editor.nodeId")}
-                    description={t("editor.nodeIdDescription")}
                     required
                     disabled={state.mode === "edit"}
                     value={draft.id}
@@ -290,7 +291,6 @@ export function NodeEditor({
                   />
                   <TextInput
                     label={t("editor.baseUrl")}
-                    description={t("editor.baseUrlDescription")}
                     required
                     value={draft.base_url}
                     error={errorText(errors.base_url)}
@@ -320,7 +320,6 @@ export function NodeEditor({
                   />
                   <NumberInput
                     label={t("editor.schedulingWeight")}
-                    description={t("editor.weightDescription")}
                     required
                     step={0.05}
                     value={draft.weight}
@@ -357,7 +356,6 @@ export function NodeEditor({
               <section className="wizard-section">
                 <div className="section-title">
                   <h2>{t("editor.healthTelemetry")}</h2>
-                  <span>{t("editor.healthTelemetryDescription")}</span>
                 </div>
                 <div className="wizard-grid two-columns">
                   <TextInput
@@ -533,8 +531,12 @@ export function NodeEditor({
                 <section className="wizard-section">
                   <div className="switch-heading">
                     <div>
-                      <h2>{t("editor.kvEvents")}</h2>
-                      <span>{t("editor.kvDescription")}</span>
+                      <div className="heading-with-help">
+                        <h2>{t("editor.kvEvents")}</h2>
+                        <HelpTip subject={t("editor.kvEvents")}>
+                          {t("editor.kvDescription")}
+                        </HelpTip>
+                      </div>
                     </div>
                     <Switch
                       aria-label={t("editor.enableKv")}
@@ -599,8 +601,12 @@ export function NodeEditor({
               <section className="wizard-section compact-section">
                 <div className="switch-heading">
                   <div>
-                    <h2>{t("editor.startDraining")}</h2>
-                    <span>{t("editor.startDrainingDescription")}</span>
+                    <div className="heading-with-help">
+                      <h2>{t("editor.startDraining")}</h2>
+                      <HelpTip subject={t("editor.startDraining")}>
+                        {t("editor.startDrainingDescription")}
+                      </HelpTip>
+                    </div>
                   </div>
                   <Switch
                     aria-label={t("editor.startDrainingLabel")}
@@ -618,7 +624,6 @@ export function NodeEditor({
             <section className="wizard-section review-section">
               <div className="section-title">
                 <h2>{t("editor.reviewConfiguration")}</h2>
-                <span>{t("editor.reviewDescription")}</span>
               </div>
               <div className="review-grid">
                 <ReviewRow label={t("editor.nodeId")} value={draft.id} />
@@ -656,13 +661,6 @@ export function NodeEditor({
                   value={draft.draining ? t("overview.draining") : t("editor.serving")}
                 />
               </div>
-              <Alert
-                icon={<Info size={16} />}
-                color="indigo"
-                title={t("editor.connectionRecommended")}
-              >
-                {t("editor.connectionRecommendation")}
-              </Alert>
             </section>
           )}
 

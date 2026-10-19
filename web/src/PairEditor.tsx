@@ -64,18 +64,24 @@ export function PairEditor({
       {rows.map((row, index) => (
         <div className="mapping-row" key={rowKey(row)}>
           <TextInput
+            label={keyLabel}
+            classNames={{ label: "mapping-field-label" }}
             aria-label={`${keyLabel} ${index + 1}`}
             value={row.key}
             error={Boolean(error)}
             onChange={(event) => update(index, "key", event.target.value)}
           />
           <TextInput
+            label={valueLabel}
+            classNames={{ label: "mapping-field-label" }}
             aria-label={`${valueLabel} ${index + 1}`}
             value={row.value}
             error={Boolean(error)}
             onChange={(event) => update(index, "value", event.target.value)}
           />
           <Switch
+            label={t("editor.multimodal")}
+            classNames={{ label: "mapping-field-label" }}
             size="sm"
             aria-label={`${t("editor.multimodal")} ${index + 1}`}
             checked={
@@ -86,6 +92,8 @@ export function PairEditor({
             onChange={(event) => update(index, "multimodal", event.currentTarget.checked)}
           />
           <Select
+            label={t("editor.capabilitySource")}
+            classNames={{ label: "mapping-field-label" }}
             aria-label={`${t("editor.capabilitySource")} ${index + 1}`}
             value={row.inherit_capability ? "inherit" : "override"}
             data={[

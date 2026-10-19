@@ -1,4 +1,9 @@
 export const metricsEnglish = {
+  "metrics.definitions": "Data quality & definitions",
+  "metrics.trendTitle": "Traffic trends",
+  "metrics.smoothLabel": "Smoothed",
+  "metrics.peakLabel": "Sampled peak",
+  "metrics.sampleWarning": "Low sample count",
   "metrics.upstreamActive": "Occupied upstream slots",
   "metrics.engineDetails": "Engine history, cache and capacity",
   "metrics.activePeak": "Peak in-flight requests",
@@ -89,6 +94,11 @@ export const metricsEnglish = {
 };
 
 export const metricsChinese: Record<keyof typeof metricsEnglish, string> = {
+  "metrics.definitions": "数据质量与统计口径",
+  "metrics.trendTitle": "流量趋势",
+  "metrics.smoothLabel": "平滑速率",
+  "metrics.peakLabel": "采样峰值",
+  "metrics.sampleWarning": "样本较少",
   "metrics.upstreamActive": "上游并发占用",
   "metrics.engineDetails": "引擎历史、缓存与容量",
   "metrics.activePeak": "窗口内在途请求峰值",

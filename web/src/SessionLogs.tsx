@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import * as api from "./api";
 import type { LogDetail, LogPage, LogSession, LogStatus } from "./session-log-types";
+import { HelpTip } from "./ui";
 
 function tokens(usage: unknown, key: string): string | number {
   if (!usage || typeof usage !== "object") return "—";
@@ -153,8 +154,10 @@ export function SessionLogs() {
                 </details>
               </article>
             ))}
-            <h2>{t("logs.content")}</h2>
-            <p>{t("logs.contentNote")}</p>
+            <div className="section-title log-content-heading">
+              <h2>{t("logs.content")}</h2>
+              <HelpTip subject={t("logs.content")}>{t("logs.contentNote")}</HelpTip>
+            </div>
             {detail.payloads.length === 0 && <p>{t("logs.noContent")}</p>}
             {detail.payloads.map((payload) => {
               const key = `${payload.stage}:${payload.attempt}`;
@@ -199,10 +202,9 @@ export function SessionLogs() {
 
   return (
     <section className="session-logs">
-      <Group justify="space-between">
+      <Group justify="space-between" className="page-title-row">
         <div>
           <h1>{t("logs.title")}</h1>
-          <p>{t("logs.subtitle")}</p>
         </div>
         <Button
           variant="default"

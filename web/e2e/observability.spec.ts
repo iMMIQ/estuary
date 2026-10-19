@@ -9,7 +9,7 @@ test("shows smoothed rates, histories and model/window filters without layout ov
   await page.goto("/admin/");
   const panel = page.getByRole("region", { name: "Gateway observability" });
   await expect(panel).toBeVisible();
-  await expect(panel.getByText("EWMA · 10 s half-life").first()).toBeVisible();
+  await expect(panel.getByText("EWMA · 10 s half-life").first()).toBeHidden();
   await expect(panel.locator(".metric-trend")).toHaveCount(6);
   await page.screenshot({
     path: `test-results/observability-${test.info().project.name}.png`,
@@ -18,7 +18,15 @@ test("shows smoothed rates, histories and model/window filters without layout ov
   await expect(panel.locator(".metric-line").first()).toHaveAttribute("d", /^M/);
   await page.getByRole("combobox", { name: "Statistics window", exact: true }).click();
   await page.getByRole("option", { name: "Last 1 minute", exact: true }).click();
+  await panel.locator("summary").filter({ hasText: "Data quality & definitions" }).click();
   await expect(panel.getByText("Observed 60 s in this window")).toBeVisible();
+  await panel.locator("summary").filter({ hasText: "Data quality & definitions" }).click();
+  await panel.getByRole("button", { name: "About Output throughput", exact: true }).first().click();
+  await expect(page.getByRole("dialog", { name: "About Output throughput" })).toContainText(
+    "Counts reported usage",
+  );
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
   await panel.getByRole("button", { name: "gateway-chat", exact: true }).click();
   await expect(
     panel.getByRole("heading", { name: "Gateway observability · gateway-chat" }),
@@ -63,9 +71,13 @@ test("node details request node statistics and render both languages", async ({ 
   await page.getByText("vllm-a", { exact: true }).click();
   await page.getByRole("tab", { name: "Metrics", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Gateway observability · vllm-a" })).toBeVisible();
-  await expect(
-    page.locator(".metrics-note").filter({ hasText: /Includes traffic outside/ }),
-  ).toBeVisible();
+  const panel = page.getByRole("region", { name: "Gateway observability" });
+  await panel.locator("summary").filter({ hasText: "Engine history, cache and capacity" }).click();
+  await panel.getByRole("button", { name: "About vLLM engine telemetry", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "About vLLM engine telemetry" })).toContainText(
+    "Includes traffic outside",
+  );
+  await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Language" }).first().click();
   await page.getByRole("menuitem", { name: "简体中文" }).click();
   await expect(page.getByRole("heading", { name: "网关运行指标 · vllm-a" })).toBeVisible();
