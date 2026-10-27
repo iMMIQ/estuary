@@ -11,7 +11,12 @@ export default defineConfig(({ mode }) => {
       rollupOptions: {
         output: {
           // Keep the shared React runtime cached across application changes.
-          manualChunks: { react: ["react", "react-dom", "react/jsx-runtime", "react-dom/client"] },
+          manualChunks(id) {
+            if (/[\\/]node_modules[\\/](react|react-dom)[\\/]/.test(id)) {
+              return "react";
+            }
+            return undefined;
+          },
         },
       },
     },

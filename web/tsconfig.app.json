@@ -14,6 +14,7 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "resolveJsonModule": true,
+    "types": ["vite/client", "bun"],
     "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx"

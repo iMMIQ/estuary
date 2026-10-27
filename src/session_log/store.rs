@@ -176,7 +176,7 @@ fn reader(path: &Path) -> Result<Connection> {
     connection.progress_handler(
         1000,
         Some(move || started.elapsed() > Duration::from_secs(2)),
-    );
+    )?;
     Ok(connection)
 }
 

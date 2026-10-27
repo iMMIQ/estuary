@@ -9,7 +9,8 @@
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "target": "ES2022"
+    "target": "ES2022",
+    "types": ["bun"]
   },
   "include": ["vite.config.ts", "scripts/**/*.ts"]
 }
