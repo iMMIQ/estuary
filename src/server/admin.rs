@@ -487,7 +487,7 @@ pub(super) struct MutationQuery {
 pub(super) async fn update_node(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
-    Query(query): Query<MutationQuery>,
+    Query(_query): Query<MutationQuery>,
     Json(request): Json<UpdateNodeRequest>,
 ) -> Response {
     let _mutation = state.admin_mutation.lock().await;
@@ -519,20 +519,10 @@ pub(super) async fn update_node(
         request.clear_api_key,
         request.clear_headers,
     );
-    let replacement = match prepare_node(&state, &requested_config).await {
+    let replacement = match prepare_node_update(&state, &requested_config, &previous).await {
         Ok(node) => node,
         Err(error) => return admin_validation_error(&error),
     };
-    let was_draining = previous.lifecycle() == crate::node::LifecycleState::Draining;
-    previous.set_draining(true);
-    state.scheduler.notify_state_change();
-    let timeout = mutation_timeout(&state, query.timeout_ms);
-    if !state.scheduler.wait_for_node_idle(&previous, timeout).await {
-        return admin_conflict(
-            "node_still_active",
-            "the node is draining but still has active requests; retry the update later",
-        );
-    }
     let updated = match state
         .store
         .update_async(&node_id, request.revision, &requested_config)
@@ -540,20 +530,19 @@ pub(super) async fn update_node(
     {
         Ok(Some(updated)) => updated,
         Ok(None) => {
-            previous.set_draining(was_draining);
             return admin_conflict(
                 "revision_conflict",
                 "the node changed while the update was being applied",
             );
         }
         Err(error) => {
-            previous.set_draining(was_draining);
             return admin_internal_error("could not persist node update", &error);
         }
     };
-    if let Err(error) = state.scheduler.replace_node(&replacement) {
-        return admin_internal_error("could not replace runtime node", &error);
-    }
+    let replacement = match state.scheduler.replace_node(&replacement) {
+        Ok(node) => node,
+        Err(error) => return admin_internal_error("could not replace runtime node", &error),
+    };
     state
         .runtime_revisions
         .write()
@@ -622,14 +611,32 @@ pub(super) async fn delete_node(
 }
 
 pub(super) async fn prepare_node(state: &AppState, config: &NodeConfig) -> Result<Arc<Node>> {
+    prepare_node_candidate(state, config, None).await
+}
+
+pub(super) async fn prepare_node_update(
+    state: &AppState,
+    config: &NodeConfig,
+    previous: &Node,
+) -> Result<Arc<Node>> {
+    prepare_node_candidate(state, config, Some(previous)).await
+}
+
+async fn prepare_node_candidate(
+    state: &AppState,
+    config: &NodeConfig,
+    previous: Option<&Node>,
+) -> Result<Arc<Node>> {
     validate_node_config(config)?;
     let node = Node::from_config_with_policies(
         config,
         state.settings.health.route_while_starting,
         state.settings.circuit_breaker.clone(),
     )?;
-    preflight_vllm(&state.client, &node).await?;
-    preflight_health(&state.client, &node, &state.settings.health).await?;
+    if !previous.is_some_and(|previous| node.same_upstream_config(previous)) {
+        preflight_vllm(&state.client, &node).await?;
+        preflight_health(&state.client, &node, &state.settings.health).await?;
+    }
     Ok(node)
 }
 

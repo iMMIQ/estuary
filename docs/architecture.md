@@ -192,10 +192,26 @@ triggers advance a database-wide control revision after every node change.
 Processes sharing the same local database poll that revision and reconcile their
 own runtime scheduler.
 
-Node creation and update probe a complete candidate before mutation. An update
-keeps the old node live during validation, then drains it, waits for active
-leases, revision-checks the database write, and swaps the runtime node. Delete
-uses the same drain-and-wait rule. A timeout leaves the node draining instead of
+Node creation probes a complete candidate before mutation. Updates validate the
+complete document and probe the candidate only when its upstream URL, resolved
+credentials/headers, health URL, or provider configuration changes. After the
+revision-checked database write, the scheduler installs the new configuration
+without draining. Accepted requests retain their immutable node snapshot;
+future assignments use the new configuration. All generations share active
+request counts, workload, and a resizable capacity limiter. Lowering concurrency
+reclaims free permits immediately and consumes busy permits as they are released,
+without cancelling requests. Raising concurrency immediately wakes queued work.
+Health is preserved when the upstream configuration is unchanged; request
+statistics and circuit state are preserved for the same upstream engine.
+
+Configuration replacement invalidates prefix/KV ownership and restarts provider
+monitors for the new snapshot. Retired responses cannot repopulate prefix history,
+and tokenization cache entries are scoped to the configuration instance. Shared
+database reconciliation follows the same update path and retains the previous
+runtime configuration when candidate validation fails.
+
+Delete still drains the current node and waits for active leases across every
+configuration generation. A timeout leaves the node draining instead of
 cancelling accepted inference.
 
 Direct Bearer keys and custom header values are plaintext in the SQLite node

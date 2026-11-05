@@ -49,7 +49,7 @@ struct Candidate {
 }
 
 type PendingAcquisition =
-    Pin<Box<dyn Future<Output = (Candidate, NodeReservation)> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = (Candidate, Option<NodeReservation>)> + Send + 'static>>;
 
 #[derive(Debug)]
 pub struct Scheduler {
@@ -206,6 +206,9 @@ impl Scheduler {
                         unreachable!("a guarded acquisition set is not empty");
                     };
                     registered.remove(&candidate.node_instance_id);
+                    let Some(reservation) = reservation else {
+                        continue;
+                    };
                     if !candidate.node.is_routable() {
                         drop(reservation);
                         continue;
@@ -584,8 +587,10 @@ impl Scheduler {
                 node.id()
             )));
         };
-        let previous = std::mem::replace(&mut nodes[index], Arc::clone(node));
+        let replacement = node.with_live_runtime(&nodes[index]);
+        let previous = std::mem::replace(&mut nodes[index], Arc::clone(&replacement));
         previous.retire();
+        replacement.resize_capacity();
         self.prefix.clear_node(node.id());
         self.exact_cache
             .remove_node_owned(node.id(), previous.instance_id());
@@ -599,7 +604,7 @@ impl Scheduler {
         }
         drop(nodes);
         self.notify.notify_waiters();
-        Ok(previous)
+        Ok(replacement)
     }
 
     pub fn remove_node(&self, node_id: &str) -> Option<Arc<Node>> {

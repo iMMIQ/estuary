@@ -489,10 +489,23 @@ impl PrefixDirectory {
     }
 
     pub fn record(&self, node_id: &str, input: &PrefixInput) {
+        self.record_if(node_id, input, || true);
+    }
+
+    pub(crate) fn record_for_node(&self, node: &crate::node::Node, input: &PrefixInput) {
+        // Check retirement under the same lock as clear_node: an old response
+        // must not repopulate affinity after its node configuration was replaced.
+        self.record_if(node.id(), input, || !node.is_retired());
+    }
+
+    fn record_if(&self, node_id: &str, input: &PrefixInput, current: impl FnOnce() -> bool) {
         if !self.enabled || input.text.is_empty() || input.tree_key.len() > MAX_TREE_KEY_BYTES {
             return;
         }
         let mut trees = self.trees.write();
+        if !current() {
+            return;
+        }
         trees.epoch = trees.epoch.wrapping_add(1);
         let epoch = trees.epoch;
         if !trees.values.contains_key(&input.tree_key) && trees.values.len() >= self.max_trees {

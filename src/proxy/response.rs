@@ -134,7 +134,7 @@ pub(super) async fn buffered_success_response(
     reservation.shrink_to(body.len());
     lease.record_success(header_latency);
     if record_prefix {
-        prefix_directory.record(node.id(), prefix_input);
+        prefix_directory.record_for_node(node, prefix_input);
     }
     let mut response = Response::new(budgeted_body(body, reservation));
     *response.status_mut() = status;

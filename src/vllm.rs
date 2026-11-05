@@ -328,6 +328,7 @@ impl VllmManager {
             &prompt.path,
             public_model,
             node.id(),
+            node.instance_id(),
             node.provider_generation(),
             &payload,
         );

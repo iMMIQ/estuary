@@ -8,6 +8,204 @@ use axum::http::{
 };
 use axum::serve::Listener;
 
+fn gateway_with_busy_node(max_concurrency: usize) -> (Gateway, crate::config::NodeConfig) {
+    let config = crate::config::NodeConfig {
+        id: "live".to_owned(),
+        // Routing-only updates must succeed even without a reachable upstream.
+        base_url: "http://127.0.0.1:1/v1".to_owned(),
+        models: HashMap::from([("public".to_owned(), "old-model".to_owned())]),
+        max_concurrency,
+        ..crate::config::NodeConfig::default()
+    };
+    let settings = Settings {
+        nodes: vec![config.clone()],
+        ..Settings::default()
+    };
+    let gateway = Gateway::build(settings).unwrap();
+    gateway
+        .state
+        .scheduler
+        .node("live")
+        .unwrap()
+        .record_probe_success(&gateway.state.settings.health);
+    (gateway, config)
+}
+
+async fn apply_node_update(
+    state: &Arc<AppState>,
+    config: crate::config::NodeConfig,
+    revision: u64,
+) -> axum::response::Response {
+    admin::update_node(
+        State(Arc::clone(state)),
+        axum::extract::Path(config.id.clone()),
+        axum::extract::Query(admin::MutationQuery {
+            timeout_ms: Some(0),
+            revision: None,
+        }),
+        Json(admin::UpdateNodeRequest {
+            revision,
+            config,
+            clear_api_key: false,
+            clear_headers: false,
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn routing_updates_preserve_busy_runtime_without_upstream_probes() {
+    let (gateway, mut config) = gateway_with_busy_node(1);
+    let state = &gateway.state;
+    let previous = state.scheduler.node("live").unwrap();
+    let lease = previous
+        .try_acquire(Arc::new(tokio::sync::Notify::new()))
+        .unwrap();
+    lease.record_success(Duration::from_millis(123));
+    config
+        .models
+        .insert("public".to_owned(), "new-model".to_owned());
+    config.model_capabilities.insert(
+        "public".to_owned(),
+        crate::config::ModelCapabilityConfig { multimodal: false },
+    );
+    config.max_concurrency = 2;
+    config.weight = 2.5;
+    let response = apply_node_update(state, config.clone(), 1).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["runtime"]["active"], 1);
+    assert_eq!(payload["runtime"]["available"], 1);
+    assert_eq!(payload["runtime"]["max_concurrency"], 2);
+    assert_eq!(payload["runtime"]["weight"], 2.5);
+    assert_eq!(payload["runtime"]["latency_ewma_ms"], 123.0);
+    let current = state.scheduler.node("live").unwrap();
+    assert!(previous.is_retired());
+    assert_eq!(
+        previous.upstream_model(Some("public")),
+        Some(Some("old-model".to_owned()))
+    );
+    assert_eq!(
+        current.upstream_model(Some("public")),
+        Some(Some("new-model".to_owned()))
+    );
+    assert!(!current.supports_multimodal("public"));
+    assert!(current.is_routable());
+    let second = current
+        .try_acquire(Arc::new(tokio::sync::Notify::new()))
+        .unwrap();
+    assert!(
+        current
+            .try_acquire(Arc::new(tokio::sync::Notify::new()))
+            .is_none()
+    );
+
+    // A failed or stale write must not start draining or alter live capacity.
+    config.max_concurrency = 0;
+    assert_eq!(
+        apply_node_update(state, config.clone(), 2).await.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    config.max_concurrency = 1;
+    assert_eq!(
+        apply_node_update(state, config.clone(), 1).await.status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(current.snapshot().available, 0);
+    assert!(current.is_routable());
+    assert_eq!(
+        apply_node_update(state, config.clone(), 2).await.status(),
+        StatusCode::OK
+    );
+    let current = state.scheduler.node("live").unwrap();
+    assert_eq!(current.active(), 2);
+    assert_eq!(current.snapshot().available, 0);
+    drop(second);
+    assert!(
+        current
+            .try_acquire(Arc::new(tokio::sync::Notify::new()))
+            .is_none()
+    );
+    drop(lease);
+    assert_eq!(current.active(), 0);
+    assert_eq!(current.snapshot().available, 1);
+}
+
+#[tokio::test]
+async fn reconciliation_updates_busy_nodes_and_deletion_waits_for_all_generations() {
+    let (gateway, mut config) = gateway_with_busy_node(2);
+    let state = &gateway.state;
+    let previous = state.scheduler.node("live").unwrap();
+    let lease = previous
+        .try_acquire(Arc::new(tokio::sync::Notify::new()))
+        .unwrap();
+    for revision in 1..=2 {
+        config.max_concurrency = 1;
+        config.weight += 1.0;
+        state
+            .store
+            .update_async("live", revision, &config)
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile::reconcile_control_plane(state).await.unwrap();
+        let current = state.scheduler.node("live").unwrap();
+        assert!(current.is_routable());
+        assert_eq!(current.active(), 1);
+        assert_eq!(current.snapshot().available, 0);
+        assert_eq!(
+            state.runtime_revisions.read().get("live"),
+            Some(&(revision + 1))
+        );
+    }
+    let deletion = || {
+        admin::delete_node(
+            State(Arc::clone(state)),
+            axum::extract::Path("live".to_owned()),
+            axum::extract::Query(admin::MutationQuery {
+                timeout_ms: Some(0),
+                revision: Some(3),
+            }),
+        )
+    };
+    assert_eq!(deletion().await.status(), StatusCode::CONFLICT);
+    assert_eq!(state.scheduler.node("live").unwrap().active(), 1);
+    drop(lease);
+    assert_eq!(deletion().await.status(), StatusCode::OK);
+    assert!(state.scheduler.node("live").is_none());
+}
+
+#[tokio::test]
+async fn rejected_shared_update_keeps_previous_node_serving() {
+    let (gateway, mut config) = gateway_with_busy_node(1);
+    let state = &gateway.state;
+    let previous = state.scheduler.node("live").unwrap();
+    let lease = previous
+        .try_acquire(Arc::new(tokio::sync::Notify::new()))
+        .unwrap();
+    config.health_path = "/new-health".to_owned();
+    state
+        .store
+        .update_async("live", 1, &config)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reconcile::reconcile_control_plane(state).await.is_err());
+    assert!(Arc::ptr_eq(
+        &previous,
+        &state.scheduler.node("live").unwrap()
+    ));
+    assert!(previous.is_routable());
+    assert_eq!(previous.active(), 1);
+    assert_eq!(state.runtime_revisions.read().get("live"), Some(&1));
+    drop(lease);
+}
+
 #[test]
 fn gzip_negotiation_respects_explicit_refusal_and_quality() {
     for (value, expected) in [

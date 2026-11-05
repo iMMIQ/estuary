@@ -157,6 +157,7 @@ pub(super) fn streaming_response(
     let upstream_request_id = headers.get("x-request-id").cloned();
     let node_id = node.id().to_owned();
     let stream_node_id = node_id.clone();
+    let stream_node = Arc::clone(lease.node());
     let (sender, mut receiver) = mpsc::channel::<StreamingOutput>(1);
     let terminal_failure = Arc::new(parking_lot::Mutex::new(None));
     let pump_failure = Arc::clone(&terminal_failure);
@@ -295,7 +296,7 @@ pub(super) fn streaming_response(
                         }
                     }
                     if record_prefix && !indexed && guard.first_token_observed {
-                        prefix_directory.record(&stream_node_id, &prefix_input);
+                        prefix_directory.record_for_node(&stream_node, &prefix_input);
                         indexed = true;
                     }
                     let output = match (input, stream_adapter.as_mut()) {
@@ -348,7 +349,7 @@ pub(super) fn streaming_response(
                         }
                     }
                     if record_prefix && !indexed {
-                        prefix_directory.record(&stream_node_id, &prefix_input);
+                        prefix_directory.record_for_node(&stream_node, &prefix_input);
                     }
                     guard.completed();
                     return;

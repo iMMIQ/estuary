@@ -78,10 +78,25 @@ Messages, Responses and Chat
 clients use the Chat Completions backend for every model. Node and model settings
 no longer choose between backend protocols.
 
-Create and update operations validate the complete document and probe the
-candidate before changing the active scheduler. Updates and deletes drain the
-old node and wait for its active leases. Every stored record has an optimistic
-revision; stale updates return a conflict rather than overwriting newer data.
+Create and update operations validate the complete document. Node updates apply
+live without waiting for active requests to finish. Every stored record has an
+optimistic revision; stale updates return a conflict rather than overwriting
+newer data. A failed update leaves the current runtime configuration serving.
+
+| Node fields | Update behavior |
+| --- | --- |
+| `models`, `model_capabilities`, `weight` | New assignments use the updated routing policy. No upstream probe is needed. |
+| `max_concurrency` | Increases release capacity immediately. Decreases let existing requests finish and admit more only below the new limit. No upstream probe is needed. |
+| `draining` | Stops or resumes new assignments immediately; accepted requests continue. No upstream probe is needed. |
+| `base_url`, `api_key`, `api_key_env`, `headers`, `headers_from_env`, `health_path`, all `provider` fields | Probe changed upstream settings while the current node serves, then switch new assignments to the new snapshot. Accepted requests keep their original URL, credentials, model, and provider settings. |
+| `id` | Immutable; create a new node to change its ID. |
+
+Equivalent resolved upstream settings skip redundant probes. Concurrency and
+workload accounting span all live snapshots, including when the upstream URL or
+provider type changes. Configuration changes reset prefix/KV ownership and
+restart provider monitors. Updates accept the legacy `timeout_ms` query parameter
+but do not wait for draining. Delete operations still drain and wait for active
+requests from all configuration generations before removing the node.
 
 SQLite uses WAL mode and transactional migrations. Workers sharing a local
 database poll its control revision and reconcile node changes into their own

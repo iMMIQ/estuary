@@ -93,7 +93,7 @@ export function updateNode(
   revision: number,
   clearApiKey: boolean,
 ): Promise<NodeRecord> {
-  return request(`/admin/api/nodes/${encodeURIComponent(config.id)}?timeout_ms=30000`, {
+  return request(`/admin/api/nodes/${encodeURIComponent(config.id)}`, {
     method: "PUT",
     body: JSON.stringify({ config, revision, clear_api_key: clearApiKey }),
   });

@@ -1,6 +1,9 @@
 use std::{collections::HashMap, time::Duration};
 
-use axum::{Json, Router, routing::get};
+use axum::{
+    Json, Router,
+    routing::{get, post},
+};
 use estuary::{
     Gateway, Settings,
     config::{NodeConfig, ProviderKind},
@@ -10,6 +13,162 @@ use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
+
+async fn live_update_upstreams(
+    release: std::sync::Arc<tokio::sync::Semaphore>,
+    started: tokio::sync::mpsc::UnboundedSender<(axum::http::HeaderMap, Value)>,
+) -> (TestServer, TestServer) {
+    let blocked = std::sync::Arc::clone(&release);
+    let first = TestServer::spawn(
+        Router::new()
+            .route("/v1/models", get(|| async { StatusCode::OK }))
+            .route("/v1/chat/completions", post(move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                let started = started.clone();
+                let blocked = std::sync::Arc::clone(&blocked);
+                async move {
+                    started.send((headers, body.clone())).unwrap();
+                    let _permit = blocked.acquire().await.unwrap();
+                    Json(json!({"id":"old", "object":"chat.completion", "model": body["model"],
+                        "choices":[{"index":0,"message":{"role":"assistant","content":"old response"},"finish_reason":"stop"}]}))
+                }
+            })),
+    ).await;
+    let second = TestServer::spawn(
+        Router::new()
+            .route("/ready", get(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers["authorization"], "Bearer new-secret");
+                assert_eq!(headers["x-tenant"], "new-tenant");
+                StatusCode::OK
+            }))
+            .route("/engine/version", get(|| async { Json(json!({"version":"0.25.0"})) }))
+            .route("/engine/metrics", get(|| async { "vllm:num_requests_running 0\nvllm:num_requests_waiting 0\n" }))
+            .route("/v1/chat/completions", post(|headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers["authorization"], "Bearer new-secret");
+                assert_eq!(headers["x-tenant"], "new-tenant");
+                assert_eq!(body["model"], "new-model");
+                Json(json!({"id":"new", "object":"chat.completion", "model":"new-model",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"new response"},"finish_reason":"stop"}]}))
+            })),
+    ).await;
+    (first, second)
+}
+
+fn live_update_provider() -> estuary::config::ProviderConfig {
+    estuary::config::ProviderConfig {
+        kind: ProviderKind::Vllm,
+        version_path: "/engine/version".to_owned(),
+        metrics_path: "/engine/metrics".to_owned(),
+        tokenize_path: "/engine/tokenize".to_owned(),
+        monitor_interval_ms: 500,
+        request_timeout_ms: 500,
+        telemetry_stale_ms: 2_000,
+        waiting_threshold: 3,
+        tokenize_cache_entries: 32,
+        kv_events: Some(estuary::config::VllmKvEventsConfig::default()),
+    }
+}
+
+#[tokio::test]
+async fn connection_settings_change_live_while_old_response_uses_its_snapshot() {
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let (started, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (first, second) = live_update_upstreams(std::sync::Arc::clone(&release), started).await;
+    let gateway = Gateway::build(Settings::default()).unwrap();
+    let admin = TestServer::spawn(gateway.admin_router()).await;
+    let public = TestServer::spawn(gateway.public_router()).await;
+    let client = client();
+    let mut config = node(&first.base_url);
+    config.api_key = Some("old-secret".to_owned());
+    config
+        .headers
+        .insert("x-tenant".to_owned(), "old-tenant".to_owned());
+    client
+        .post(admin.url("/admin/api/nodes"))
+        .json(&config)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let old_request = {
+        let client = client.clone();
+        let url = public.url("/v1/chat/completions");
+        tokio::spawn(async move {
+            client
+                .post(url)
+                .json(
+                    &json!({"model":"public-chat","messages":[{"role":"user","content":"hello"}]}),
+                )
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        })
+    };
+    let (headers, body) = timeout(IO_TIMEOUT, received.recv()).await.unwrap().unwrap();
+    assert_eq!(headers["authorization"], "Bearer old-secret");
+    assert_eq!(headers["x-tenant"], "old-tenant");
+    assert_eq!(body["model"], "upstream-chat");
+
+    config.base_url = format!("{}/v1", second.base_url);
+    config
+        .models
+        .insert("public-chat".to_owned(), "new-model".to_owned());
+    config.api_key = Some("new-secret".to_owned());
+    config
+        .headers
+        .insert("x-tenant".to_owned(), "new-tenant".to_owned());
+    config.health_path = "/ready".to_owned();
+    config.max_concurrency = 2;
+    config.weight = 1.5;
+    config.provider = live_update_provider();
+    let updated = timeout(
+        IO_TIMEOUT,
+        client
+            .put(admin.url("/admin/api/nodes/dynamic-a?timeout_ms=0"))
+            .json(&json!({"revision":1,"config":config}))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        updated.status(),
+        StatusCode::OK,
+        "{}",
+        updated.text().await.unwrap()
+    );
+    let updated = updated.json::<Value>().await.unwrap();
+    assert_eq!(updated["runtime"]["active"], 1);
+    assert_eq!(updated["runtime"]["available"], 1);
+    assert_eq!(updated["runtime"]["lifecycle"], "serving");
+    assert!(!old_request.is_finished());
+    let new_response = timeout(
+        IO_TIMEOUT,
+        client
+            .post(public.url("/v1/chat/completions"))
+            .json(&json!({"model":"public-chat","messages":[{"role":"user","content":"hello"}]}))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(new_response.status(), StatusCode::OK);
+    assert_eq!(
+        new_response.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "new response"
+    );
+    release.add_permits(1);
+    let old_response = timeout(IO_TIMEOUT, old_request).await.unwrap().unwrap();
+    assert_eq!(
+        old_response["choices"][0]["message"]["content"],
+        "old response"
+    );
+}
 
 struct TestServer {
     base_url: String,

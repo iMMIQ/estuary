@@ -375,7 +375,7 @@ pub enum ProviderKind {
 }
 
 #[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderConfig {
     #[serde(rename = "type")]
@@ -409,7 +409,7 @@ impl Default for ProviderConfig {
 }
 
 #[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VllmKvEventsConfig {
     pub endpoint: String,

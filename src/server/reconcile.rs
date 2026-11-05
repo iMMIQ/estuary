@@ -8,7 +8,7 @@ use tokio::sync::watch;
 use tracing::warn;
 
 use super::AppState;
-use super::admin::prepare_node;
+use super::admin::{prepare_node, prepare_node_update};
 
 pub(super) async fn run_control_reconciler(
     state: Arc<AppState>,
@@ -81,28 +81,20 @@ pub(super) async fn reconcile_control_plane(state: &Arc<AppState>) -> Result<()>
             continue;
         }
 
-        let replacement = match prepare_node(state, &stored.config).await {
+        let previous = state.scheduler.node(&stored.config.id);
+        let prepared = if let Some(previous) = &previous {
+            prepare_node_update(state, &stored.config, previous).await
+        } else {
+            prepare_node(state, &stored.config).await
+        };
+        let replacement = match prepared {
             Ok(node) => node,
             Err(error) => {
-                if let Some(previous) = state.scheduler.node(&stored.config.id) {
-                    previous.set_draining(true);
-                    state.scheduler.notify_state_change();
-                }
                 failures.push(format!("{}: {error:#}", stored.config.id));
                 continue;
             }
         };
-        if let Some(previous) = state.scheduler.node(&stored.config.id) {
-            previous.set_draining(true);
-            state.scheduler.notify_state_change();
-            let timeout = Duration::from_millis(state.settings.server.node_mutation_timeout_ms);
-            if !state.scheduler.wait_for_node_idle(&previous, timeout).await {
-                failures.push(format!(
-                    "{}: active requests did not drain",
-                    stored.config.id
-                ));
-                continue;
-            }
+        if previous.is_some() {
             if let Err(error) = state.scheduler.replace_node(&replacement) {
                 failures.push(format!("{}: {error}", stored.config.id));
                 continue;

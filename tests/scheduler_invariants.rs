@@ -70,6 +70,74 @@ fn routing(queue_max_requests: usize) -> RoutingConfig {
 }
 
 #[tokio::test]
+async fn queued_requests_follow_live_model_and_capacity_changes() {
+    let previous = healthy_node("live", 1);
+    let scheduler = Scheduler::new(vec![Arc::clone(&previous)], routing(8));
+    let first = scheduler
+        .acquire(
+            Some("model"),
+            prefix::PrefixInput::default(),
+            &HashSet::new(),
+            128,
+        )
+        .await
+        .unwrap();
+    let excluded = HashSet::new();
+    let waiting = scheduler.acquire(
+        Some("model"),
+        prefix::PrefixInput::default(),
+        &excluded,
+        128,
+    );
+    tokio::pin!(waiting);
+    assert!(matches!(poll!(&mut waiting), Poll::Pending));
+
+    let mut config = NodeConfig {
+        id: "live".to_owned(),
+        base_url: "http://live.invalid/v1".to_owned(),
+        models: HashMap::from([("model".to_owned(), "new-upstream".to_owned())]),
+        max_concurrency: 2,
+        ..NodeConfig::default()
+    };
+    let current = scheduler
+        .replace_node(&Node::from_config(&config).unwrap())
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.upstream_model.as_deref(), Some("new-upstream"));
+    assert_eq!(second.node.instance_id(), current.instance_id());
+    assert_eq!(current.active(), 2);
+
+    config.max_concurrency = 1;
+    let current = scheduler
+        .replace_node(&Node::from_config(&config).unwrap())
+        .unwrap();
+    let waiting = scheduler.acquire(
+        Some("model"),
+        prefix::PrefixInput::default(),
+        &excluded,
+        128,
+    );
+    tokio::pin!(waiting);
+    assert!(matches!(poll!(&mut waiting), Poll::Pending));
+    drop(second);
+    assert_eq!(current.active(), 1);
+    assert!(matches!(poll!(&mut waiting), Poll::Pending));
+    drop(first);
+    let third = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(third.node.instance_id(), current.instance_id());
+    assert_eq!(current.active(), 1);
+    drop(third);
+    assert_eq!(current.snapshot().available, 1);
+    assert_eq!(scheduler.queue_snapshot(), (0, 0));
+}
+
+#[tokio::test]
 async fn equal_score_low_overlap_traffic_rotates_between_nodes() {
     let first = healthy_node("first", 4);
     let second = healthy_node("second", 4);

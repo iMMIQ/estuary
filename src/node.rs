@@ -12,14 +12,16 @@ use anyhow::{Context, Result, bail};
 use http::{HeaderMap, HeaderName, HeaderValue, header::AUTHORIZATION};
 use parking_lot::Mutex;
 use serde::Serialize;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Notify;
 use url::Url;
 
 use crate::config::{CircuitBreakerConfig, HealthConfig, NodeConfig, ProviderConfig, ProviderKind};
 use crate::time::unix_millis;
 
 const EWMA_ALPHA: f64 = 0.20;
+mod capacity;
 mod telemetry;
+use capacity::{Capacity, CapacityPermit};
 pub use telemetry::EngineTelemetry;
 pub(crate) use telemetry::ProviderCounter;
 static NEXT_NODE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -262,13 +264,14 @@ pub struct Node {
     route_while_starting: bool,
     lifecycle: AtomicU8,
     retired: AtomicBool,
+    retired_notify: Notify,
     circuit_config: CircuitBreakerConfig,
-    circuit: Mutex<CircuitRuntime>,
-    semaphore: Arc<Semaphore>,
-    active: AtomicUsize,
-    health: AtomicU8,
-    stats: Mutex<RuntimeStats>,
-    workload: Mutex<Workload>,
+    circuit: Arc<Mutex<CircuitRuntime>>,
+    capacity: Arc<Capacity>,
+    active: Arc<AtomicUsize>,
+    health: Arc<AtomicU8>,
+    stats: Arc<Mutex<RuntimeStats>>,
+    workload: Arc<Mutex<Workload>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -384,14 +387,80 @@ impl Node {
                 .encode(),
             ),
             retired: AtomicBool::new(false),
+            retired_notify: Notify::new(),
             circuit_config,
-            circuit: Mutex::new(CircuitRuntime::default()),
-            semaphore: Arc::new(Semaphore::new(config.max_concurrency)),
-            active: AtomicUsize::new(0),
-            health: AtomicU8::new(HealthState::Starting.encode()),
-            stats: Mutex::new(RuntimeStats::default()),
-            workload: Mutex::new(Workload::default()),
+            circuit: Arc::new(Mutex::new(CircuitRuntime::default())),
+            capacity: Capacity::new(config.max_concurrency),
+            active: Arc::new(AtomicUsize::new(0)),
+            health: Arc::new(AtomicU8::new(HealthState::Starting.encode())),
+            stats: Arc::new(Mutex::new(RuntimeStats::default())),
+            workload: Arc::new(Mutex::new(Workload::default())),
         }))
+    }
+
+    /// Only request routing/admission changed; no upstream probe is necessary.
+    pub(crate) fn same_upstream_config(&self, previous: &Self) -> bool {
+        self.base_url == previous.base_url
+            && self.health_url == previous.health_url
+            && self.headers == previous.headers
+            && self.provider == previous.provider
+    }
+
+    /// Keep accepted requests on their immutable configuration while accounting
+    /// for every generation against the same node capacity and workload.
+    pub(crate) fn with_live_runtime(&self, previous: &Self) -> Arc<Self> {
+        let same_upstream = self.same_upstream_config(previous);
+        let same_engine =
+            self.base_url == previous.base_url && self.provider.kind == previous.provider.kind;
+        Arc::new(Self {
+            id: self.id.clone(),
+            instance_id: self.instance_id,
+            base_url: self.base_url.clone(),
+            health_url: self.health_url.clone(),
+            models: self.models.clone(),
+            model_capabilities: self.model_capabilities.clone(),
+            max_concurrency: self.max_concurrency,
+            weight: self.weight,
+            headers: self.headers.clone(),
+            provider: self.provider.clone(),
+            provider_runtime: Mutex::new(if same_upstream {
+                previous.provider_runtime.lock().clone()
+            } else {
+                self.provider_runtime.lock().clone()
+            }),
+            provider_generation: AtomicU64::new(if same_upstream {
+                previous.provider_generation()
+            } else {
+                self.provider_generation()
+            }),
+            route_while_starting: self.route_while_starting,
+            lifecycle: AtomicU8::new(self.lifecycle.load(Ordering::Acquire)),
+            retired: AtomicBool::new(false),
+            retired_notify: Notify::new(),
+            circuit_config: self.circuit_config.clone(),
+            circuit: Arc::clone(if same_engine {
+                &previous.circuit
+            } else {
+                &self.circuit
+            }),
+            capacity: Arc::clone(&previous.capacity),
+            active: Arc::clone(&previous.active),
+            health: Arc::clone(if same_upstream {
+                &previous.health
+            } else {
+                &self.health
+            }),
+            stats: Arc::clone(if same_engine {
+                &previous.stats
+            } else {
+                &self.stats
+            }),
+            workload: Arc::clone(&previous.workload),
+        })
+    }
+
+    pub(crate) fn resize_capacity(&self) {
+        self.capacity.resize(self.max_concurrency);
     }
 
     pub fn id(&self) -> &str {
@@ -436,6 +505,7 @@ impl Node {
     pub fn retire(&self) {
         self.retired.store(true, Ordering::Release);
         self.set_draining(true);
+        self.retired_notify.notify_waiters();
     }
 
     pub fn set_draining(&self, draining: bool) -> bool {
@@ -705,6 +775,7 @@ impl Node {
         if self.is_retired()
             || self.lifecycle() != LifecycleState::Serving
             || !self.is_health_state_routable(self.health())
+            || self.active() >= self.capacity.limit()
         {
             return None;
         }
@@ -806,7 +877,7 @@ impl Node {
     }
 
     pub fn try_acquire(self: &Arc<Self>, idle_notify: Arc<Notify>) -> Option<NodeLease> {
-        let permit = Arc::clone(&self.semaphore).try_acquire_owned().ok()?;
+        let permit = self.capacity.try_acquire()?;
         let circuit_ticket = self.begin_circuit_request()?;
         Some(NodeLease {
             node: Arc::clone(self),
@@ -819,12 +890,24 @@ impl Node {
         })
     }
 
-    pub(crate) async fn reserve(self: Arc<Self>) -> NodeReservation {
-        let permit = Arc::clone(&self.semaphore)
-            .acquire_owned()
-            .await
-            .expect("node semaphore is never closed");
-        NodeReservation { node: self, permit }
+    pub(crate) async fn reserve(self: Arc<Self>) -> Option<NodeReservation> {
+        // Remove obsolete waiters promptly during repeated live edits, even if
+        // a long-running request keeps every capacity permit busy.
+        let retired = self.retired_notify.notified();
+        tokio::pin!(retired);
+        retired.as_mut().enable();
+        if self.is_retired() {
+            return None;
+        }
+        let permit = tokio::select! {
+            biased;
+            () = &mut retired => return None,
+            permit = self.capacity.acquire() => permit,
+        };
+        Some(NodeReservation {
+            node: Arc::clone(&self),
+            permit,
+        })
     }
 
     pub fn score_stats(&self, stale_after: Duration) -> Option<(f64, f64)> {
@@ -977,7 +1060,10 @@ impl Node {
             circuit_failures: circuit.consecutive_failures,
             circuit_half_open_in_flight: circuit.half_open_in_flight,
             active,
-            available: self.semaphore.available_permits(),
+            available: self
+                .capacity
+                .available()
+                .min(self.max_concurrency.saturating_sub(active)),
             max_concurrency: self.max_concurrency,
             weight: self.weight,
             latency_ewma_ms: stats.latency_ewma_ms,
@@ -1034,7 +1120,7 @@ fn prefix_cache_hit_rate(hits: Option<f64>, queries: Option<f64>) -> Option<f64>
 #[derive(Debug)]
 pub(crate) struct NodeReservation {
     node: Arc<Node>,
-    permit: OwnedSemaphorePermit,
+    permit: CapacityPermit,
 }
 
 impl NodeReservation {
@@ -1057,7 +1143,7 @@ impl NodeReservation {
 pub struct NodeLease {
     pub(crate) observation: Option<Arc<crate::observability::Observation>>,
     node: Arc<Node>,
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<CapacityPermit>,
     circuit_ticket: Option<CircuitTicket>,
     idle_notify: Arc<Notify>,
     workload: Mutex<Workload>,
@@ -1242,6 +1328,32 @@ mod tests {
         drop(first);
         assert_eq!(node.active(), 1);
         drop(second);
+    }
+
+    #[tokio::test]
+    async fn retiring_a_busy_node_cancels_queued_reservations_without_waiting_for_leases() {
+        let node = Node::from_config(&config()).unwrap();
+        let notify = Arc::new(Notify::new());
+        let first = node.try_acquire(Arc::clone(&notify)).unwrap();
+        let second = node.try_acquire(notify).unwrap();
+        let waiting = Arc::clone(&node).reserve();
+        tokio::pin!(waiting);
+        assert!(matches!(
+            futures_util::poll!(&mut waiting),
+            std::task::Poll::Pending
+        ));
+        node.retire();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(node.active(), 2);
+        assert!(Arc::clone(&node).reserve().await.is_none());
+        drop((first, second));
+        assert_eq!(node.active(), 0);
+        assert_eq!(node.snapshot().available, 2);
     }
 
     #[test]
