@@ -70,7 +70,8 @@ test("revision conflict merges local edits and saves with the current revision",
   const nodes = await mockControlPlane(page, [initial]);
   const sent: number[] = [];
   let saved: NodeConfig | undefined;
-  await page.route("**/admin/api/nodes/vllm-a?*", async (route) => {
+  await page.route("**/admin/api/nodes/vllm-a", async (route) => {
+    if (route.request().method() !== "PUT") return route.fallback();
     saved = route.request().postDataJSON().config;
     sent.push(route.request().postDataJSON().revision);
     if (sent.length > 1) {
@@ -119,7 +120,8 @@ test("editing preserves inherited image capability", async ({ page }) => {
   });
   await mockControlPlane(page, [initial]);
   let saved: NodeConfig | undefined;
-  await page.route("**/admin/api/nodes/vllm-a?*", async (route) => {
+  await page.route("**/admin/api/nodes/vllm-a", async (route) => {
+    if (route.request().method() !== "PUT") return route.fallback();
     saved = route.request().postDataJSON().config;
     await route.fulfill({ json: initial });
   });
@@ -152,7 +154,8 @@ for (const removeStoredKey of [false, true]) {
     initial.credentials.api_key_source = "database";
     await mockControlPlane(page, [initial]);
     let saved: { config: NodeConfig; clear_api_key: boolean } | undefined;
-    await page.route("**/admin/api/nodes/vllm-a?*", async (route) => {
+    await page.route("**/admin/api/nodes/vllm-a", async (route) => {
+      if (route.request().method() !== "PUT") return route.fallback();
       saved = route.request().postDataJSON();
       await route.fulfill({ json: initial });
     });

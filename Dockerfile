@@ -1,8 +1,12 @@
-ARG BUN_IMAGE=oven/bun:1.4.2-alpine
-ARG RUST_IMAGE=rust:1.99-alpine3.22
+ARG NODE_IMAGE=node:26.12.1-alpine3.24
+ARG BUN_IMAGE=oven/bun:1.4.4-alpine
+ARG RUST_IMAGE=rust:1.98.1-alpine3.22
 ARG ALPINE_IMAGE=alpine:3.21
 
-FROM ${BUN_IMAGE} AS web-builder
+FROM ${BUN_IMAGE} AS bun-runtime
+
+FROM ${NODE_IMAGE} AS web-builder
+COPY --from=bun-runtime /usr/local/bin/bun /usr/local/bin/bun
 
 WORKDIR /build/web
 ARG NPM_REGISTRY=https://registry.npmjs.org
@@ -21,11 +25,12 @@ RUN version="$(cut -d. -f1,2 /etc/alpine-release)" \
     && printf '%s/v%s/main\n%s/v%s/community\n' \
         "${APK_REPOSITORY%/}" "${version}" "${APK_REPOSITORY%/}" "${version}" \
         > /etc/apk/repositories \
-    && apk add --no-cache build-base cmake perl
+    && apk add --no-cache build-base cmake lld perl
 WORKDIR /build
 ARG CARGO_REGISTRY
 ARG ESTUARY_BUILD_VERSION
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo/config.toml ./.cargo/config.toml
 COPY build.rs ./
 COPY deploy/build-version.sh ./deploy/build-version.sh
 COPY src/ ./src/
@@ -33,10 +38,10 @@ COPY vendor/ ./vendor/
 COPY examples/ ./examples/
 COPY benches/ ./benches/
 COPY --from=web-builder /build/web/dist ./web/dist/
-RUN if [ -n "${CARGO_REGISTRY}" ]; then \
-        mkdir .cargo; \
+RUN sed -i '/^\[source\./,$d' .cargo/config.toml \
+    && if [ -n "${CARGO_REGISTRY}" ]; then \
         printf '[source.crates-io]\nreplace-with = "mirror"\n[source.mirror]\nregistry = "%s"\n' \
-            "${CARGO_REGISTRY}" > .cargo/config.toml; \
+            "${CARGO_REGISTRY}" >> .cargo/config.toml; \
     fi \
     && cargo build --locked --release
 

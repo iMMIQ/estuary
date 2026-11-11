@@ -41,7 +41,7 @@ probe_apk() {
 probe_docker() {
     local name=$1 prefix=$2 start elapsed code image
     start=$(date +%s%3N)
-    for image in library/alpine:3.21 library/rust:1.99-alpine3.22 oven/bun:1.4.2-alpine; do
+    for image in library/alpine:3.21 library/rust:1.98.1-alpine3.22 oven/bun:1.4.4-alpine library/node:26.12.1-alpine3.24; do
         code=$(curl --location --silent --output /dev/null --write-out '%{http_code}' \
             --connect-timeout 3 --max-time 8 \
             --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
@@ -103,8 +103,9 @@ printf 'Build version: %s\n' "${build_version}" >&2
 exec docker build --network host --tag "${ESTUARY_IMAGE:-estuary:local}" \
     --build-arg "ESTUARY_BUILD_VERSION=${build_version}" \
     --build-arg "ALPINE_IMAGE=${docker_registry}/library/alpine:3.21" \
-    --build-arg "RUST_IMAGE=${docker_registry}/library/rust:1.99-alpine3.22" \
-    --build-arg "BUN_IMAGE=${docker_registry}/oven/bun:1.4.2-alpine" \
+    --build-arg "RUST_IMAGE=${docker_registry}/library/rust:1.98.1-alpine3.22" \
+    --build-arg "BUN_IMAGE=${docker_registry}/oven/bun:1.4.4-alpine" \
+    --build-arg "NODE_IMAGE=${docker_registry}/library/node:26.12.1-alpine3.24" \
     --build-arg "APK_REPOSITORY=${apk_repository}" \
     --build-arg "CARGO_REGISTRY=${cargo_registry}" \
     --build-arg "NPM_REGISTRY=${npm_registry}" \

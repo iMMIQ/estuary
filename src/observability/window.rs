@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(counts.success, 60);
         assert_eq!(histograms[0].snapshot().samples, 60);
         assert!((histograms[0].snapshot().p95.unwrap() - 0.1).abs() < 0.025);
-        assert_eq!(seconds, 60.0);
+        assert!((seconds - 60.0).abs() < 1e-9);
         window.expire(1900);
         assert_eq!(window.read(1900.0, 300, 0.0).0.success, 0);
     }

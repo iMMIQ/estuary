@@ -63,7 +63,16 @@ volumes, shutdown, and rolling updates.
 
 ### From Source
 
-Rust 1.99 or newer is required.
+Rust 1.98.1 or newer and an installed LLD linker (`ld.lld`) are required.
+Local and Docker builds enable `target-cpu=native` and link with LLD.
+Release workflows use a portable CPU target and Zig's LLD linker for cross-compilation.
+
+The web toolchain uses Node.js 26.12.1 (`.node-version`), Bun 1.4.4, and
+TypeScript 6.0.3.
+
+Dependency versions are selected from stable releases published through 2026-11-04.
+`rusqlite` uses the latest compatible 0.40 release because `rusqlite_migration` 2.6
+requires that series. Commit both `Cargo.lock` and `web/bun.lock` when updating dependencies.
 
 ```bash
 mkdir -p data

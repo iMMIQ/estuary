@@ -12,24 +12,26 @@ env:
 
 jobs:
   rust:
-    name: Rust (1.99)
+    name: Rust (1.98.1)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
       - name: Use official Cargo registry
-        run: rm .cargo/config.toml
+        run: sed -i '/^\[source\./,$d' .cargo/config.toml
+      - name: Install LLD
+        run: sudo apt-get update && sudo apt-get install -y lld
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.99.0"
+          toolchain: "1.98.1"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.90.1
         with:
-          tool: cargo-machete
+          tool: cargo-machete@0.9.2
       - run: cargo machete
       - run: cargo test --locked --all-targets
       - run: cargo test --locked --test load_balance_stress -- --ignored
@@ -44,18 +46,23 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - name: Use official Cargo registry
-        run: rm ../.cargo/config.toml
+        run: sed -i '/^\[source\./,$d' ../.cargo/config.toml
+      - name: Install LLD
+        run: sudo apt-get update && sudo apt-get install -y lld
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.99.0"
-      - uses: Swatinem/rust-cache@v2
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           shared-key: config-contract
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v7.1.0
         with:
-          bun-version: "1.4.2"
+          node-version-file: .node-version
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: "1.4.4"
       - name: Use official npm registry
         run: sed -i 's|https://repo.huaweicloud.com/repository/npm/|https://registry.npmjs.org/|g' bun.lock
       - run: bun install --frozen-lockfile --registry=https://registry.npmjs.org
@@ -72,12 +79,12 @@ jobs:
     name: Python and deployment scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - name: Install script checks
         run: |
           python3 -m venv "$RUNNER_TEMP/quality-tools"
           "$RUNNER_TEMP/quality-tools/bin/python" -m pip install \
-            ruff==0.16.10 shellcheck-py==0.11.0.1 shfmt-py==4.2.0 actionlint-py==1.7.12.25
+            ruff==0.17.3 shellcheck-py==0.11.0.1 shfmt-py==4.2.0 actionlint-py==1.7.12.25
           echo "$RUNNER_TEMP/quality-tools/bin" >> "$GITHUB_PATH"
       - run: ruff check tests
       - run: ruff format --check tests
@@ -94,7 +101,9 @@ jobs:
       - run: for script in deploy/*.sh; do bash -n "$script"; done
 
   release:
-    name: Rust (1.99 musl ${{ matrix.arch }})
+    name: Rust (1.98.1 musl ${{ matrix.arch }})
+    env:
+      RUSTFLAGS: "-C target-cpu=${{ matrix.cpu }}"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -102,17 +111,21 @@ jobs:
         include:
           - arch: amd64
             target: x86_64-unknown-linux-musl
+            cpu: x86-64
           - arch: arm64
             target: aarch64-unknown-linux-musl
+            cpu: generic
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
       - name: Use official Cargo registry
-        run: rm .cargo/config.toml
+        run: sed -i '/^\[source\./,$d' .cargo/config.toml
+      - name: Install LLD
+        run: sudo apt-get update && sudo apt-get install -y lld
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.99.0"
+          toolchain: "1.98.1"
       - name: Resolve Rust toolchain
         id: rust
         shell: bash
@@ -121,18 +134,18 @@ jobs:
           echo "sysroot=$(rustc --print sysroot)" >> "$GITHUB_OUTPUT"
       - name: Cache musl standard library
         id: rust-std-cache
-        uses: actions/cache@v6
+        uses: actions/cache@v6.1.0
         with:
           path: ${{ steps.rust.outputs.sysroot }}/lib/rustlib/${{ matrix.target }}
           key: rust-std-${{ runner.os }}-${{ steps.rust.outputs.release }}-${{ matrix.target }}
       - name: Install musl target from official Rust distribution
         if: steps.rust-std-cache.outputs.cache-hit != 'true'
         run: rustup target add ${{ matrix.target }}
-      - uses: mlugg/setup-zig@v2
-      - uses: taiki-e/install-action@v2
+      - uses: mlugg/setup-zig@v2.2.1
+      - uses: taiki-e/install-action@v2.90.1
         with:
-          tool: cargo-zigbuild
-      - uses: Swatinem/rust-cache@v2
+          tool: cargo-zigbuild@0.24.1
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           shared-key: release-${{ matrix.target }}
       - run: cargo zigbuild --locked --release --target ${{ matrix.target }}

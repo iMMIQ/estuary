@@ -109,7 +109,13 @@ pub(super) fn validate_tool_parameters(
         )));
     }
     // Schema validation uses local data with HTTP and file resolution disabled.
-    jsonschema::JSONSchema::compile(schema)
+    // Preserve the former Draft 7 default for tools without an explicit dialect.
+    let mut options = jsonschema::options();
+    if schema.get("$schema").is_none() {
+        options = options.with_draft(jsonschema::Draft::Draft7);
+    }
+    options
+        .build(schema)
         .map(|_| ())
         .map_err(|error| ConversionError::bad_request(format!("{path}: {error}")))
 }
@@ -128,4 +134,45 @@ pub(super) fn contains_json_instruction(messages: &[InputMessage]) -> bool {
             .windows(4)
             .any(|part| part.eq_ignore_ascii_case(b"json"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_tool_parameters;
+    use serde_json::json;
+
+    #[test]
+    fn tool_schemas_preserve_draft7_tuples_and_local_references() {
+        let schema = json!({
+            "type": "object",
+            "definitions": {"name": {"type": "string"}},
+            "properties": {
+                "name": {"$ref": "#/definitions/name"},
+                "coordinates": {"type": "array", "items": [{"type": "number"}]}
+            }
+        });
+        assert!(validate_tool_parameters(&schema, "parameters").is_ok());
+    }
+
+    #[test]
+    fn tool_schemas_honor_an_explicit_dialect() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"coordinates": {"type": "array", "items": [{"type": "number"}]}}
+        });
+        assert!(validate_tool_parameters(&schema, "parameters").is_err());
+    }
+
+    #[test]
+    fn tool_schemas_reject_invalid_types_and_external_references() {
+        for property in [
+            json!({"type": "invalid"}),
+            json!({"$ref": "https://example.invalid/schema.json"}),
+            json!({"$ref": "file:///nonexistent-schema.json"}),
+        ] {
+            let schema = json!({"type": "object", "properties": {"value": property}});
+            assert!(validate_tool_parameters(&schema, "parameters").is_err());
+        }
+    }
 }

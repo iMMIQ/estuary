@@ -1,3 +1,7 @@
+[build]
+rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=lld"]
+
+# Keep registry overrides last so CI and Docker can remove them independently.
 [source.crates-io]
 replace-with = "ustc"
 

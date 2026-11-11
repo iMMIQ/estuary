@@ -18,23 +18,26 @@
     "contract:check": "bun scripts/config-contract.ts --check"
   },
   "dependencies": {
-    "@mantine/core": "^9.7.4",
-    "@mantine/hooks": "^9.7.4",
-    "i18next": "^26.5.11",
-    "lucide-react": "^1.62.0",
+    "@mantine/core": "^9.7.5",
+    "@mantine/hooks": "^9.7.5",
+    "i18next": "^26.7.1",
+    "lucide-react": "^1.68.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
-    "react-i18next": "^17.1.9"
+    "react-i18next": "^17.1.12"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.6.3",
+    "@biomejs/biome": "2.6.5",
     "@playwright/test": "1.64.1",
     "@types/bun": "^1.4.4",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
-    "@vitejs/plugin-react": "^6.1.2",
-    "knip": "6.43.0",
-    "typescript": "^7.0.2",
+    "@vitejs/plugin-react": "^6.2.1",
+    "knip": "6.44.1",
+    "typescript": "6.0.3",
     "vite": "^8.3.5"
+  },
+  "engines": {
+    "node": "26.12.1"
   }
 }
