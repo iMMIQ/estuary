@@ -1,9 +1,9 @@
 # Vendored deepseek-recipe protocol libraries
 
-This directory contains the MIT-licensed `deepseek-recipe` and
-`deepseek-recipe-core` crates from
+This directory contains the MIT-licensed `deepseek-recipe`,
+`deepseek-recipe-core`, and `deepseek-recipe-macros` crates (version 0.2.0) from
 [deepseek-ai/deepseek-recipe](https://github.com/deepseek-ai/deepseek-recipe), pinned
-to revision `8cadfede7063c896b944e7bae05daa3549ae97ea`.
+to revision `935817c66f5d6e64838f419692545f06787e485f`.
 
 Estuary uses the protocol adapters and conversation types to convert Messages
 and Responses clients to a generic Chat Completions backend. Model prompt

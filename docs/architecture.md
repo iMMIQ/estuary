@@ -157,7 +157,12 @@ prefix lookup and node selection. Chat requests retain unknown fields;
 Messages and Responses use the vendored MIT-licensed deepseek-recipe protocol
 adapters and shared conversation types. No DeepSeek prompt encoder, tokenizer,
 image preprocessor, or demo server is used. Upstream revision and the optional
-tokenizer patch are recorded in `vendor/deepseek-recipe/ESTUARY.md`.
+tokenizer patch are recorded in `vendor/deepseek-recipe/ESTUARY.md`. Each requested
+model is registered as an image-capable V4.1 conversion alias; this selects protocol
+conversion rules without changing the backend model name. Original sampling
+parameters and thinking budgets are forwarded to Chat, and the backend applies
+its token limits. System messages retain their role, including images, and literal
+image-token text is distinguished from actual image placeholders.
 
 Buffered and streaming Chat results are reconstructed into the original client
 protocol. Tool history, images, reasoning text and backend usage are preserved.

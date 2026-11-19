@@ -1,5 +1,5 @@
 //! Client protocol adapters. All generation protocols use the Chat backend.
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;
 use deepseek_recipe::{
@@ -11,25 +11,29 @@ use deepseek_recipe::{
         request::ResponsesRequest,
         response::{ResponsesChunkGenerator, ResponsesResponse},
     },
-    request::{ConversationRequest, ConversionOptions, ProtocolRequest, WebSearchBehavior},
-    response::ProtocolResponse,
+    request::{
+        ConversationRequest, ConversionOptions, ModelVersion, ProtocolRequest, ResponseOptions,
+        WebSearchBehavior,
+    },
+    response::{Accumulate, ProtocolResponse},
     stream::{ChunkGenerator, CompletionUsage, FinishReason, OutputChunk, PromptUsage},
-    util::append_delta::AppendDelta,
 };
 use deepseek_recipe_core::{
-    messages::InputMessage,
-    multimodal::{IMAGE_SPECIAL_TOKEN, ImageSource},
+    conversation::Conversation, messages::InputMessage, multimodal::ImageSource, prompt::Prompt,
+    special_tokens::SpecialToken,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{error::GatewayError, sse};
 
+const IMAGE_SPECIAL_TOKEN: &str = SpecialToken::Image.default_str();
+
 #[derive(Clone, Debug)]
 pub(crate) struct Context {
     pub(crate) messages: bool,
     thinking: bool,
-    custom_tools: HashSet<String>,
+    response_options: ResponseOptions,
     tool_names: HashMap<String, String>,
 }
 
@@ -58,21 +62,35 @@ pub(crate) fn prepare(
     }
     let options = ConversionOptions::new()
         .with_default_thinking_mode(false)
-        .with_responses_web_search(WebSearchBehavior::Reject);
+        .with_responses_web_search(WebSearchBehavior::Reject)
+        // Use image-capable protocol conversion for every backend model. No
+        // DeepSeek prompt rendering or sampling defaults are sent to Chat.
+        .with_model_alias(
+            source["model"].as_str().unwrap_or_default(),
+            ModelVersion::DeepseekV41Flash,
+        )
+        .with_thinking_max_tokens_upper_bound(u32::MAX)
+        .with_non_thinking_max_tokens_upper_bound(u32::MAX);
     let messages = endpoint != "responses";
     if endpoint == "messages" && source.get("max_tokens").and_then(Value::as_u64).is_none() {
         return Err(invalid("max_tokens is required for Messages"));
     }
-    let (request, custom_tools) = if messages {
+    let request = if messages {
         let mut request = MessagesRequest::deserialize(source).map_err(invalid)?;
         // Tool selection belongs to Chat/vLLM; recipe applies DeepSeek prompt policies.
         request.tool_choice = None;
-        (request.convert(options).map_err(invalid)?, HashSet::new())
+        request.convert(options).map_err(invalid)?
     } else {
         let mut request = ResponsesRequest::deserialize(source).map_err(invalid)?;
+        let echo = request.echo();
         request.tool_choice = None;
-        let names = request.custom_tool_names();
-        (request.convert(options).map_err(invalid)?, names)
+        // Forward the original output format to Chat. Recipe's constraints
+        // describe DeepSeek prompt rendering and reject schemas (such as an
+        // empty object) that a generic Chat backend can support.
+        request.text = None;
+        let mut converted = request.convert(options).map_err(invalid)?;
+        converted.response_options.responses_echo = Some(echo);
+        converted
     };
     let choice = &source["tool_choice"];
     if request.conversation.tools.is_empty()
@@ -85,7 +103,7 @@ pub(crate) fn prepare(
     let mut context = Context {
         messages,
         thinking: request.conversation.thinking_mode,
-        custom_tools,
+        response_options: request.response_options.clone(),
         tool_names: HashMap::new(),
     };
     let chat = serialize_chat(&request, source, &mut context)?;
@@ -139,11 +157,22 @@ fn reject_lossy_input(value: &Value) -> Result<(), GatewayError> {
     Ok(())
 }
 
-fn content(text: &str, images: &[ImageSource]) -> Result<Value, GatewayError> {
+fn content(prompt: &Prompt, images: &[ImageSource]) -> Result<Value, GatewayError> {
+    let text = prompt.as_str();
     if images.is_empty() {
         return Ok(Value::String(text.into()));
     }
-    let parts: Vec<_> = text.split(IMAGE_SPECIAL_TOKEN).collect();
+    // Only explicit placeholders denote images; the same spelling in user
+    // text is ordinary content in recipe 0.2.
+    let mut parts = Vec::new();
+    let mut offset = 0;
+    for range in prompt.special_ranges() {
+        if &text[range.clone()] == IMAGE_SPECIAL_TOKEN {
+            parts.push(&text[offset..range.start]);
+            offset = range.end;
+        }
+    }
+    parts.push(&text[offset..]);
     if parts.len() != images.len() + 1 {
         return Err(invalid("image placeholder count mismatch"));
     }
@@ -237,11 +266,18 @@ fn serialize_chat(
     let mut messages = Vec::new();
     for message in &request.conversation.messages {
         messages.push(match message {
-            InputMessage::System { content } => json!({"role":"system","content":content}),
+            InputMessage::System { content: text, image_sources, .. } => {
+                // Historical tool declarations are already present in the
+                // conversation's tool list; Chat needs no empty system turn.
+                if text.is_empty() && image_sources.is_empty() {
+                    continue;
+                }
+                json!({"role":"system","content":content(text,image_sources)?})
+            },
             InputMessage::User { content: text, image_sources } => json!({"role":"user","content":content(text,image_sources)?}),
             InputMessage::Tool { content: text, image_sources, tool_call_id } => json!({"role":"tool","content":content(text,image_sources)?,"tool_call_id":tool_call_id}),
             InputMessage::LatestReminder { content } => json!({"role":"user","content":format!("<system-reminder>\n{content}\n</system-reminder>")}),
-            InputMessage::Assistant { content, reasoning_content, tool_calls } => {
+            InputMessage::Assistant { content, reasoning_content, tool_calls, .. } => {
                 let mut value = json!({"role":"assistant","content":content});
                 if let Some(reasoning) = reasoning_content { value["reasoning_content"] = reasoning.clone().into(); }
                 if let Some(calls) = tool_calls {
@@ -328,7 +364,7 @@ fn serialize_chat(
     if explicit_thinking {
         chat["chat_template_kwargs"]["enable_thinking"] = context.thinking.into();
     }
-    if let Some(budget) = options.thinking_budget_tokens {
+    if let Some(budget) = source["thinking"]["budget_tokens"].as_u64() {
         chat["chat_template_kwargs"]["thinking_budget"] = budget.into();
     }
     if let Some(effort) = source["reasoning"]
@@ -423,11 +459,11 @@ impl Usage {
 enum Generator {
     Messages {
         generator: MessagesChunkGenerator,
-        response: MessagesResponse,
+        response: Box<MessagesResponse>,
     },
     Responses {
         generator: Box<ResponsesChunkGenerator>,
-        response: ResponsesResponse,
+        response: Box<ResponsesResponse>,
     },
 }
 #[derive(Default)]
@@ -457,15 +493,23 @@ impl StreamConverter {
         let generator = if context.messages {
             Generator::Messages {
                 generator: MessagesChunkGenerator::new(id.clone(), model.clone(), false),
-                response: MessagesResponse::new(id, model, 0, 0, 0),
+                response: Box::new(MessagesResponse::new(id, model, 0, 0, 0)),
             }
         } else {
+            // The generator only needs the resolved response settings. Keep
+            // request history out of the response context and open reasoning
+            // blocks only when the Chat backend actually supplies reasoning.
+            let mut request =
+                ConversationRequest::new(Conversation::default(), ModelVersion::DeepseekV41Flash);
+            request.conversation.thinking_mode = false;
+            request.response_options = context.response_options.clone();
             Generator::Responses {
-                generator: Box::new(
-                    ResponsesChunkGenerator::new(id.clone(), model.clone())
-                        .with_custom_tool_names(context.custom_tools.clone()),
-                ),
-                response: ResponsesResponse::new(id, model, 0, 0, 0),
+                generator: Box::new(ResponsesRequest::chunk_generator(
+                    &request,
+                    id.clone(),
+                    model.clone(),
+                )),
+                response: Box::new(ResponsesResponse::new(id, model, 0, 0, 0)),
             }
         };
         Self {
@@ -488,9 +532,9 @@ impl StreamConverter {
                 response,
             } => {
                 for event in generator.generate(chunk).await {
-                    let name = MessagesResponse::chunk_event_type(&event).unwrap_or_default();
+                    let name = MessagesResponse::sse_event_name(&event).unwrap_or_default();
                     let value = serde_json::to_value(&event).map_err(|_| GatewayError::Internal)?;
-                    response.append(event);
+                    response.accumulate(event);
                     values.push((name, value));
                 }
             }
@@ -499,9 +543,9 @@ impl StreamConverter {
                 response,
             } => {
                 for event in generator.generate(chunk).await {
-                    let name = ResponsesResponse::chunk_event_type(&event).unwrap_or_default();
+                    let name = ResponsesResponse::sse_event_name(&event).unwrap_or_default();
                     let value = serde_json::to_value(&event).map_err(|_| GatewayError::Internal)?;
-                    response.append(event);
+                    response.accumulate(event);
                     values.push((name, value));
                 }
             }
@@ -530,7 +574,7 @@ impl StreamConverter {
         self.started = true;
         self.emit(OutputChunk::Start {
             system_fingerprint: None,
-            usage: PromptUsage {
+            prompt_usage: PromptUsage {
                 prompt_tokens: self.usage.input,
                 prompt_cache_hit_tokens: self.usage.cached,
             },
@@ -586,10 +630,12 @@ impl StreamConverter {
                             self.emit(if reasoning {
                                 OutputChunk::Reasoning {
                                     content: text.into(),
+                                    logprobs: None,
                                 }
                             } else {
-                                OutputChunk::Raw {
+                                OutputChunk::Content {
                                     content: text.into(),
+                                    logprobs: None,
                                 }
                             })
                             .await?,
@@ -647,17 +693,14 @@ impl StreamConverter {
                 .cloned()
                 .unwrap_or(tool.name);
             events.extend(
-                self.emit(OutputChunk::ToolCall {
-                    tool_name: name,
-                    arguments: String::new(),
-                })
-                .await?,
+                self.emit(OutputChunk::ToolCallNamed { tool_name: name })
+                    .await?,
             );
             // Streaming clients assemble arguments from delta events, even
             // when the Chat backend supplied the complete JSON in one chunk.
             events.extend(
-                self.emit(OutputChunk::ToolArgumentsDelta {
-                    content: tool.arguments,
+                self.emit(OutputChunk::ToolCallArgumentsDelta {
+                    arguments: tool.arguments,
                 })
                 .await?,
             );
@@ -667,10 +710,11 @@ impl StreamConverter {
         }
         events.extend(
             self.emit(OutputChunk::Finish {
-                reason,
+                finish_reason: reason,
                 stop_sequence: None,
-                usage: CompletionUsage {
+                completion_usage: CompletionUsage {
                     completion_tokens: self.usage.output,
+                    reasoning_tokens: Some(self.usage.reasoning),
                 },
             })
             .await?,
@@ -734,13 +778,14 @@ mod tests {
             json!({"role":"system","content":"stable"})
         );
         assert_eq!(chat["messages"][2]["reasoning_content"], "reason");
-        assert_eq!(chat["messages"][3]["role"], "user");
+        assert_eq!(chat["messages"][3]["role"], "system");
         assert!(
             chat["messages"][3]["content"]
                 .to_string()
                 .contains("new reminder")
         );
         assert_eq!(chat["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(chat["chat_template_kwargs"]["thinking_budget"], 32);
         assert!(!chat.to_string().contains("cache_control"));
         let mut other = source.clone();
         other["system"][0]
@@ -758,6 +803,46 @@ mod tests {
         assert_eq!(chat["parallel_tool_calls"], false);
         assert_eq!(chat["stop"], json!(["END"]));
         assert_eq!(chat["temperature"], source["temperature"]);
+    }
+
+    #[test]
+    fn generic_backends_keep_sampling_and_token_limits() {
+        for endpoint in ["messages", "responses"] {
+            let mut source = json!({"model":"custom-model","temperature":0.4,"top_p":0.7});
+            if endpoint == "messages" {
+                source["max_tokens"] = 500_000.into();
+                source["thinking"] = json!({"type":"enabled","budget_tokens":32});
+                source["messages"] = json!([{"role":"user","content":"hi"}]);
+            } else {
+                source["max_output_tokens"] = 500_000.into();
+                source["reasoning"] = json!({"effort":"high"});
+                source["input"] = "hi".into();
+            }
+            let (chat, _) = prepare(endpoint, source).unwrap();
+            assert_eq!(chat["model"], "custom-model");
+            assert_eq!(chat["temperature"], 0.4);
+            assert_eq!(chat["top_p"], 0.7);
+            assert_eq!(chat["max_tokens"], 500_000);
+        }
+    }
+
+    #[test]
+    fn system_images_and_literal_image_tokens_survive_conversion_for_every_model() {
+        for model in ["custom-vision", "DeepSeek-V4-Pro"] {
+            let source = json!({"model":model,"input":[{"role":"developer","content":[
+                {"type":"input_text","text":format!("literal {IMAGE_SPECIAL_TOKEN}")},
+                {"type":"input_image","image_url":"https://example.com/a.png"},
+                {"type":"input_text","text":"after"}
+            ]},{"role":"user","content":"describe"}]});
+            let (chat, _) = prepare("responses", source).unwrap();
+            assert_eq!(chat["model"], model);
+            assert_eq!(chat["messages"][0]["role"], "system");
+            let blocks = &chat["messages"][0]["content"];
+            assert_eq!(blocks[0]["text"], format!("literal {IMAGE_SPECIAL_TOKEN}"));
+            assert_eq!(blocks[1]["image_url"]["url"], "https://example.com/a.png");
+            assert_eq!(blocks[2]["text"], "after");
+            assert_eq!(chat["messages"][1]["content"], "describe");
+        }
     }
 
     #[test]
@@ -809,7 +894,7 @@ mod tests {
             let ctx = Context {
                 messages,
                 thinking: true,
-                custom_tools: HashSet::new(),
+                response_options: ResponseOptions::default(),
                 tool_names: HashMap::new(),
             };
             let body =
@@ -851,7 +936,7 @@ mod tests {
             let ctx = Context {
                 messages,
                 thinking: false,
-                custom_tools: HashSet::new(),
+                response_options: ResponseOptions::default(),
                 tool_names: HashMap::new(),
             };
             let mut converter = StreamConverter::new(ctx.clone(), "public".into());
@@ -917,7 +1002,7 @@ mod transport_tests {
         let context = Context {
             messages: true,
             thinking: false,
-            custom_tools: HashSet::new(),
+            response_options: ResponseOptions::default(),
             tool_names: HashMap::new(),
         };
         let mut converter = StreamConverter::new(context, "m".into());
@@ -967,6 +1052,30 @@ mod compatibility_tests {
             name
         );
         assert_eq!(replayed["messages"][2]["tool_call_id"], call["call_id"]);
+    }
+
+    #[tokio::test]
+    async fn responses_echo_original_tool_choice_in_buffered_and_streamed_results() {
+        let source = json!({"model":"generic","input":"hi","tool_choice":"required",
+            "temperature":0.3,"max_output_tokens":64,
+            "tools":[{"type":"function","name":"run","parameters":{"type":"object"}}]});
+        let (_, context) = prepare("responses", source).unwrap();
+        let mut converter = StreamConverter::new(context.unwrap(), "public".into());
+        let reply = json!({"choices":[{"message":{"tool_calls":[{"function":{"name":"run","arguments":"{}"}}]},"finish_reason":"tool_calls"}]});
+        converter.push(&reply).await.unwrap();
+        let events = converter.finish().await.unwrap();
+        let completed: Value = events
+            .iter()
+            .map(|event| serde_json::from_str::<Value>(event.data()).unwrap())
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let buffered: Value = serde_json::from_slice(&converter.response().unwrap()).unwrap();
+        for response in [&completed["response"], &buffered] {
+            assert_eq!(response["model"], "public");
+            assert_eq!(response["tool_choice"], "required");
+            assert_eq!(response["max_output_tokens"], 64);
+            assert_eq!(response["tools"][0]["name"], "run");
+        }
     }
 
     #[tokio::test]
@@ -1078,7 +1187,7 @@ mod tool_stream_tests {
             let context = Context {
                 messages,
                 thinking: false,
-                custom_tools: HashSet::new(),
+                response_options: ResponseOptions::default(),
                 tool_names: HashMap::new(),
             };
             let mut converter = StreamConverter::new(context, "public".into());
