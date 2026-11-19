@@ -121,6 +121,23 @@ local nonce tool for unattended execution.
 Add `--images` when testing against a local vision model to include image input
 and MCP image-result replay. Both scripts use an isolated `CODEX_HOME`.
 
+For native Goals with Codex **0.170.0**, run:
+
+```bash
+python3 tests/codex_goal_e2e.py
+```
+
+This starts the real Codex app-server against Estuary and a strict Chat-only mock.
+It checks native goal creation, paused state, resume, autonomous continuation
+across two turns, `get_goal`/`update_goal`, real MCP nonce execution, completion,
+clearing, and a token budget that stops further turns. Cached input tokens are
+excluded from goal budget usage. Reports and original/converted payloads remain
+under `target/codex-goal-e2e/runs/`.
+
+Codex's named `agent.goal_objective` context has no answered call ID. Estuary
+preserves its name, namespace and contents as user context; it does not emit an
+unpaired Chat tool result. Ordinary tool results retain their call IDs.
+
 ## OpenCode v2
 
 Run Chat and Responses with the same server:

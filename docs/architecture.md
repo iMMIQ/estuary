@@ -169,6 +169,10 @@ protocol. Tool history, images, reasoning text and backend usage are preserved.
 Protocol output and tool argument accumulation is capped at 16 MiB per response.
 Parallel tool argument fragments are buffered until tool completion.
 Namespaces are encoded as collision-checked Chat names and restored in Responses.
+Named Responses tool outputs without a call ID, including Codex Goals'
+`agent.goal_objective`, become user context with their name and namespace. Chat
+tool messages always answer a preceding call; standalone context retains text
+and images without inventing a tool call.
 The gateway does not condition protocol conversion on User-Agent or model family.
 Completions and Embeddings retain their existing endpoints.
 

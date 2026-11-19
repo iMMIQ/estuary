@@ -8,7 +8,7 @@ use deepseek_recipe::{
         response::{MessagesChunkGenerator, MessagesResponse},
     },
     openai::responses::{
-        request::ResponsesRequest,
+        request::{ResponsesInput, ResponsesRequest},
         response::{ResponsesChunkGenerator, ResponsesResponse},
     },
     request::{
@@ -88,6 +88,7 @@ pub(crate) fn prepare(
         // describe DeepSeek prompt rendering and reject schemas (such as an
         // empty object) that a generic Chat backend can support.
         request.text = None;
+        normalize_responses_context(&mut request, source)?;
         let mut converted = request.convert(options).map_err(invalid)?;
         converted.response_options.responses_echo = Some(echo);
         converted
@@ -111,6 +112,44 @@ pub(crate) fn prepare(
         context.thinking = false;
     }
     Ok((chat, Some(context)))
+}
+
+fn normalize_responses_context(
+    request: &mut ResponsesRequest,
+    source: &Value,
+) -> Result<(), GatewayError> {
+    let Some(ResponsesInput::Items(items)) = &mut request.input else {
+        return Ok(());
+    };
+    let Some(originals) = source["input"].as_array() else {
+        return Ok(());
+    };
+    for (item, original) in items.iter_mut().zip(originals) {
+        if original["type"] != "function_call_output" || !original["call_id"].is_null() {
+            continue;
+        }
+        // Codex goals inject named context (agent.goal_objective) without an
+        // answered call. Chat requires every tool result to have a call ID;
+        // retain this context and its provenance as user content instead.
+        let name = original["name"].as_str().unwrap_or("tool");
+        let name = original["namespace"].as_str().map_or_else(
+            || name.to_owned(),
+            |namespace| format!("{namespace}::{name}"),
+        );
+        let mut blocks = vec![json!({
+            "type":"input_text", "text":format!("Tool output ({name}):")
+        })];
+        match &original["output"] {
+            Value::String(text) => blocks.push(json!({"type":"input_text","text":text})),
+            Value::Array(parts) => blocks.extend(parts.iter().cloned()),
+            _ => return Err(invalid("tool output must be a string or content blocks")),
+        }
+        *item = serde_json::from_value(json!({
+            "type":"message", "role":"user", "content":blocks
+        }))
+        .map_err(invalid)?;
+    }
+    Ok(())
 }
 
 fn reject_lossy_input(value: &Value) -> Result<(), GatewayError> {
@@ -275,7 +314,8 @@ fn serialize_chat(
                 json!({"role":"system","content":content(text,image_sources)?})
             },
             InputMessage::User { content: text, image_sources } => json!({"role":"user","content":content(text,image_sources)?}),
-            InputMessage::Tool { content: text, image_sources, tool_call_id } => json!({"role":"tool","content":content(text,image_sources)?,"tool_call_id":tool_call_id}),
+            InputMessage::Tool { content: text, image_sources, tool_call_id: Some(tool_call_id) } => json!({"role":"tool","content":content(text,image_sources)?,"tool_call_id":tool_call_id}),
+            InputMessage::Tool { tool_call_id: None, .. } => return Err(invalid("Chat tool results require a tool call ID")),
             InputMessage::LatestReminder { content } => json!({"role":"user","content":format!("<system-reminder>\n{content}\n</system-reminder>")}),
             InputMessage::Assistant { content, reasoning_content, tool_calls, .. } => {
                 let mut value = json!({"role":"assistant","content":content});
@@ -854,6 +894,48 @@ mod tests {
         assert_eq!(
             chat["response_format"]["json_schema"]["schema"],
             json!({"type":"object"})
+        );
+    }
+
+    #[test]
+    fn codex_goal_context_retains_its_name_without_an_unpaired_chat_tool_result() {
+        for call_id in [None, Some(Value::Null)] {
+            let mut item = json!({"type":"function_call_output","namespace":"agent",
+                "name":"goal_objective","output":"Finish the verified task"});
+            if let Some(value) = call_id {
+                item["call_id"] = value;
+            }
+            let (chat, _) = prepare("responses", json!({"model":"m","input":[item]})).unwrap();
+            assert_eq!(chat["messages"][0]["role"], "user");
+            assert_eq!(
+                chat["messages"][0]["content"],
+                "Tool output (agent::goal_objective):\n\nFinish the verified task"
+            );
+            assert!(chat["messages"][0].get("tool_call_id").is_none());
+        }
+    }
+
+    #[test]
+    fn standalone_tool_context_keeps_images_and_does_not_bypass_pending_calls() {
+        let item = json!({"type":"function_call_output","name":"context","output":[
+            {"type":"input_text","text":"before"},
+            {"type":"input_image","image_url":"https://example.com/a.png"},
+            {"type":"input_text","text":"after"}
+        ]});
+        let (chat, _) = prepare("responses", json!({"model":"m","input":[item.clone()]})).unwrap();
+        assert_eq!(chat["messages"][0]["role"], "user");
+        let blocks = &chat["messages"][0]["content"];
+        assert_eq!(blocks[0]["text"], "Tool output (context):\n\nbefore");
+        assert_eq!(blocks[1]["image_url"]["url"], "https://example.com/a.png");
+        assert_eq!(blocks[2]["text"], "after");
+        assert!(
+            prepare(
+                "responses",
+                json!({"model":"m","input":[
+                    {"type":"function_call","call_id":"pending","name":"run","arguments":"{}"},item
+                ]})
+            )
+            .is_err()
         );
     }
 
