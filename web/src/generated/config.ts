@@ -33,6 +33,10 @@ export type ServerConfig = {
   max_buffered_response_bytes: number;
   expose_node_header: boolean;
   log_json: boolean;
+  public_api_keys: Array<string>;
+  public_rpm_limit: number | null;
+  trust_proxy_headers: boolean;
+  observability_max_scopes: number;
 };
 
 export type SessionLogConfig = {
