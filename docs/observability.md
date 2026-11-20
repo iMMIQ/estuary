@@ -1,149 +1,169 @@
-# Dashboard observability
+# Observability & Metrics
 
-[Documentation index](README.md) | [Operations](operations.md)
+[Documentation Index](README.md) | [API & Clients](api.md) | [Session Logging](session-logging.md)
 
-The overview, upstream list, and node metrics tab share process-local operational
-statistics. Collection works even when session logging is disabled. It does not
-query session-log SQLite tables or store prompts and responses.
+Estuary maintains bounded, process-local operational telemetry for the embedded dashboard, `GET /admin/api/observability`, and OpenMetrics `GET /metrics`. Collection is always active, never reads session-log SQLite tables, and never stores prompt or response content.
 
-## Rates and history
+---
 
-The server samples once per second independently of browsers. Rates include the
-raw counter delta divided by actual monotonic elapsed time, a time-aware EWMA
-with a 10-second half-life, and a trailing 60-second mean. Browser refreshes do
-not change smoothing. Gateway scopes use their known zero-counter baseline for
-the first EWMA update, so a newly created model does not initialize at its first
-burst rate. Engine rates warm up from the first valid counter delta. The UI
-normally polls every five seconds and pauses in hidden tabs.
+## Sampling, Smoothing & History
 
-History retains up to 180 five-second points, covering 15 minutes. Charts share
-a time axis and inspector. Output throughput also shows the highest raw
-one-second sample within each point; load history retains sampled peaks.
-In-flight peaks additionally observe request starts and finishes, preserving
-requests shorter than the sampling interval. These are observed peaks, not a
-continuous measurement of upstream gauges. Missing observations and sampling
-gaps remain gaps. Wall-clock timestamps label history; rates and elapsed times
-use the monotonic clock. A backwards wall-clock jump clears chart history.
+- **Server-side 1-second sampler**: Independently of browser connections, Estuary samples counters every second using the monotonic clock.
+- **Rate variants**: Each throughput rate reports:
+  - `raw`: counter delta divided by actual monotonic elapsed seconds;
+  - `smoothed`: time-aware EWMA with a 10-second half-life (gateway scopes start from a known `0.0` baseline to avoid cold-start spikes; engine rates warm up from the first valid delta);
+  - `mean_60s`: trailing 60-second average.
+- **Windowed distributions (`1m` / `5m` / `15m`)**: Counters and histograms are stored in 10-second buckets (up to 90 buckets per scope). Once a full window exists, the oldest partial bucket is excluded, so `observed_seconds` may be up to 10 seconds shorter than the requested window.
+- **15-minute history charts**: Retains up to 180 five-second points (`900` seconds). Each point stores smoothed rates, rolling 5-minute `ttft_p95` and `queue_p95`, live pressure, and sampled peaks (`output`, `active`, `queued`, `waiting`, `kv_usage`). In-flight `active` peaks also track every request start/completion between ticks so sub-second bursts remain visible. A backward wall-clock jump clears chart history.
+- **Histograms**: 80 fixed bins (`0`, geometric boundaries starting at `0.0005` multiplying by `1.25`, and `+Inf` overflow). Units are seconds except `generation_rate` (tokens/s). Quantiles (`p50`, `p95`) are interpolated and return `null` if the rank falls in the overflow bin.
+- **Dashboard refresh**: The UI refreshes via `/admin/api/events` SSE notifications on config changes plus 5-second polling when visible (pausing in hidden tabs and backing off exponentially on failure while marking stale data).
 
-Select 1, 5, or 15 minutes for counters, ratios, and distributions. Counters and
-histograms use 10-second buckets. The oldest partial bucket is excluded once a
-full window is available, so effective coverage can be up to 10 seconds shorter
-than the selected window. `observed_seconds` reports this coverage, including
-startup and new-node warmup. History charts always show 15 minutes; their
-latency series use rolling five-minute P95s.
+---
 
-## Sources and definitions
+## Metric Definitions
+
+Primary gateway request telemetry covers `POST` to `/v1/chat/completions`, `/v1/responses`, `/v1/completions`, `/v1/messages`, and `/v1/embeddings`. Health probes, `/v1/models*`, and `/v1/messages/count_tokens` are excluded. Embeddings contribute request and input-token counts, not generation-speed samples. Failures before model attribution count in fleet totals without a model scope.
 
 | Metric | Definition |
 | --- | --- |
-| Gateway incoming / successful requests per second | Logical downstream request starts / final successes. |
-| Gateway input / output tokens per second | Reported usage, booked when the downstream response finishes or is cancelled. It can lag live engine generation. |
-| Gateway TTFT | Gateway receipt to the first observed text, reasoning, or tool output. Includes admission and routing waits; excludes the final network hop to the client. Streaming only. |
-| Upstream TTFT | Upstream attempt start to its first observed generation event. Streaming only. |
-| Full response lifetime | Gateway receipt until the response body is exhausted or dropped, including failures and cancellations. This is a server-side observation, not client acknowledgement. |
-| Admission wait | Time waiting for gateway ingress admission, including cancellation while waiting. |
-| Routing wait | Time spent selecting a usable node or waiting for its capacity, summed across attempts. |
-| TPOT / per-request generation speed | Provider mean ITL when available; otherwise estimated first-to-last generation time divided by reported output tokens minus one, for a single generation. Speed is its reciprocal. SSE chunks are never counted as tokens. |
-| In-flight requests | Starts minus final outcomes, including ingress waits and response delivery. |
-| Occupied upstream slots | Node lease occupancy, separately from the whole downstream request lifetime. |
-| Failure / cancellation / unknown / success ratios | Each final outcome divided by all final outcomes within the selected window. |
-| Retries | Retry attempts, plus the fraction of completed logical requests that retried at least once. |
-| Output usage coverage | Requests with reported output usage divided by completed generation requests. Embeddings do not lower this ratio. |
-| Gateway cached-token ratio | Reported cached tokens divided by input tokens, using only requests reporting both. |
-| Exact / approximate routing matches | Routing affinity decisions, independently of actual engine cache hits. |
+| Incoming / completed req/s | Logical downstream request starts / final successes. |
+| Gateway input / output tok/s | Upstream-reported token usage booked at downstream completion or cancellation (can lag live engine generation). |
+| Gateway TTFT (`ttft`) | Gateway receipt to first observed text, reasoning, or tool generation event. Includes admission and routing wait; excludes final hop to client. Streaming only. |
+| Upstream TTFT (`upstream_ttft`) | Upstream attempt dispatch to first observed generation event. Streaming only. |
+| Full response lifetime (`duration`) | Gateway receipt until downstream body is exhausted or dropped (includes failures and cancellations). |
+| Admission wait (`ingress`) | Time waiting for ingress count/byte admission (including cancellations while waiting). |
+| Routing wait (`queue`) | Time selecting a node or waiting for node concurrency permits, summed across attempts. |
+| TPOT / generation speed (`tpot`, `generation_rate`) | Provider mean ITL when reported; otherwise first-to-last generation time divided by `(output_tokens - 1)` for single completions (`generation_rate = 1 / tpot`). SSE chunks are never counted as tokens. |
+| In-flight requests (`active`) | Started minus finalized requests (covers ingress wait through response delivery). |
+| Occupied upstream slots (`upstream_active`) | Active node concurrency leases (excludes ingress wait). |
+| Outcome ratios | `success`, `failed`, `cancelled`, `unknown` each divided by total finalized outcomes in the window. |
+| Retries | Total retry attempts plus fraction of finalized logical requests that retried at least once. |
+| Output usage coverage | Completed generation requests with reported output tokens divided by all completed generation requests. |
+| Gateway cached-token ratio | Reported `cached_tokens / input_tokens` across requests reporting both. |
+| Exact / approximate routing matches | Routing affinity decisions, independent of actual upstream KV hit rates. |
 
-Primary request statistics include POST chat completions, completions, responses,
-messages, and embeddings. Health checks, model discovery, and token-count utility
-requests are excluded. Embeddings contribute request and input-token statistics,
-but not generation-speed samples. Failures before model attribution appear in
-fleet totals without being assigned to a model.
+**Streaming outcomes**: HTTP `200` alone does not establish success. Recognized terminal events mark `success`, explicit stream errors mark `failed`, downstream drops mark `cancelled`, and unrecognized EOF marks `unknown`. Gateway/model scopes count logical requests once; node scopes count attempts (including failed attempts before retry), attributing final latency and usage to the final node.
 
-An HTTP 200 is insufficient to establish streaming success. Recognized terminal
-events establish success, explicit stream errors establish failure, downstream
-body drops establish cancellation, and unrecognized stream EOF remains unknown.
-Gateway/model counters count logical requests once. Node counters count attempts,
-including failed attempts before retries. Request latency and usage samples are
-attributed to the final node; they are not measurements of every retry attempt.
+### Engine Telemetry (vLLM) & Missing Data
 
-Distributions expose P50, P95, mean, sample count, and overflow count. They merge
-fixed histograms rather than averaging node percentiles. Each histogram has 80
-bins: zero, geometric finite boundaries starting at 0.0005 and increasing by
-1.25, and an overflow bin. Units are seconds except generation speed, which is
-tokens per second. Quantiles are interpolated estimates and become unavailable
-if the requested rank lies in overflow. Low TTFT sample counts are labelled.
+The vLLM engine section reflects **all traffic processed by the vLLM engine**, including traffic bypassing Estuary. It aggregates per-series counter deltas before summing across nodes so counter resets (for example an engine restart) reset the baseline without spiking throughput. Fleet KV-cache usage is the maximum across fresh reporting nodes.
 
-## Engine telemetry and missing data
+- `null` means unavailable, unsupported, stale, resetting, or not yet sampled (never fabricated as `0`).
+- Valid idle observations report `0` and decay EWMA toward zero.
+- Estuary does not inject `stream_options.include_usage` into native passthrough requests; clients or upstreams must report usage for usage-dependent metrics.
 
-The separate vLLM section includes **all traffic seen by the engine**, including
-traffic bypassing this gateway. It shows input/output token rates, successful
-request rates, running/waiting work, KV-cache usage, recent prefix-cache ratio,
-preemptions per minute, reporting coverage, sample age, and observed resets.
-Fleet KV-cache usage is the maximum across fresh reporting nodes.
+---
 
-Counter deltas are calculated per labelled engine series before node/fleet
-aggregation. A counter decrease resets its baseline; the first sample and stale
-gaps do not create throughput spikes. The cache ratio uses paired counter deltas
-from the last minute, rather than process-lifetime totals. Legacy node rate and
-cache-ratio fields use these same smoothed/recent values; cumulative counters
-remain available separately.
+## Observability API
 
-`null` means unavailable, unsupported, stale, resetting, or not yet sampled.
-Valid idle samples are zero and decay the EWMA. Missing usage is not estimated
-as zero. Reporters are counted separately for input, output, and requests; fleet
-rates can be partial when nodes do not report. Node panels retain telemetry age
-and expose stale coverage. Failed dashboard refreshes retain the previous data
-with an explicit stale indicator.
+`GET /admin/api/observability` uses standard management authentication:
 
-The gateway does not inject usage options into native passthrough requests.
-Clients/providers must return usage for usage-dependent metrics. Existing
-protocol adapters retain their existing usage behavior.
-
-## API, metrics, and limits
-
-`GET /admin/api/observability` uses existing admin authentication. Query options:
-
-- `scope=fleet|node|model` (default `fleet`);
-- `id=<node ID or public model name>` for node/model scope;
-- `window=60|300|900` seconds (default `300`).
-
-The response includes fleet, node, and model summaries and only the selected
-scope's history. Unknown selections return `selected: null` and empty history;
-invalid scopes/windows return HTTP 400. For example:
+| Query parameter | Allowed values | Default |
+| --- | --- | --- |
+| `scope` | `fleet`, `node`, `model` | `fleet` |
+| `id` | Node ID or public model name (required when `scope != fleet`, max 1024 bytes) | `""` |
+| `window` | `60`, `300`, `900` (seconds) | `300` |
 
 ```bash
 curl -H "Authorization: Bearer $ESTUARY_ADMIN_TOKEN" \
-  'http://127.0.0.1:9090/admin/api/observability?scope=model&id=chat&window=300'
+  'http://127.0.0.1:9090/admin/api/observability?scope=model&id=gateway-chat&window=300'
 ```
 
-`GET /metrics` exports all operational metrics through a single
-`prometheus-client` OpenMetrics registry (including bounded `scope` and `name`
-counters from observability, session-log status counters/gauges, and core
-gateway/node/queue/routing families):
+Invalid `scope` or `window` returns `400`. Unknown node/model IDs return `200` with `selected: null` and empty `history`.
 
-- `estuary_gateway_{started,success,failed,cancelled,unknown,retries,input_tokens,output_tokens,cached_tokens}_total{scope,name}`;
-- `estuary_session_log_*` counters and gauges for session-log capture health;
-- core gateway request, upstream attempt, node concurrency/health/vLLM telemetry,
-  queue/memory, and latency histogram families.
+---
 
-Every metric family appears with a single `# TYPE` declaration and a single
-terminating `# EOF`. Full windowed distributions, smoothed rates, and 15-minute
-history series are served via `GET /admin/api/observability`.
+## OpenMetrics `/metrics` Reference
 
-Collection retains at most 32 node scopes and 32 model scopes, plus fleet totals.
-Identifiers are limited to 1,024 bytes, window storage to 90 ten-second buckets
-per scope, and history to 180 points per scope. Each configured vLLM node tracks
-up to 512 relevant labelled counter series and 600 recent delta samples. Larger
-engine series sets report unavailable rates instead of a silently truncated sum.
-The dashboard labels dimension limits; fleet totals still include every request.
-Memory and scrape size therefore depend on these bounds rather than request
-volume. Removed nodes retain their bounded process-local history.
+`GET /metrics` exports a single `prometheus-client` OpenMetrics 1.0.0 registry (single `# TYPE` per family, terminating `# EOF`). All names carry the `estuary_` prefix; credentials, request IDs, and session IDs never appear as labels.
 
-Gateway restart clears these statistics and changes `instance_id`. Replacing a
-node configuration changes its instance and resets its node statistics; old
-in-flight completions cannot contaminate the replacement. Fleet/model results
-still account for those requests. Separate gateway processes have separate
-histories: use an external metrics store for persistence or cross-process views.
+### Request, Attempt & Stream Counters
 
-Regression tests cover usage, scope filtering, authentication, response lifetime,
-stream errors/EOF/cancellation, retry attribution, node replacement, coverage,
-histogram merging, bounds, resets, and desktop/mobile dashboard interactions.
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `estuary_requests_total` | Counter | `endpoint`, `status` | Downstream responses created (streaming bodies may still be in progress). |
+| `estuary_upstream_attempts_total` | Counter | `node`, `outcome` | Upstream attempts by node and outcome (`200`, `transport_error`, `header_timeout`, etc.). |
+| `estuary_retries_total` | Counter | `node`, `outcome` | Retry attempts by failed node and reason (`connect_error`, HTTP status, `body_error`). |
+| `estuary_tokenization_outcomes_total` | Counter | `outcome` | Exact routing tokenization decisions/results (`cache_hit`, `upstream_success`, `prefix_gate`, `directory_unavailable`, `deadline`, `upstream_error`, etc.). |
+| `estuary_stream_cancellations_total` | Counter | `node` | Streaming bodies dropped before upstream EOF (usually client cancellation). |
+| `estuary_stream_errors_total` | Counter | `node` | Errors reading upstream response bodies. |
+
+### Node State, Workload & vLLM Gauges
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `estuary_node_active` | Gauge | `node` | Current in-flight leases on the node. |
+| `estuary_node_pending_prefill_tokens` | Gauge | `node` | Estimated uncached prefill tokens held by local leases. |
+| `estuary_node_pending_decode_tokens` | Gauge | `node` | Estimated decode tokens held by local leases. |
+| `estuary_node_health` | Gauge | `node` | `0=starting`, `1=healthy`, `2=degraded`, `3=unhealthy`. |
+| `estuary_node_accepting_requests` | Gauge | `node` | `1` if serving, healthy, provider-ready, and allowed by circuit breaker; else `0`. |
+| `estuary_node_circuit_state` | Gauge | `node` | `0=closed`, `1=open`, `2=half_open`. |
+| `estuary_node_provider_ready` | Gauge | `node` | `1` if provider compatibility permits routing; else `0`. |
+| `estuary_node_provider_state` | Gauge | `node` | `0=generic`, `1=checking`, `2=ready`, `3=incompatible`. |
+| `estuary_node_upstream_running` | Gauge | `node` | Latest fresh vLLM running-request count. |
+| `estuary_node_upstream_waiting` | Gauge | `node` | Latest fresh vLLM waiting-request count. |
+| `estuary_node_kv_cache_usage_ratio` | Gauge | `node` | Latest vLLM KV-cache utilization ratio (`0.0`–`1.0`). |
+| `estuary_node_exact_kv_blocks` | Gauge | `node` | Blocks tracked in the node's exact KV directory. |
+| `estuary_node_exact_kv_bytes` | Gauge | `node` | Accounted memory bytes of the node's exact KV directory. |
+| `estuary_node_exact_kv_ready` | Gauge | `node` | `1` if the node's exact KV directory is authoritative; else `0`. |
+
+### Queue, Connection & Buffer Gauges
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `estuary_queue_requests` | Gauge | Requests currently waiting for an upstream concurrency permit. |
+| `estuary_queue_bytes` | Gauge | KiB-rounded request bytes held by queued requests. |
+| `estuary_admission_waiters` | Gauge | Requests waiting to enter ingress admission. |
+| `estuary_public_connections` | Gauge | Active accepted public TCP connections. |
+| `estuary_response_buffer_bytes` | Gauge | Bytes reserved by in-progress/completed non-streaming response buffers. |
+| `estuary_response_buffer_waiters` | Gauge | Non-streaming responses waiting for global response buffer capacity. |
+
+### Latency, Prefix & Token Histograms
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `estuary_request_duration_seconds` | Histogram | Admission to response creation (includes full body for buffered responses). |
+| `estuary_queue_duration_seconds` | Histogram | Time selecting or waiting for upstream capacity. |
+| `estuary_tokenization_duration_seconds` | Histogram | Time spent deciding, caching, or requesting exact routing tokenization. |
+| `estuary_prefix_match_chars` | Histogram | Selected approximate matched prefix length in canonical characters. |
+| `estuary_prefix_match_tokens` | Histogram | Selected exact vLLM matched prefix length in tokens. |
+| `estuary_upstream_first_token_duration_seconds` | Histogram | Upstream dispatch to first observed generation event. |
+| `estuary_inference_input_tokens` | Histogram | Reported input tokens on completed requests. |
+| `estuary_inference_cached_tokens` | Histogram | Reported cached input tokens on completed requests. |
+| `estuary_inference_output_tokens` | Histogram | Reported output tokens on completed requests. |
+
+### Scoped Gateway Counters
+
+All carry labels `{scope, name}` where `scope` is `fleet`, `node`, or `model` (bounded by `ESTUARY_OBSERVABILITY_MAX_SCOPES`):
+
+- `estuary_gateway_started_total`
+- `estuary_gateway_success_total`
+- `estuary_gateway_failed_total`
+- `estuary_gateway_cancelled_total`
+- `estuary_gateway_unknown_total`
+- `estuary_gateway_retries_total`
+- `estuary_gateway_input_tokens_total`
+- `estuary_gateway_output_tokens_total`
+- `estuary_gateway_cached_tokens_total`
+
+### Session Logging Metrics
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `estuary_session_log_enabled` | Gauge | `1` if session logging is configured; else `0`. |
+| `estuary_session_log_available` | Gauge | `1` if the session log SQLite writer is healthy; else `0`. |
+| `estuary_session_log_queued` | Gauge | Commands queued for background SQLite persistence. |
+| `estuary_session_log_content_bytes` | Gauge | Captured payload bytes currently buffered in memory. |
+| `estuary_session_log_dropped_total` | Counter | Rejected observations or discarded write commands due to backpressure/write failure. |
+| `estuary_session_log_truncated_total` | Counter | Stage/attempt payloads truncated to respect byte budgets. |
+| `estuary_session_log_write_errors_total` | Counter | SQLite write or recovery errors. |
+| `estuary_session_log_committed_total` | Counter | Completed requests committed to SQLite. |
+| `estuary_session_log_last_commit_timestamp_ms` | Gauge | Unix ms timestamp of the last committed batch. |
+
+---
+
+## Cardinality Bounds & Lifecycle
+
+- **Scope cap**: Retains up to `ESTUARY_OBSERVABILITY_MAX_SCOPES` (default `32`, max `4096`) node scopes and model scopes plus `fleet`. Excess events increment `limited_events`; `fleet` totals always include every request.
+- **Identifier & series caps**: Scope IDs are limited to 1,024 bytes. Each vLLM node tracks up to 512 relevant labelled counter series (exceeding that reports unavailable rates instead of a truncated sum).
+- **Resets**: Process restart clears all in-memory telemetry and generates a new `instance_id`. Replacing a node configuration advances its node instance ID and resets its per-node observability series so previous in-flight completions cannot contaminate the replacement. Scrape `/metrics` into an external time-series database for long-term retention or cross-instance aggregation.

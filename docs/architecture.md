@@ -1,274 +1,106 @@
 # Architecture
 
-[Documentation index](README.md) | [Configuration and operations](operations.md) |
-[Native vLLM provider](vllm.md) | [Deployment](../deploy/README.md)
+[Documentation Index](README.md) | [Configuration & Security](configuration.md) | [vLLM Provider](vllm.md)
 
-Estuary has a public inference plane and a private management plane. Both use a
-shared scheduler inside each worker process; SQLite is the only persisted node
-registry.
+Estuary runs a public inference data plane and a private management control plane in one process. Both share an in-memory `Scheduler`; SQLite (`node_configs`, `ip_limits`, `control_state`) is the sole durable store for configuration.
 
 ```mermaid
 flowchart LR
-    Client --> Public[Public listener]
-    Public --> Admission[Body and queue budgets]
-    Admission --> Scheduler
-    Health[Health and circuit state] --> Scheduler
-    Prefix[Approximate prefix directory] --> Scheduler
-    VLLM[vLLM metrics, tokenize, KV events] --> Scheduler
-    Scheduler --> Node[Node lease]
-    Node --> Upstream[Model server]
-    Upstream --> Buffer[Bounded buffer or stream pump]
-    Buffer --> Client
-    Admin[Management listener] --> SQLite
-    SQLite --> Scheduler
+    Client --> Public["Public Listener"]
+    Public --> Auth["Optional Auth / RPM"]
+    Auth --> Admission["Ingress Count & Byte Budget"]
+    Admission --> Bridge["Protocol Normalize & Chat Bridge"]
+    Bridge --> Scheduler["Scheduler"]
+    Health["Health & Circuit State"] --> Scheduler
+    Prefix["Sharded Prefix Directory"] --> Scheduler
+    VLLM["vLLM Metrics, Tokenize & KV Events"] --> Scheduler
+    Scheduler --> Lease["Node Lease"]
+    Lease --> Upstream["Upstream Model Server"]
+    Upstream --> Delivery["Bounded Buffer or Cap-1 Stream Pump"]
+    Delivery --> Client
+    Admin["Management Listener"] --> SQLite["SQLite (WAL)"]
+    SQLite --> Reconciler["Control Reconciler"]
+    Reconciler --> Scheduler
 ```
 
-## Public Request Flow
+---
 
-The public router exposes local model discovery and an explicit inference
-allowlist. A request follows these steps:
+## Public Request Pipeline
 
-1. Assign a request ID and acquire a public-connection permit.
-2. Reserve request-count and KiB-rounded body budgets before reading the body.
-3. Read the JSON body under idle, total-time, and size limits.
-4. Parse the public model and canonical prompt material required for routing.
-5. Filter nodes by model mapping, operator drain, health, provider readiness,
-   circuit state, retry exclusions, and fresh vLLM waiting depth.
-6. Rank eligible nodes by load, recent request signals, and prefix locality.
-7. Atomically acquire one node's concurrency permit, waiting without a scheduler
-   deadline when all eligible nodes are busy.
-8. Rewrite the model, strip client credentials and hop-by-hop headers, inject
-   node credentials, and send the upstream request with redirects disabled.
-9. Stream through a capacity-one pump or buffer a non-streaming success to EOF.
-10. Record successful prefix ownership and release the node permit on EOF,
-    failure, timeout, or downstream cancellation.
+1. **TCP accept & connection caps**: `BoundedTcpListener` enforces `ESTUARY_MAX_CONNECTIONS` and persisted per-IP connection limits (`ip_limits`), tracking accepted connections until their first request begins so graceful shutdown cannot race socket handoffs.
+2. **Response tracking & request ID**: `track_public_response` installs a single `ObservedStream` wrapper for observability, session logging, and graceful-shutdown in-flight tracking; `assign_request_id` sets `x-request-id` (and `request-id` for Anthropic paths).
+3. **Optional public auth & RPM**: When `ESTUARY_PUBLIC_API_KEYS` or `ESTUARY_PUBLIC_RPM_LIMIT` is set, requests are verified in constant time and checked against a bounded per-key/IP fixed-window limiter.
+4. **Ingress admission**: Before reading the body of any `POST /v1/*`, Estuary acquires one request slot (`queue_max_requests`) and KiB-rounded byte permits (`queue_max_bytes`), reserving `Content-Length` (or `max_request_body_bytes` for chunked uploads). Exhaustion waits and applies transport backpressure instead of spawning unbounded work.
+5. **Body read & budget shrink**: The request body is read under idle, total, and size limits, after which `adjust_bytes` immediately returns any over-reserved ingress byte permits.
+6. **Compatibility & protocol bridge**: Estuary rejects unsupported stateful/lossy inputs, strips Claude Code billing blocks and no-op context edits, replaces images on `multimodal: false` models, and converts `/v1/messages*` and `/v1/responses` once into upstream `/v1/chat/completions` JSON.
+7. **Prefix & exact tokenization**: Extracts canonical routing material and token workload estimates. For vLLM pools with authoritative exact KV directories and an approximate prefix match above `cache_threshold`, queries the shared tokenization LRU cache (with singleflight coalescing) via `control_client` (separate from the inference HTTP pool).
+8. **Scheduling & FIFO lease acquisition**: Ranks eligible nodes and atomically acquires a node concurrency permit. When all eligible nodes are busy, the request registers cancel-safe acquisition futures across eligible nodes; Tokio FIFO semaphores prevent new arrivals from starving older waiters. Independent model pools share no global head-of-line lock, and registry/health/provider/circuit changes wake waiters.
+9. **In-place dispatch & early byte release**: Patches only top-level `model` (and `return_mm_kwargs`/`stream` for `count_tokens`) in place without deep-cloning large prompt JSON, scrubs inbound credentials/hop-by-hop headers, injects node credentials, and forwards with redirects disabled. Once forwarded/headers received, `release_bytes` returns the ingress byte reservation (response buffering is bounded independently).
+10. **Delivery & cleanup**: Non-streaming successes buffer within per-response and global response-buffer budgets (`ResponseBufferBudget`); streaming responses flow through a capacity-one `mpsc` pump owning the node lease until EOF, error, client cancel, or upstream/downstream timeout. Successful responses record approximate prefix ownership before releasing the lease.
 
-Requests waiting for node capacity register cancel-safe acquisition futures on
-all currently eligible node semaphores. Tokio FIFO semaphore assignment prevents
-a new fast-path request from taking capacity already promised to an older waiter.
-Independent model pools do not share a global head-of-line lock. Registry,
-health, provider, and circuit changes wake waiting selection.
+---
 
-## Scheduling
+## Scheduling Model
 
-Node `max_concurrency` is a hard per-process limit. Lower scores are preferred:
+Each node's `max_concurrency` is a hard per-process cap. Eligible nodes (matching model, not draining, routable health/provider/circuit state, not excluded by retries, and fresh vLLM `waiting < waiting_threshold`) are scored; **lower scores win**:
 
 ```text
 observed_load = max(local_active, fresh_vllm_running + fresh_vllm_waiting)
-load = ((observed_load + 1) / max_concurrency) / weight
+load          = ((observed_load + 1) / max_concurrency) / weight
 
-prefill = (pending_prefill_tokens + incoming_uncached_tokens) / prefill_token_scale / weight
-decode = (pending_decode_tokens + incoming_output_tokens) / decode_token_scale / weight
-latency = recent_first_generation_latency_ms / target_latency_ms
-error = error_ewma + health_penalty
+prefill       = (pending_prefill_tokens + incoming_uncached_tokens) / prefill_token_scale / weight
+decode        = (pending_decode_tokens  + incoming_output_tokens)   / decode_token_scale  / weight
+latency       = recent_latency_ms / target_latency_ms
+error         = error_ewma + health_penalty
 
-score = load_weight * load
+score = load_weight    * load
       + prefill_weight * prefill
-      + decode_weight * decode
+      + decode_weight  * decode
       + latency_weight * latency
-      + error_weight * error
+      + error_weight   * error
 ```
 
-Fresh observed first-generation latency is preferred to response-header latency.
-When no fresh generation observation exists, recent header latency is the
-fallback. Missing or stale latency/error observations contribute no penalty.
-Equal candidates rotate rather than falling back to a fixed node ID. A fresh
-vLLM waiting count at or above `provider.waiting_threshold` removes that node
-from admission until telemetry reports recovery.
+- **Latency & health penalties**: Fresh observed TTFT EWMA is preferred over response-header latency; stale or absent samples contribute `0`. Health penalties are `0.0` (`healthy`), `0.15` (`starting`, when `route_while_starting=true`), and `0.35` (`degraded`). Ties rotate round-robin across candidates via an atomic tie-breaker rather than favoring lexicographically first node IDs.
+- **Cache affinity & imbalance decay**:
+  - An authoritative exact vLLM token match (including `0`) overrides approximate character history for that node and receives full credit even below `cache_threshold`.
+  - Approximate character matches above `cache_threshold` receive at most `50%` credit, halving every `prefix.approximate_half_life_ms` since last recorded on that node, capped to the indexed prefix length.
+  - Cache credit decays continuously as a node's normalized load exceeds the least-loaded eligible candidate:
+    ```text
+    excess_requests          = max(0, load - min_load) * max_concurrency * weight
+    credit_divisor           = 1 + excess_requests / max(1, balance_abs_threshold) / balance_rel_threshold
+    incoming_uncached_tokens = input_tokens - floor(cached_tokens * confidence / credit_divisor)
+    ```
+- **Workload accounting**: Each lease tracks its assigned prefill and estimated output work. The first observed generation event (text, reasoning, or tool output; never pings or metadata) clears pending prefill while keeping concurrency and decode reservations until EOF, failure, timeout, or cancellation. Input work uses exact token IDs when available, else a full-prompt text heuristic (~4 ASCII or ~1 non-ASCII char/token, excluding encoded media blobs). Output work uses recent reported per-completion output length (default `256` tokens), capped by the request's output token limit and multiplied by completion count (`n` and Completions batch size; `0` for Embeddings and `count_tokens`).
 
-Cache savings reduce incoming prefill work in this continuous score; a cache
-owner does not automatically outrank a less loaded node. Each worker's prefix
-is considered, including shorter matches on other workers. A reliable exact
-token match, including zero, takes precedence over historical character matches
-for that worker. Exact matches receive credit even below the approximate
-`prefix.cache_threshold` gate.
+---
 
-Character matches above that gate receive at most 50% estimated token credit.
-Streaming history is recorded after observed generation rather than after
-metadata alone, with successful EOF as the fallback. Their confidence halves every `prefix.approximate_half_life_ms` (five minutes
-by default), measured since that worker's matching prefix was last recorded.
-Credit is capped by the bounded prefix actually indexed, so truncating a long
-request cannot make its unindexed suffix appear cached.
+## Prefix & Exact KV Directories
 
-Credit also decays smoothly as a worker's capacity- and weight-normalized load
-exceeds the least loaded eligible worker:
+- **Approximate `PrefixDirectory`**: Sharded in-memory compressed radix trees keyed by `(endpoint, public_model)` indexing canonical prompt-affecting fields (system/instructions, messages, tools, tool choice, response format, parallel tool calls, reasoning settings). Bounded globally by `max_trees` and `max_directory_chars`, per request by `max_request_chars`, and per node by `max_tree_chars_per_node` with recency eviction. Streaming requests record ownership after observed generation (with EOF fallback).
+- **Exact `ExactCacheDirectory`**: Sharded per-node token-block directory maintained from vLLM ZMQ KV events; see [vLLM Provider](vllm.md#exact-kv-block-routing).
 
-```text
-excess_requests = max(0, load - min_load) * max_concurrency * weight
-credit_divisor = 1 + excess_requests / max(1, prefix.balance_abs_threshold)
-                                    / prefix.balance_rel_threshold
-incoming_uncached_tokens = input_tokens - floor(cache_tokens * confidence / credit_divisor)
-```
+---
 
-The balance settings now control this continuous decay rather than turning all
-cache affinity off when the pool crosses a global imbalance threshold.
+## Health, Circuit Breakers & Bounded Retries
 
-A lease records its assigned prefill and estimated output work. The first
-observed generation event clears prefill work while retaining concurrency and
-output accounting. EOF, failure, timeout, and cancellation release all remaining
-work automatically. The same accounting applies after queue admission; node
-FIFO semaphore fairness and first-available admission remain unchanged.
+- **Health monitor**: Runs jittered active HTTP probes against `health_path` (using `control_client` and node credentials). States are `starting`, `healthy`, `degraded`, and `unhealthy`. The first successful startup probe transitions `starting -> healthy`; failures degrade and then mark `unhealthy` after `unhealthy_threshold` active or `passive_failure_threshold` passive inference failures; recovery requires `healthy_threshold` consecutive probe successes. Upstream `429` signals overload rather than a health failure.
+- **Circuit breaker**: Independent of health. Consecutive transport, 5xx, or body failures open the circuit for `circuit_open_ms`; afterwards up to `circuit_half_open_max_requests` real inference requests probe half-open state until `circuit_half_open_success_threshold` consecutive successes close it (any half-open failure reopens it).
+- **Retries**: Bounded to `1`–`3` total attempts (`ESTUARY_RETRY_MAX_ATTEMPTS`), always choosing a different untried eligible node. Eligible before downstream commit on connect errors, configured `ESTUARY_RETRY_STATUSES`, or non-streaming body read/validation failures. Streaming responses never retry once upstream headers are accepted.
 
-Input work uses exact tokenization when available, otherwise a full-request
-text estimate (roughly four ASCII characters or one non-ASCII character per
-token). Encoded image, audio, video, and file blocks are excluded from the text
-estimate; their inference cost is not modeled. The estimate is independent of
-prefix truncation and remains enabled when cache affinity is disabled. Output work uses recent successful reported
-output lengths, normalized for `n`, capped by the request's output limit and
-multiplied by the completion count (`n`, and prompt batch size for Completions).
-Without fresh samples, the estimate is 256 tokens per completion. Embeddings and token-count requests receive no output reservation.
-These are token-based heuristics, not calibrated GPU-time predictions; model,
-hardware, multimodal inputs, and output-length variation require workload
-validation before tuning.
+---
 
-Streaming observation is bounded to 64 KiB per SSE event and does not modify
-forwarded bytes. Role declarations, heartbeats, and metadata do not count as
-generation; text, reasoning, and tool output do. Oversized, unsupported, or
-unparseable events are skipped for observation, and subsequent events can
-still be observed. TTFT excludes gateway queueing; stream backpressure can
-influence the time at which an upstream event is observed. Reported usage is
-recorded at successful EOF, preserving each upstream protocol's input-token
-semantics. Missing usage does not invent token observations.
+## Persistence, Live Updates & Control-Plane Reconciliation
 
-## Prefix State
+SQLite runs in WAL mode with transactional migrations (`node_configs`, `ip_limits`, `control_state`). Triggers bump `control_state.revision` on every insert, update, or delete:
 
-For every endpoint and public model, Estuary keeps a bounded in-memory compressed
-radix tree of canonical prompt material assigned successfully by that process.
-The key includes prompt-affecting fields such as instructions, messages, tools,
-tool choice, response format, parallel tool calls, and reasoning settings.
+- **Live node replacement**: Updating a node creates a new configuration snapshot sharing the node's live resizable capacity semaphore, active count, and workload counters across generations. In-flight requests finish on their original immutable snapshot while new requests route to the updated snapshot. Health, request stats, and circuit state are preserved when the upstream engine configuration is unchanged; prefix/KV ownership is invalidated and vLLM monitors restart cleanly for the new generation.
+- **Multi-process reconciliation**: Local processes sharing one SQLite database poll `control_state.revision` every `ESTUARY_CONTROL_SYNC_INTERVAL_MS` and reconcile added/updated/deleted nodes and `ip_limits` into their local runtime state. Every local change or reconciliation also broadcasts on `/admin/api/events` (SSE).
 
-The directory is bounded by request length, tree count, total characters, and a
-per-node character budget. Per-node leaves are evicted by recency. Generic model
-servers cannot report real KV eviction, so approximate ownership may contain
-false positives or false negatives and is lost on restart.
+---
 
-vLLM nodes can add authoritative token-block state from Chat `/render`,
-`/tokenize`, and ZMQ KV events. Messages, Responses, and Chat requests enter the
-same routing pipeline after conversion to the final Chat payload. Token IDs are
-scoped to compatible node payloads. Exact state is process-local and falls back
-to approximate routing when telemetry, tokenization, event continuity, or memory
-authority is unavailable. See [the vLLM provider guide](vllm.md).
+## Design Boundaries
 
-## Protocol Handling
-
-Client `/v1/messages`, `/v1/responses`, and `/v1/chat/completions` all use upstream
-`/v1/chat/completions`, for every model and provider. Conversion happens before
-prefix lookup and node selection. Chat requests retain unknown fields;
-Messages and Responses use the vendored MIT-licensed deepseek-recipe protocol
-adapters and shared conversation types. No DeepSeek prompt encoder, tokenizer,
-image preprocessor, or demo server is used. Upstream revision and the optional
-tokenizer patch are recorded in `vendor/deepseek-recipe/ESTUARY.md`. Each requested
-model is registered as an image-capable V4.1 conversion alias; this selects protocol
-conversion rules without changing the backend model name. Original sampling
-parameters and thinking budgets are forwarded to Chat, and the backend applies
-its token limits. System messages retain their role, including images, and literal
-image-token text is distinguished from actual image placeholders.
-
-Buffered and streaming Chat results are reconstructed into the original client
-protocol. Tool history, images, reasoning text and backend usage are preserved.
-Protocol output and tool argument accumulation is capped at 16 MiB per response.
-Parallel tool argument fragments are buffered until tool completion.
-Namespaces are encoded as collision-checked Chat names and restored in Responses.
-Named Responses tool outputs without a call ID, including Codex Goals'
-`agent.goal_objective`, become user context with their name and namespace. Chat
-tool messages always answer a preceding call; standalone context retains text
-and images without inventing a tool call.
-The gateway does not condition protocol conversion on User-Agent or model family.
-Completions and Embeddings retain their existing endpoints.
-
-Stateful Responses (`background`, `previous_response_id`, `conversation`, and
-retrieve/delete/cancel operations), server search, document/file input, and
-encrypted-only reasoning are rejected explicitly. They require backend services
-or state that the Chat API cannot supply. Unknown unsupported content blocks also
-fail instead of silently discarding their contents.
-
-Messages errors keep Anthropic envelopes and streams receive keep-alive pings.
-`/v1/messages/count_tokens` uses the Chat render endpoint without generating an
-answer. The retired `anthropic_protocol` and `flatten_codex_namespaces` config
-fields are discarded at the SQLite read boundary and omitted when saved. New
-configuration requests reject these fields.
-
-The gateway removes Claude Code's standalone single-line billing marker and the
-no-op `clear_thinking_20251015` edit with `keep: all`. Other context edits fail.
-Inline system reminders stay in their original conversation position as user
-system-reminder blocks rather than being merged into the leading system prompt.
-
-## Persistence and Node Lifecycle
-
-SQLite stores a validated node JSON document, optimistic revision, and
-timestamps. Migrations run transactionally at startup, WAL mode is enabled, and
-triggers advance a database-wide control revision after every node change.
-Processes sharing the same local database poll that revision and reconcile their
-own runtime scheduler.
-
-Node creation probes a complete candidate before mutation. Updates validate the
-complete document and probe the candidate only when its upstream URL, resolved
-credentials/headers, health URL, or provider configuration changes. After the
-revision-checked database write, the scheduler installs the new configuration
-without draining. Accepted requests retain their immutable node snapshot;
-future assignments use the new configuration. All generations share active
-request counts, workload, and a resizable capacity limiter. Lowering concurrency
-reclaims free permits immediately and consumes busy permits as they are released,
-without cancelling requests. Raising concurrency immediately wakes queued work.
-Health is preserved when the upstream configuration is unchanged; request
-statistics and circuit state are preserved for the same upstream engine.
-
-Configuration replacement invalidates prefix/KV ownership and restarts provider
-monitors for the new snapshot. Retired responses cannot repopulate prefix history,
-and tokenization cache entries are scoped to the configuration instance. Shared
-database reconciliation follows the same update path and retains the previous
-runtime configuration when candidate validation fails.
-
-Delete still drains the current node and waits for active leases across every
-configuration generation. A timeout leaves the node draining instead of
-cancelling accepted inference.
-
-Direct Bearer keys and custom header values are plaintext in the SQLite node
-document. Management responses redact their values. The database, WAL,
-snapshots, and backups are therefore secrets.
-
-## Health, Circuits, and Retry
-
-Health states are `starting`, `healthy`, `degraded`, and `unhealthy`. Active
-probes use node credentials. The first successful startup probe makes a node
-healthy; failures degrade it and configured active or passive thresholds make it
-unhealthy. Recovery requires the configured consecutive successful probes.
-Upstream `429` is treated as load pressure, not an active-health failure.
-
-The circuit breaker is independent of health. Consecutive transport, 5xx, or
-body failures open it. After `open_ms`, a bounded number of real inference
-requests probe half-open state; the configured success streak closes the circuit
-and any half-open failure reopens it.
-
-Retries use a different eligible node and are limited to one through three total
-attempts. Connection failures, configured transient statuses, and invalid or
-failed non-streaming success bodies can retry before downstream commit.
-Streaming responses never switch nodes after successful headers. Any enabled
-generation retry is at-least-once and can duplicate work or billing.
-
-## Backpressure and Shutdown
-
-Public connections, admitted requests, admitted request bytes, individual
-non-streaming bodies, and aggregate non-streaming buffers all have independent
-bounds. Exhaustion waits and applies transport backpressure rather than creating
-unbounded tasks or synthesizing a gateway `429`.
-
-A streaming response is moved by a capacity-one channel. Its pump owns the node
-permit until EOF, error, client cancellation, upstream idle/total timeout, or
-downstream stall timeout. Non-streaming successes are committed only after their
-complete body fits within both response budgets.
-
-SIGINT, SIGTERM, and process drain first disable readiness. After the configured
-withdrawal delay, the public listener stops accepting while accepted queues and
-responses continue. The process exits when they finish or when
-`shutdown_grace_ms` expires.
-
-## Boundaries
-
-- Public inference has no inbound authentication.
-- Concurrency, queues, health, circuits, metrics state, and prefix state are not
-  shared across arbitrary gateway replicas.
-- Responses state and background operations are not persisted.
-- vLLM exact routing excludes remote/offloaded, LoRA, salted, and multimodal KV
-  identities that Estuary cannot reproduce from the request.
-- Retries do not provide exactly-once upstream execution.
+- **Process-local runtime state**: Concurrency leases, queues, health, circuits, observability histories, RPM buckets, and prefix/KV directories are not replicated across separate hosts or containers.
+- **Stateless Responses**: Background execution, `previous_response_id`, `conversation`, and `/v1/responses/{id}` are rejected because Estuary does not persist response-to-node state.
+- **At-least-once retries**: Enabling retries can repeat upstream token generation or billing.
+- **Separate data & control HTTP clients**: Inference traffic uses an unbounded-idle pool (`client`); health probes, vLLM scraping, and tokenization use a dedicated pool (`control_client`) so inference bursts cannot starve control operations.

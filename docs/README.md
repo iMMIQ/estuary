@@ -1,25 +1,33 @@
-# Documentation
+# Estuary Documentation
 
-[Estuary](../README.md) keeps the root README focused on installation and first
-use. The maintained technical documentation is organized by task:
+[README](../README.md) ([简体中文](../README.zh-CN.md) | [日本語](../README.ja.md))
 
-| Document | Use it for |
+Each topic has a single authoritative document organized by role:
+
+## Operate & Deploy
+
+| Document | Covers |
 | --- | --- |
-| [Architecture](architecture.md) | Request flow, scheduling, persistence, protocol adaptation, backpressure, and process lifecycle. |
-| [Configuration and operations](operations.md) | Runtime settings, node configuration, security, health checks, management endpoints, and metrics. |
-| [Dashboard observability](observability.md) | Smoothed throughput, latency, request outcomes, engine telemetry, windows, and metric definitions. |
-| [Native vLLM provider](vllm.md) | vLLM version requirements, telemetry, tokenization, KV events, and client compatibility. |
-| [Local end-to-end tests](local-e2e.md) | Real Claude Code, Codex, and OpenCode tests with local CPU inference servers. |
-| [Deployment](../deploy/README.md) | Static binary installation, Docker, graceful shutdown, and persistent paths. |
-| [Performance benchmark](performance.md) | Reproducible gateway-overhead benchmark commands and output. |
-| [Generated configuration contract](config-contract.md) | Canonical config types, defaults, validation rules, shared cases, and module boundaries. |
-| [Session logging](session-logging.md) | Enable independent storage, inspect sessions, and understand capture limits and retention. |
+| [Deployment](deployment.md) | Static Linux binaries, Docker image builds, Docker Compose runtime, volumes, graceful shutdown, and rolling updates. |
+| [Configuration & Security](configuration.md) | Process CLI flags and environment variables, SQLite node schema, live node hot-updates, public/admin authentication, rate limits, and credential encryption. |
+| [Observability & Metrics](observability.md) | Real-time dashboard rates/histograms, `/admin/api/observability`, and the complete OpenMetrics `/metrics` catalog. |
+| [Session Logging](session-logging.md) | Independent SQLite conversation logging, content deduplication, automatic redaction, retention, and query limits. |
 
-The executable is authoritative for runtime flags and environment variables:
+## Integrate Clients & Engines
 
-```bash
-estuary --help
-```
+| Document | Covers |
+| --- | --- |
+| [API & Clients](api.md) | Public inference routes, shared Chat Completions protocol bridge, compatibility boundaries, Claude Code / Codex / OpenCode setup, and the complete Admin API. |
+| [vLLM Provider](vllm.md) | vLLM 0.25+ version gate, Prometheus telemetry, shared tokenization cache, ZMQ KV events, exact routing, and per-request engine timings. |
 
-Node-specific configuration is authoritative in SQLite and is managed through
-the embedded application or `/admin/api/nodes` endpoints.
+## Understand & Contribute
+
+| Document | Covers |
+| --- | --- |
+| [Architecture](architecture.md) | Request pipeline, backpressure, continuous scheduling formula, prefix/KV directories, live node replacement, and system boundaries. |
+| [Contributing](../CONTRIBUTING.md) | Local toolchains, build & CI commands, shared Rust/TypeScript config contract generation, local coding-agent E2E suites, and benchmarks. |
+
+## Authoritative Runtime Sources
+
+- Process flags and defaults (except `ESTUARY_CONFIG_ENCRYPTION_KEY`, which is environment-only): run `estuary --help`.
+- Persisted node configurations and IP connection limits: stored in SQLite and managed via `/admin/` or `/admin/api/*`.

@@ -1,53 +1,26 @@
+English | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
+
 # Estuary
 
 [![CI](https://github.com/iMMIQ/estuary/actions/workflows/ci.yml/badge.svg)](https://github.com/iMMIQ/estuary/actions/workflows/ci.yml)
 [![Release](https://github.com/iMMIQ/estuary/actions/workflows/release.yml/badge.svg)](https://github.com/iMMIQ/estuary/actions/workflows/release.yml)
 
-Estuary is a self-hosted Rust gateway for OpenAI-compatible model servers. It
-serves OpenAI and Anthropic client protocols from one public listener, maps
-public model names to upstream models, and routes each request to a healthy node
-using concurrency, observed load, latency, errors, and prompt-prefix locality.
+Estuary is a self-hosted Rust gateway for OpenAI-compatible model servers. It exposes OpenAI and Anthropic client APIs on a single public listener, routes every request to healthy upstreams using live load, latency, error, workload, and prompt-prefix signals, and ships as a single binary with an embedded English / Simplified Chinese management application.
 
 ## Features
 
-- OpenAI Chat Completions, Responses, Completions, Embeddings, and Models APIs.
-- Messages and Responses compatibility through a shared Chat Completions backend.
-- Per-node model mappings, concurrency limits, weights, health checks, circuit
-  breakers, and bounded retries.
-- Optional session logs in a separate database, with content deduplication and request/attempt inspection.
-- Approximate prompt-prefix affinity for generic servers and exact KV-block
-  affinity for vLLM 0.25 and newer.
-- SQLite-backed node configuration with an embedded English and Simplified
-  Chinese management application.
-- Bounded request admission, response buffering, streaming backpressure, and
-  graceful shutdown.
-- Docker and static Linux binary deployment.
-
-## API
-
-| Method and path | Behavior |
-| --- | --- |
-| `GET /v1/models` | Lists configured public model names. |
-| `GET /v1/models/{model}` | Returns one configured public model. |
-| `POST /v1/chat/completions` | Buffered or SSE Chat Completions forwarding. |
-| `POST /v1/responses` | Foreground buffered or SSE Responses adapted through Chat Completions. |
-| `POST /v1/completions` | Completions forwarding. |
-| `POST /v1/embeddings` | Embeddings forwarding. |
-| `POST /v1/messages` | Anthropic Messages, including tools, thinking, and SSE. |
-| `POST /v1/messages/count_tokens` | Token counting through the Chat render endpoint. |
-| `HEAD /api/hello` | Claude Code gateway capability probe. |
-
-Inference routes are an allowlist. Other `/v1/*` operations return a
-protocol-shaped `404`. Responses background mode, conversations,
-`previous_response_id`, and `/v1/responses/{id}` operations are rejected because
-the gateway does not persist response-to-node state.
+- **Unified client protocols**: OpenAI Chat Completions, Responses, Completions, Embeddings, Models, and Anthropic Messages (including `count_tokens`), all normalized onto upstream Chat Completions for generation.
+- **Load- and prefix-aware scheduling**: Per-node concurrency caps, weighted load/prefill/decode/latency/error scoring, approximate radix-tree prefix affinity for any server, and exact KV-block routing for vLLM 0.25+.
+- **Live control plane**: SQLite-backed node registry with live configuration updates without draining active requests, optimistic revision locking, active health probes, circuit breakers, and bounded retries.
+- **Built-in security controls**: Optional static public API keys, per-key/IP RPM throttling, persisted per-IP connection limits, management token authentication, and optional BLAKE3 authenticated encryption for stored upstream credentials.
+- **Observability & optional session logs**: Real-time dashboard with smoothed rates and histograms, OpenMetrics `/metrics`, and optional content-deduplicated session logging in an independent SQLite database.
+- **Bounded & self-contained**: Bounded connection, ingress queue, response buffer, and streaming backpressure with graceful shutdown; ships as static Linux binaries or a minimal Alpine Docker image.
 
 ## Quick Start
 
 ### Docker
 
-Build and runtime are separate. Local builds select the fastest reachable
-official or mainland mirror; the Dockerfile itself defaults to official sources.
+Build the image (auto-selecting the fastest reachable registry mirror) and start with Docker Compose:
 
 ```bash
 export ESTUARY_ADMIN_TOKEN="$(openssl rand -hex 32)"
@@ -55,23 +28,14 @@ export ESTUARY_ADMIN_TOKEN="$(openssl rand -hex 32)"
 docker compose up -d
 ```
 
-The public API is available on `http://127.0.0.1:8080`. The management
-application is available on `http://127.0.0.1:9090/admin/` and uses the token as
-the HTTP Basic Auth password. See [deployment](deploy/README.md) for image tags,
-volumes, shutdown, and rolling updates.
+- Public inference API: `http://127.0.0.1:8080`
+- Management UI: `http://127.0.0.1:9090/admin/` (HTTP Basic Auth: any username, password = `ESTUARY_ADMIN_TOKEN`)
+
+See [Deployment](docs/deployment.md) for prebuilt static Linux binaries, build versions, volumes, and graceful rolling updates.
 
 ### From Source
 
-Rust 1.98.1 or newer and an installed LLD linker (`ld.lld`) are required.
-Local and Docker builds enable `target-cpu=native` and link with LLD.
-Release workflows use a portable CPU target and Zig's LLD linker for cross-compilation.
-
-The web toolchain uses Node.js 26.12.1 (`.node-version`), Bun 1.4.4, and
-TypeScript 6.0.3.
-
-Dependency versions are selected from stable releases published through 2026-11-04.
-`rusqlite` uses the latest compatible 0.40 release because `rusqlite_migration` 2.6
-requires that series. Commit both `Cargo.lock` and `web/bun.lock` when updating dependencies.
+Install the Rust toolchain in [rust-toolchain.toml](rust-toolchain.toml) with LLD (`ld.lld`), plus Node.js ([.node-version](.node-version)) and Bun. Build the embedded web UI once, then run Estuary:
 
 ```bash
 (cd web && bun install --frozen-lockfile && bun run build)
@@ -82,42 +46,22 @@ cargo run --release -- \
   --admin-listen 127.0.0.1:9090
 ```
 
-`web/dist/` is generated at build time and excluded from Git, so build the web
-assets once before compiling the Rust binary from source. Open
-`http://127.0.0.1:9090/admin/` and add an upstream node. An empty database
-is valid, but readiness remains `503` until at least one node is routable.
+## Configure a Node & Verify
 
-Build versions are resolved automatically. A commit tagged with the matching
-package version (for example, `v0.4.0`) reports `0.4.0`; other commits report
-the package version plus a 12-character Git hash, such as
-`0.4.0+bbf691e19ba2`. The CLI and management application use the same version.
-The Docker build wrapper passes this version into the image automatically. See
-[deployment](deploy/README.md) for builds without Git metadata.
-
-## Configure A Node
-
-The management application validates and probes a node before saving it. The
-required fields are:
+Open `http://127.0.0.1:9090/admin/` and add an upstream node with:
 
 - a unique node ID;
-- an absolute OpenAI-compatible base URL, normally ending in `/v1`;
-- at least one public-to-upstream model mapping;
-- a positive per-process concurrency limit.
+- an absolute OpenAI-compatible `base_url` (typically ending in `/v1`);
+- at least one public-to-upstream model mapping (`*` preserves the requested model name);
+- a positive `max_concurrency` limit and provider type (`openai` or `vllm`).
 
-Select `openai` for a generic OpenAI-compatible server or `vllm` for vLLM
-telemetry and KV routing. Upstream Bearer keys and custom headers can be stored with the
-node. Model mappings rewrite the public request model before forwarding; a
-mapping value of `*` preserves the requested name.
+An empty database starts normally, and `/health/ready` remains `503` until at least one node is routable.
 
-Verify the configured model catalog:
+Once saved, verify the model catalog and send a Chat Completion:
 
 ```bash
 curl -sS http://127.0.0.1:8080/v1/models
-```
 
-Send a Chat Completion using a public model name:
-
-```bash
 curl -sS http://127.0.0.1:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{
@@ -126,84 +70,21 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-## Clients
-
-OpenAI-compatible clients use `http://HOST:8080/v1` as their base URL.
-
-Claude Code uses the Anthropic listener:
-
-```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:8080 \
-ANTHROPIC_API_KEY=estuary \
-claude
-```
-
-Codex uses the Responses API:
-
-```toml
-model_provider = "estuary"
-model = "gateway-chat"
-web_search = "disabled"
-
-[model_providers.estuary]
-name = "Estuary"
-base_url = "http://127.0.0.1:8080/v1"
-wire_api = "responses"
-requires_openai_auth = false
-```
-
-When Codex is routed to vLLM, Estuary supports the full Responses request shape,
-including namespace tools. Responses Lite custom calls, tool search, additional
-tools, and web search are rejected rather than silently changed. See the
-[vLLM provider guide](docs/vllm.md) for protocol details.
-
-## Production Notes
-
-- The public inference listener does not authenticate callers. Keep it on a
-  trusted network or place it behind an authenticating proxy.
-- A non-loopback management listener requires `ESTUARY_ADMIN_TOKEN`. Health
-  probes remain unauthenticated.
-- Upstream keys and custom header values are stored unencrypted in SQLite.
-  Protect the database, WAL files, snapshots, and backups.
-- SQLite must be on a local filesystem. Do not place it on NFS.
-- Node concurrency, queues, health, circuits, and prefix state are process-local.
-  Run Estuary behind a load balancer or container orchestrator for rolling updates.
-- A retry can repeat upstream generation or billing. The default is one attempt.
+For Claude Code, Codex, OpenCode, and full protocol details, see [API & Clients](docs/api.md).
 
 ## Documentation
 
-The [documentation index](docs/README.md) links the maintained guides:
-
-- [Architecture](docs/architecture.md)
-- [Configuration and operations](docs/operations.md)
-- [Generated configuration contract and module boundaries](docs/config-contract.md)
-- [Native vLLM provider](docs/vllm.md)
-- [Deployment](deploy/README.md)
-- [Performance benchmark](docs/performance.md)
-
-## Development
-
-```bash
-cd web
-bun install --frozen-lockfile
-bun run contract:check
-bun run check
-bun run deadcode
-bun run build
-bun run test
-cd ..
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets
-```
-
-Browser tests additionally require Playwright Chromium:
-
-```bash
-cd web
-bunx --bun playwright install chromium
-bun run test:e2e
-```
+| Guide | Covers |
+| --- | --- |
+| [Documentation Index](docs/README.md) | Role-based map of all documentation. |
+| [Deployment](docs/deployment.md) | Static Linux binaries, Docker builds, Compose runtime, graceful shutdown, and rolling updates. |
+| [Configuration & Security](docs/configuration.md) | Process flags/env vars, node schema, live hot-updates, authentication, rate limiting, and credential encryption. |
+| [API & Clients](docs/api.md) | Public inference endpoints, protocol adaptation boundaries, Claude Code / Codex / OpenCode setup, and Admin API. |
+| [vLLM Provider](docs/vllm.md) | vLLM 0.25+ version gate, telemetry, shared tokenization, ZMQ KV events, and exact cache routing. |
+| [Observability & Metrics](docs/observability.md) | Dashboard smoothing/histograms, `/admin/api/observability`, and OpenMetrics `/metrics` reference. |
+| [Session Logging](docs/session-logging.md) | Independent SQLite request/session capture, content deduplication, redaction, retention, and query limits. |
+| [Architecture](docs/architecture.md) | Request pipeline, scheduling math, prefix/KV directories, hot-updates, and system boundaries. |
+| [Contributing](CONTRIBUTING.md) | Local development, CI checks, shared config contract generation, E2E harnesses, and benchmarks. |
 
 ## License
 
