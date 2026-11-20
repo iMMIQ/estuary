@@ -83,7 +83,24 @@ export function useControlPlane(metricsQuery = "scope=fleet&window=300") {
       if (document.visibilityState === "visible" && !pending.current) void refresh(true);
     };
     document.addEventListener("visibilitychange", resume);
+    let events: EventSource | null = null;
+    if (typeof EventSource !== "undefined") {
+      try {
+        events = new EventSource("/admin/api/events");
+        let initialized = false;
+        events.addEventListener("revision", () => {
+          if (!initialized) {
+            initialized = true;
+            return;
+          }
+          if (document.visibilityState === "visible") void refresh(true);
+        });
+      } catch {
+        events = null;
+      }
+    }
     return () => {
+      events?.close();
       document.removeEventListener("visibilitychange", resume);
       window.clearInterval(interval);
       pending.current?.abort();

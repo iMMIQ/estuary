@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::{
@@ -58,6 +58,7 @@ pub struct Scheduler {
     prefix: Arc<PrefixDirectory>,
     exact_cache: Arc<ExactCacheDirectory>,
     notify: Arc<Notify>,
+    model_notifies: RwLock<HashMap<String, Arc<Notify>>>,
     idle_notify: Arc<Notify>,
     queue_slots: Arc<Semaphore>,
     queue_kib: Arc<Semaphore>,
@@ -70,7 +71,31 @@ pub struct Scheduler {
 #[derive(Debug)]
 pub struct IngressAdmission {
     _request: OwnedSemaphorePermit,
-    _bytes: OwnedSemaphorePermit,
+    bytes: Option<OwnedSemaphorePermit>,
+    reserved_kib: usize,
+}
+
+impl IngressAdmission {
+    /// Return excess byte permits once the actual request body size is known
+    /// (particularly important for chunked uploads that pessimistically reserve
+    /// `max_request_body_bytes`).
+    pub fn adjust_bytes(&mut self, actual_bytes: usize) {
+        let actual_kib = actual_bytes.div_ceil(1024).max(1);
+        if actual_kib < self.reserved_kib
+            && let Some(permit) = self.bytes.as_mut()
+            && let Some(kept) = permit.split(actual_kib)
+        {
+            self.bytes = Some(kept);
+            self.reserved_kib = actual_kib;
+        }
+    }
+
+    /// Release the ingress request-body byte reservation early once the request
+    /// body has been forwarded upstream (response buffering is bounded separately).
+    pub fn release_bytes(&mut self) {
+        self.bytes = None;
+        self.reserved_kib = 0;
+    }
 }
 
 #[derive(Debug)]
@@ -130,6 +155,7 @@ impl Scheduler {
             prefix,
             exact_cache,
             notify: Arc::new(Notify::new()),
+            model_notifies: RwLock::new(HashMap::new()),
             idle_notify: Arc::new(Notify::new()),
             queue_slots: Arc::new(Semaphore::new(queue_max_requests)),
             queue_kib: Arc::new(Semaphore::new(queue_max_kib)),
@@ -183,12 +209,20 @@ impl Scheduler {
             Arc::clone(&self.queued_bytes),
             rounded_bytes,
         );
+        let model_notify = model.map(|name| self.model_notifier(name));
         let mut registered = HashSet::new();
         let mut acquisitions = FuturesUnordered::<PendingAcquisition>::new();
         loop {
             let state_changed = self.notify.notified();
             tokio::pin!(state_changed);
             state_changed.as_mut().enable();
+            let model_changed = async {
+                match &model_notify {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(model_changed);
 
             for candidate in self.ranked_candidates(model, &prefix_input, excluded)? {
                 if registered.insert(candidate.node_instance_id) {
@@ -242,8 +276,38 @@ impl Scheduler {
                         score: candidate.score,
                     });
                 }
+                () = model_changed => {}
                 () = state_changed => {}
             }
+        }
+    }
+
+    fn model_notifier(&self, model: &str) -> Arc<Notify> {
+        if let Some(existing) = self.model_notifies.read().get(model) {
+            return Arc::clone(existing);
+        }
+        let mut notifies = self.model_notifies.write();
+        Arc::clone(
+            notifies
+                .entry(model.to_owned())
+                .or_insert_with(|| Arc::new(Notify::new())),
+        )
+    }
+
+    fn notify_for_node(&self, node: &Node) {
+        let mut has_wildcard = false;
+        let notifies = self.model_notifies.read();
+        for (public, _) in node.explicit_models() {
+            if let Some(notify) = notifies.get(public) {
+                notify.notify_waiters();
+            }
+        }
+        if node.upstream_model(None).is_some() {
+            has_wildcard = true;
+        }
+        drop(notifies);
+        if has_wildcard {
+            self.notify.notify_waiters();
         }
     }
 
@@ -262,7 +326,8 @@ impl Scheduler {
         drop(waiter);
         IngressAdmission {
             _request: request,
-            _bytes: bytes,
+            bytes: Some(bytes),
+            reserved_kib: body_kib as usize,
         }
     }
 
@@ -496,7 +561,7 @@ impl Scheduler {
     pub fn set_node_draining(&self, node_id: &str, draining: bool) -> Option<Arc<Node>> {
         let node = self.nodes().into_iter().find(|node| node.id() == node_id)?;
         if node.set_draining(draining) {
-            self.notify.notify_waiters();
+            self.notify_for_node(&node);
         }
         Some(node)
     }
@@ -572,10 +637,11 @@ impl Scheduler {
                 node.instance_id(),
             );
         }
+        let notify_node = Arc::clone(&node);
         nodes.push(node);
         nodes.sort_by(|left, right| left.id().cmp(right.id()));
         drop(nodes);
-        self.notify.notify_waiters();
+        self.notify_for_node(&notify_node);
         Ok(())
     }
 
@@ -603,7 +669,8 @@ impl Scheduler {
             );
         }
         drop(nodes);
-        self.notify.notify_waiters();
+        self.notify_for_node(&previous);
+        self.notify_for_node(&replacement);
         Ok(replacement)
     }
 
@@ -616,7 +683,7 @@ impl Scheduler {
         self.exact_cache
             .remove_node_owned(node_id, node.instance_id());
         drop(nodes);
-        self.notify.notify_waiters();
+        self.notify_for_node(&node);
         Some(node)
     }
 }

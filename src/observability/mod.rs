@@ -336,13 +336,18 @@ struct State {
 pub struct Observability {
     started: Instant,
     instance_id: String,
+    max_scopes_per_kind: usize,
     state: Mutex<State>,
 }
 impl Observability {
     pub fn new() -> Arc<Self> {
+        Self::with_max_scopes(MAX_SCOPES_PER_KIND)
+    }
+    pub fn with_max_scopes(max_scopes_per_kind: usize) -> Arc<Self> {
         Arc::new(Self {
             started: Instant::now(),
             instance_id: uuid::Uuid::now_v7().to_string(),
+            max_scopes_per_kind: max_scopes_per_kind.max(1),
             state: Mutex::new(State::default()),
         })
     }
@@ -352,7 +357,7 @@ impl Observability {
     pub(crate) fn configure_models(&self, models: Vec<String>) {
         let mut state = self.state.lock();
         for id in models.into_iter().filter(|id| id.len() <= 1024) {
-            if state.models.len() >= MAX_SCOPES_PER_KIND && !state.models.contains_key(&id) {
+            if state.models.len() >= self.max_scopes_per_kind && !state.models.contains_key(&id) {
                 break;
             }
             state
@@ -378,7 +383,8 @@ impl Observability {
         }
         if let Some(model) = model {
             if model.len() <= 1024
-                && (state.models.contains_key(model) || state.models.len() < MAX_SCOPES_PER_KIND)
+                && (state.models.contains_key(model)
+                    || state.models.len() < self.max_scopes_per_kind)
             {
                 state
                     .models
@@ -391,7 +397,7 @@ impl Observability {
         }
         if let Some((node, instance)) = node {
             if node.len() <= 1024
-                && (state.nodes.contains_key(node) || state.nodes.len() < MAX_SCOPES_PER_KIND)
+                && (state.nodes.contains_key(node) || state.nodes.len() < self.max_scopes_per_kind)
             {
                 let series = state
                     .nodes
@@ -446,7 +452,8 @@ impl Observability {
                 }
             }
             if node.id.len() > 1024
-                || (!state.nodes.contains_key(&node.id) && state.nodes.len() >= MAX_SCOPES_PER_KIND)
+                || (!state.nodes.contains_key(&node.id)
+                    && state.nodes.len() >= self.max_scopes_per_kind)
             {
                 state.limited_events += 1;
                 continue;
@@ -528,7 +535,7 @@ impl Observability {
             retention_seconds: RETENTION,
             step_seconds: STEP,
             window_seconds: seconds,
-            scope_limit_per_kind: MAX_SCOPES_PER_KIND,
+            scope_limit_per_kind: self.max_scopes_per_kind,
             limited_events: state.limited_events,
             fleet: state.fleet.snapshot("fleet", "", now, seconds),
             nodes,

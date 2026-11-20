@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     io::{self, Write},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 
@@ -459,22 +462,16 @@ pub struct PrefixDirectory {
     max_tree_chars_per_node: usize,
     max_trees: usize,
     max_directory_chars: usize,
-    trees: RwLock<PrefixTrees>,
-}
-
-#[derive(Debug, Default)]
-struct PrefixTrees {
-    values: HashMap<String, TreeEntry>,
-    epoch: u64,
-    // Updated with each tree's character delta while holding the directory lock.
-    total_chars: usize,
+    epoch: AtomicU64,
+    total_chars: AtomicUsize,
+    trees: RwLock<HashMap<String, Arc<TreeEntry>>>,
 }
 
 #[derive(Debug)]
 struct TreeEntry {
-    tree: Arc<RwLock<RadixTree>>,
-    last_recorded: u64,
-    accounted_chars: usize,
+    tree: RwLock<RadixTree>,
+    last_recorded: AtomicU64,
+    accounted_chars: AtomicUsize,
 }
 
 impl PrefixDirectory {
@@ -484,7 +481,9 @@ impl PrefixDirectory {
             max_tree_chars_per_node: config.max_tree_chars_per_node,
             max_trees: config.max_trees,
             max_directory_chars: config.max_directory_chars,
-            trees: RwLock::new(PrefixTrees::default()),
+            epoch: AtomicU64::new(0),
+            total_chars: AtomicUsize::new(0),
+            trees: RwLock::new(HashMap::new()),
         }
     }
 
@@ -493,7 +492,7 @@ impl PrefixDirectory {
     }
 
     pub(crate) fn record_for_node(&self, node: &crate::node::Node, input: &PrefixInput) {
-        // Check retirement under the same lock as clear_node: an old response
+        // Check retirement under the same per-tree lock as clear_node: an old response
         // must not repopulate affinity after its node configuration was replaced.
         self.record_if(node.id(), input, || !node.is_retired());
     }
@@ -502,26 +501,34 @@ impl PrefixDirectory {
         if !self.enabled || input.text.is_empty() || input.tree_key.len() > MAX_TREE_KEY_BYTES {
             return;
         }
-        let mut trees = self.trees.write();
+        let epoch = self.epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        // Fast path: look up an existing tree under a shared directory read lock
+        // so inserts for different models/endpoints do not contend globally.
+        let entry = if let Some(existing) = self.trees.read().get(&input.tree_key).cloned() {
+            existing
+        } else {
+            let mut trees = self.trees.write();
+            if let Some(existing) = trees.get(&input.tree_key).cloned() {
+                existing
+            } else {
+                if trees.len() >= self.max_trees {
+                    evict_oldest_tree(&mut trees, &self.total_chars);
+                }
+                let created = Arc::new(TreeEntry {
+                    tree: RwLock::new(RadixTree::default()),
+                    last_recorded: AtomicU64::new(epoch),
+                    accounted_chars: AtomicUsize::new(0),
+                });
+                trees.insert(input.tree_key.clone(), Arc::clone(&created));
+                created
+            }
+        };
+
+        let mut tree = entry.tree.write();
         if !current() {
             return;
         }
-        trees.epoch = trees.epoch.wrapping_add(1);
-        let epoch = trees.epoch;
-        if !trees.values.contains_key(&input.tree_key) && trees.values.len() >= self.max_trees {
-            evict_oldest_tree(&mut trees);
-        }
-        let entry = trees
-            .values
-            .entry(input.tree_key.clone())
-            .or_insert_with(|| TreeEntry {
-                tree: Arc::new(RwLock::new(RadixTree::default())),
-                last_recorded: epoch,
-                accounted_chars: 0,
-            });
-        entry.last_recorded = epoch;
-        let previous_chars = entry.accounted_chars;
-        let mut tree = entry.tree.write();
+        entry.last_recorded.store(epoch, Ordering::Relaxed);
         let previous_tenant_chars = tree
             .tenant_char_count
             .get(node_id)
@@ -533,18 +540,24 @@ impl PrefixDirectory {
             .get(node_id)
             .copied()
             .unwrap_or_default();
-        entry.accounted_chars = previous_chars
-            .saturating_sub(previous_tenant_chars)
-            .saturating_add(tenant_chars);
-        let accounted_chars = entry.accounted_chars;
         drop(tree);
-        trees.total_chars = trees
-            .total_chars
-            .saturating_sub(previous_chars)
-            .saturating_add(accounted_chars);
-        while trees.total_chars > self.max_directory_chars {
-            if !evict_oldest_tree(&mut trees) {
-                break;
+
+        if tenant_chars >= previous_tenant_chars {
+            let delta = tenant_chars - previous_tenant_chars;
+            entry.accounted_chars.fetch_add(delta, Ordering::Relaxed);
+            self.total_chars.fetch_add(delta, Ordering::Relaxed);
+        } else {
+            let delta = previous_tenant_chars - tenant_chars;
+            saturating_fetch_sub(&entry.accounted_chars, delta);
+            saturating_fetch_sub(&self.total_chars, delta);
+        }
+
+        if self.total_chars.load(Ordering::Relaxed) > self.max_directory_chars {
+            let mut trees = self.trees.write();
+            while self.total_chars.load(Ordering::Relaxed) > self.max_directory_chars {
+                if !evict_oldest_tree(&mut trees, &self.total_chars) {
+                    break;
+                }
             }
         }
     }
@@ -553,45 +566,53 @@ impl PrefixDirectory {
         if !self.enabled || input.text.is_empty() || input.tree_key.len() > MAX_TREE_KEY_BYTES {
             return PrefixMatch::default();
         }
-        let tree = self
-            .trees
-            .read()
-            .values
-            .get(&input.tree_key)
-            .map(|entry| Arc::clone(&entry.tree));
-        tree.map_or_else(PrefixMatch::default, |tree| {
-            tree.read().prefix_match(&input.text, input.char_count())
+        let entry = self.trees.read().get(&input.tree_key).cloned();
+        entry.map_or_else(PrefixMatch::default, |entry| {
+            entry
+                .tree
+                .read()
+                .prefix_match(&input.text, input.char_count())
         })
     }
 
     pub fn clear_node(&self, node_id: &str) {
         let mut trees = self.trees.write();
         let mut total_chars = 0usize;
-        trees.values.retain(|_, entry| {
+        trees.retain(|_, entry| {
             let mut tree = entry.tree.write();
             tree.clear_tenant(node_id);
-            entry.accounted_chars = tree
+            let accounted = tree
                 .tenant_char_count
                 .values()
                 .fold(0_usize, |total, chars| total.saturating_add(*chars));
-            total_chars = total_chars.saturating_add(entry.accounted_chars);
-            entry.accounted_chars > 0
+            entry.accounted_chars.store(accounted, Ordering::Relaxed);
+            total_chars = total_chars.saturating_add(accounted);
+            accounted > 0
         });
-        trees.total_chars = total_chars;
+        self.total_chars.store(total_chars, Ordering::Relaxed);
     }
 }
 
-fn evict_oldest_tree(trees: &mut PrefixTrees) -> bool {
+fn saturating_fetch_sub(counter: &AtomicUsize, delta: usize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(delta))
+    });
+}
+
+fn evict_oldest_tree(
+    trees: &mut HashMap<String, Arc<TreeEntry>>,
+    total_chars: &AtomicUsize,
+) -> bool {
     let Some(oldest) = trees
-        .values
         .iter()
-        .min_by_key(|(_, entry)| entry.last_recorded)
+        .min_by_key(|(_, entry)| entry.last_recorded.load(Ordering::Relaxed))
         .map(|(key, _)| key.clone())
     else {
         return false;
     };
-    if let Some(removed) = trees.values.remove(&oldest) {
-        trees.total_chars = trees.total_chars.saturating_sub(removed.accounted_chars);
+    if let Some(removed) = trees.remove(&oldest) {
+        let removed_chars = removed.accounted_chars.load(Ordering::Relaxed);
+        saturating_fetch_sub(total_chars, removed_chars);
     }
     true
 }
@@ -1053,7 +1074,7 @@ mod tests {
             );
             directory.record("node-a", &input);
         }
-        assert_eq!(directory.trees.read().values.len(), 2);
+        assert_eq!(directory.trees.read().len(), 2);
         let evicted = routing_text(
             "completions",
             Some("a"),
@@ -1066,7 +1087,7 @@ mod tests {
         );
 
         directory.clear_node("node-a");
-        assert!(directory.trees.read().values.is_empty());
+        assert!(directory.trees.read().is_empty());
     }
 
     #[test]
@@ -1091,15 +1112,14 @@ mod tests {
         let trees = directory.trees.read();
         assert!(
             trees
-                .values
                 .values()
-                .map(|entry| entry.accounted_chars)
+                .map(|entry| entry.accounted_chars.load(Ordering::Relaxed))
                 .sum::<usize>()
                 <= config.max_directory_chars
         );
         drop(trees);
 
-        let before = directory.trees.read().values.len();
+        let before = directory.trees.read().len();
         let long_model = "m".repeat(MAX_TREE_KEY_BYTES + 1);
         directory.record(
             "node-a",
@@ -1110,7 +1130,7 @@ mod tests {
                 &config,
             ),
         );
-        assert_eq!(directory.trees.read().values.len(), before);
+        assert_eq!(directory.trees.read().len(), before);
     }
 
     #[test]
@@ -1131,30 +1151,31 @@ mod tests {
             };
             directory.record(&node_id, &input);
             // Updating a complete prefix must not increase the accounted size.
-            let before = directory.trees.read().total_chars;
+            let before = directory.total_chars.load(Ordering::Relaxed);
             directory.record(&node_id, &input);
-            assert_eq!(directory.trees.read().total_chars, before);
+            assert_eq!(directory.total_chars.load(Ordering::Relaxed), before);
             if index % 11 == 0 {
                 directory.clear_node(&format!("node-{}", (index + 1) % 4));
             }
             let trees = directory.trees.read();
             let mut expected_total = 0;
-            for entry in trees.values.values() {
+            for entry in trees.values() {
                 let tree = entry.tree.read();
                 let expected = tree.tenant_char_count.values().sum::<usize>();
-                assert_eq!(entry.accounted_chars, expected);
+                assert_eq!(entry.accounted_chars.load(Ordering::Relaxed), expected);
                 assert!(tree.tenant_char_count.values().all(|chars| *chars <= 32));
                 expected_total += expected;
             }
-            assert_eq!(trees.total_chars, expected_total);
-            assert!(trees.total_chars <= config.max_directory_chars);
-            assert!(trees.values.len() <= config.max_trees);
+            let total_chars = directory.total_chars.load(Ordering::Relaxed);
+            assert_eq!(total_chars, expected_total);
+            assert!(total_chars <= config.max_directory_chars);
+            assert!(trees.len() <= config.max_trees);
         }
         for index in 0..4 {
             directory.clear_node(&format!("node-{index}"));
         }
-        assert_eq!(directory.trees.read().total_chars, 0);
-        assert!(directory.trees.read().values.is_empty());
+        assert_eq!(directory.total_chars.load(Ordering::Relaxed), 0);
+        assert!(directory.trees.read().is_empty());
     }
 
     #[test]
@@ -1174,13 +1195,7 @@ mod tests {
             directory.record("node-a", &input);
         }
         let trees = directory.trees.read();
-        let tree = trees
-            .values
-            .values()
-            .next()
-            .expect("one model tree")
-            .tree
-            .read();
+        let tree = trees.values().next().expect("one model tree").tree.read();
         assert!(
             tree.tenant_char_count
                 .get("node-a")

@@ -59,10 +59,12 @@ pub(super) async fn reconcile_control_plane(state: &Arc<AppState>) -> Result<()>
     let _mutation = state.admin_mutation.lock().await;
     let before = state.store.revision_async().await?;
     let stored_nodes = state.store.list_async().await?;
+    let stored_ip_limits = state.store.list_ip_limits_async().await?;
     let after = state.store.revision_async().await?;
     if before != after {
         return Ok(());
     }
+    state.connections.replace_limits(stored_ip_limits);
 
     let persisted_ids = stored_nodes
         .iter()
@@ -130,6 +132,7 @@ pub(super) async fn reconcile_control_plane(state: &Arc<AppState>) -> Result<()>
 
     if failures.is_empty() {
         state.control_revision.store(after, AtomicOrdering::Release);
+        let _ = state.control_events.send(after);
         Ok(())
     } else {
         anyhow::bail!(failures.join("; "))

@@ -84,6 +84,14 @@ pub struct ServerConfig {
     pub max_buffered_response_bytes: usize,
     pub expose_node_header: bool,
     pub log_json: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub public_api_keys: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_rpm_limit: Option<u32>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub trust_proxy_headers: bool,
+    #[serde(skip_serializing_if = "is_default_observability_max_scopes")]
+    pub observability_max_scopes: usize,
 }
 
 impl Default for ServerConfig {
@@ -111,8 +119,22 @@ impl Default for ServerConfig {
             max_buffered_response_bytes: 256 * 1024 * 1024,
             expose_node_header: false,
             log_json: false,
+            public_api_keys: Vec::new(),
+            public_rpm_limit: None,
+            trust_proxy_headers: false,
+            observability_max_scopes: 32,
         }
     }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_observability_max_scopes(value: &usize) -> bool {
+    *value == ServerConfig::default().observability_max_scopes
 }
 
 #[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]

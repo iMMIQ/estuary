@@ -48,6 +48,32 @@ const TOKENIZATION_CACHE_ENTRY_OVERHEAD: usize = 128;
 #[error("vLLM upstream is unhealthy; full KV replay is required")]
 struct KvUpstreamUnhealthy;
 
+type InflightTokenization = watch::Sender<Option<Option<Vec<u64>>>>;
+
+struct InflightGuard<'a> {
+    inflight: &'a Mutex<HashMap<[u8; 32], InflightTokenization>>,
+    key: [u8; 32],
+    sender: Option<InflightTokenization>,
+}
+
+impl InflightGuard<'_> {
+    fn complete(mut self, tokens: Option<Vec<u64>>) {
+        self.inflight.lock().remove(&self.key);
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(Some(tokens));
+        }
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            self.inflight.lock().remove(&self.key);
+            let _ = sender.send(Some(None));
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct VllmManager {
     scheduler: Arc<Scheduler>,
@@ -55,6 +81,7 @@ pub struct VllmManager {
     prefix: Arc<PrefixDirectory>,
     state_notify: Arc<Notify>,
     token_cache: Mutex<TokenizationCache>,
+    inflight: Mutex<HashMap<[u8; 32], InflightTokenization>>,
 }
 
 #[derive(Debug)]
@@ -117,6 +144,7 @@ impl VllmManager {
             state_notify: scheduler.state_notifier(),
             scheduler,
             token_cache: Mutex::new(TokenizationCache::new(cache_entries)),
+            inflight: Mutex::new(HashMap::new()),
         })
     }
 
@@ -327,8 +355,6 @@ impl VllmManager {
         let key = tokenization_key(
             &prompt.path,
             public_model,
-            node.id(),
-            node.instance_id(),
             node.provider_generation(),
             &payload,
         );
@@ -337,7 +363,49 @@ impl VllmManager {
             result.node_ids = Some(node_ids);
             return result;
         }
+        // Singleflight: coalesce concurrent tokenization requests for the same
+        // pool-scoped prompt key so cold bursts do not stampede upstream /render.
+        let (guard, mut follower) = {
+            let mut inflight = self.inflight.lock();
+            if let Some(existing) = inflight.get(&key) {
+                (None, Some(existing.subscribe()))
+            } else {
+                let (sender, _) = watch::channel(None);
+                inflight.insert(key, sender.clone());
+                (
+                    Some(InflightGuard {
+                        inflight: &self.inflight,
+                        key,
+                        sender: Some(sender),
+                    }),
+                    None,
+                )
+            }
+        };
         let timeout = Duration::from_millis(node.provider().request_timeout_ms);
+        if let Some(mut rx) = follower.take() {
+            let waited = tokio::time::timeout(timeout, async {
+                loop {
+                    if let Some(tokens) = rx.borrow().clone() {
+                        return Ok(tokens);
+                    }
+                    if rx.changed().await.is_err() {
+                        return Err(());
+                    }
+                }
+            })
+            .await;
+            return match waited {
+                Ok(Ok(Some(tokens))) => {
+                    let mut result = RoutingTokenization::new(Some(tokens), "cache_hit", started);
+                    result.node_ids = Some(node_ids);
+                    result
+                }
+                Ok(Ok(None) | Err(())) => RoutingTokenization::new(None, "upstream_error", started),
+                Err(_) => RoutingTokenization::new(None, "deadline", started),
+            };
+        }
+        let guard = guard.expect("leader always owns inflight guard");
         match tokio::time::timeout(
             timeout,
             request_tokenization(client, node, &prompt.path, payload, prompt.fallback),
@@ -346,17 +414,23 @@ impl VllmManager {
         {
             Ok(Ok(tokens)) if !node.is_retired() => {
                 self.token_cache.lock().insert(key, tokens.clone());
+                guard.complete(Some(tokens.clone()));
                 let mut result =
                     RoutingTokenization::new(Some(tokens), "upstream_success", started);
                 result.node_ids = Some(node_ids);
                 result
             }
-            Ok(Ok(_)) => RoutingTokenization::new(None, "node_retired", started),
+            Ok(Ok(_)) => {
+                guard.complete(None);
+                RoutingTokenization::new(None, "node_retired", started)
+            }
             Ok(Err(error)) => {
+                guard.complete(None);
                 debug!(node = node.id(), error = %error, "vLLM tokenization failed");
                 RoutingTokenization::new(None, "upstream_error", started)
             }
             Err(_) => {
+                guard.complete(None);
                 debug!(
                     node = node.id(),
                     "vLLM tokenization exceeded its total deadline"

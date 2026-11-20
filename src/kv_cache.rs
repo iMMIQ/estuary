@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     mem::size_of,
+    sync::Arc,
 };
 
 use anyhow::{Result, bail};
@@ -45,7 +46,7 @@ pub struct NodeCacheSnapshot {
 
 #[derive(Debug, Default)]
 pub struct ExactCacheDirectory {
-    nodes: RwLock<HashMap<String, NodeCache>>,
+    nodes: RwLock<HashMap<String, Arc<RwLock<NodeCache>>>>,
 }
 
 impl ExactCacheDirectory {
@@ -65,23 +66,26 @@ impl ExactCacheDirectory {
         owner: u64,
     ) {
         let mut nodes = self.nodes.write();
-        match nodes.get_mut(node_id) {
-            Some(node) if node.owner == owner => {
+        if let Some(existing) = nodes.get(node_id) {
+            let mut node = existing.write();
+            if node.owner == owner {
                 node.max_blocks = max_blocks;
                 node.max_bytes = max_bytes;
-            }
-            _ => {
-                nodes.insert(
-                    node_id.to_owned(),
-                    NodeCache::new(max_blocks, max_bytes, owner),
-                );
+                return;
             }
         }
+        nodes.insert(
+            node_id.to_owned(),
+            Arc::new(RwLock::new(NodeCache::new(max_blocks, max_bytes, owner))),
+        );
     }
 
     pub fn remove_node_owned(&self, node_id: &str, owner: u64) {
         let mut nodes = self.nodes.write();
-        if nodes.get(node_id).is_some_and(|node| node.owner == owner) {
+        if nodes
+            .get(node_id)
+            .is_some_and(|node| node.read().owner == owner)
+        {
             nodes.remove(node_id);
         }
     }
@@ -96,10 +100,14 @@ impl ExactCacheDirectory {
         owner: u64,
         mutations: Vec<CacheMutation>,
     ) -> Result<()> {
-        let mut nodes = self.nodes.write();
-        let Some(node) = nodes.get_mut(node_id) else {
-            bail!("KV cache node {node_id} was not configured");
+        let node_lock = {
+            let nodes = self.nodes.read();
+            let Some(node) = nodes.get(node_id) else {
+                bail!("KV cache node {node_id} was not configured");
+            };
+            Arc::clone(node)
         };
+        let mut node = node_lock.write();
         if node.owner != owner {
             return Ok(());
         }
@@ -135,10 +143,12 @@ impl ExactCacheDirectory {
     }
 
     pub fn invalidate_node_owned(&self, node_id: &str, owner: u64) {
-        if let Some(node) = self.nodes.write().get_mut(node_id)
-            && node.owner == owner
-        {
-            node.invalidate();
+        let node_lock = self.nodes.read().get(node_id).cloned();
+        if let Some(node_lock) = node_lock {
+            let mut node = node_lock.write();
+            if node.owner == owner {
+                node.invalidate();
+            }
         }
     }
 
@@ -147,10 +157,12 @@ impl ExactCacheDirectory {
     }
 
     pub fn suspend_node_owned(&self, node_id: &str, owner: u64) {
-        if let Some(node) = self.nodes.write().get_mut(node_id)
-            && node.owner == owner
-        {
-            node.authoritative = false;
+        let node_lock = self.nodes.read().get(node_id).cloned();
+        if let Some(node_lock) = node_lock {
+            let mut node = node_lock.write();
+            if node.owner == owner {
+                node.authoritative = false;
+            }
         }
     }
 
@@ -159,37 +171,46 @@ impl ExactCacheDirectory {
     }
 
     pub fn resume_node_owned(&self, node_id: &str, owner: u64) {
-        if let Some(node) = self.nodes.write().get_mut(node_id)
-            && node.owner == owner
-        {
-            node.authoritative = true;
+        let node_lock = self.nodes.read().get(node_id).cloned();
+        if let Some(node_lock) = node_lock {
+            let mut node = node_lock.write();
+            if node.owner == owner {
+                node.authoritative = true;
+            }
         }
     }
 
     pub fn matches(&self, token_ids: &[u64]) -> ExactPrefixMatch {
-        let nodes = self.nodes.read();
+        let entries: Vec<(String, Arc<RwLock<NodeCache>>)> = self
+            .nodes
+            .read()
+            .iter()
+            .map(|(id, lock)| (id.clone(), Arc::clone(lock)))
+            .collect();
         let mut result = ExactPrefixMatch::default();
-        for (node_id, node) in &*nodes {
+        for (node_id, node_lock) in entries {
+            let node = node_lock.read();
             if !node.authoritative {
                 continue;
             }
+            let matched = node.longest_match(token_ids);
+            drop(node);
             result.authoritative_nodes.insert(node_id.clone());
-            result
-                .matched_tokens
-                .insert(node_id.clone(), node.longest_match(token_ids));
+            result.matched_tokens.insert(node_id, matched);
         }
         result
     }
 
     pub fn snapshot(&self, node_id: &str) -> NodeCacheSnapshot {
-        self.nodes
-            .read()
-            .get(node_id)
-            .map_or_else(NodeCacheSnapshot::default, |node| NodeCacheSnapshot {
+        let node_lock = self.nodes.read().get(node_id).cloned();
+        node_lock.map_or_else(NodeCacheSnapshot::default, |node_lock| {
+            let node = node_lock.read();
+            NodeCacheSnapshot {
                 authoritative: node.authoritative,
                 blocks: node.block_count,
                 bytes: node.directory_bytes,
-            })
+            }
+        })
     }
 }
 

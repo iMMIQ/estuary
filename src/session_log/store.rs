@@ -99,12 +99,17 @@ pub(super) fn write_record(connection: &Connection, record: &RequestRecord) -> R
     Ok(())
 }
 
-pub(super) fn write_payloads(
-    connection: &Connection,
+pub(super) struct PreparedPayload<'a> {
+    payload: &'a CapturedPayload,
+    content: Value,
+    representation: &'static str,
+}
+
+pub(super) fn prepare_payloads<'a>(
     record: &mut RequestRecord,
-    payloads: &[CapturedPayload],
-    cache: &mut content::Cache,
-) -> Result<()> {
+    payloads: &'a [CapturedPayload],
+) -> Vec<PreparedPayload<'a>> {
+    let mut prepared = Vec::with_capacity(payloads.len());
     for payload in payloads {
         if payload.bytes.is_empty() {
             continue;
@@ -127,25 +132,42 @@ pub(super) fn write_payloads(
             }
             inspect::merge_usage(&mut attempt.usage, &usage);
         }
-        let root = content::put(connection, &content, cache)?;
-        let state = if payload.state == "partial" {
-            "partial"
-        } else if representation == "stream_summary" {
-            "summary"
-        } else if representation == "partial_text" {
-            "unparsed"
-        } else {
-            "complete"
-        };
-        if connection.execute("INSERT OR IGNORE INTO payloads(request_id,stage,attempt,root_hash,state,bytes_seen,representation,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![record.id,payload.stage,payload.attempt,root,state,payload.bytes_seen,representation,unix_millis()])?==1 {
-            connection.execute("UPDATE content_blobs SET refs=refs+1 WHERE hash=?1",[root])?;
-        }
+        prepared.push(PreparedPayload {
+            payload,
+            content,
+            representation,
+        });
     }
     record.usage = record
         .attempts
         .last()
         .map_or(Value::Null, |attempt| attempt.usage.clone());
+    prepared
+}
+
+pub(super) fn write_prepared_payloads(
+    connection: &Connection,
+    request_id: &str,
+    prepared: &[PreparedPayload<'_>],
+    cache: &mut content::Cache,
+) -> Result<()> {
+    for item in prepared {
+        let payload = item.payload;
+        let root = content::put(connection, &item.content, cache)?;
+        let state = if payload.state == "partial" {
+            "partial"
+        } else if item.representation == "stream_summary" {
+            "summary"
+        } else if item.representation == "partial_text" {
+            "unparsed"
+        } else {
+            "complete"
+        };
+        if connection.execute("INSERT OR IGNORE INTO payloads(request_id,stage,attempt,root_hash,state,bytes_seen,representation,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![request_id,payload.stage,payload.attempt,root,state,payload.bytes_seen,item.representation,unix_millis()])?==1 {
+            connection.execute("UPDATE content_blobs SET refs=refs+1 WHERE hash=?1",[root])?;
+        }
+    }
     Ok(())
 }
 

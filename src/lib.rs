@@ -2,6 +2,7 @@ mod anthropic;
 mod chat_bridge;
 pub mod config;
 mod connection_drain;
+pub mod crypto;
 pub mod error;
 pub mod health;
 mod inference_stats;

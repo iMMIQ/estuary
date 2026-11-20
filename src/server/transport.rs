@@ -248,4 +248,8 @@ impl ConnectionTracker {
     pub(super) fn remove_limit(&self, ip: IpAddr) -> bool {
         self.state.lock().limits.remove(&ip).is_some()
     }
+
+    pub(super) fn replace_limits(&self, limits: Vec<(IpAddr, usize)>) {
+        self.state.lock().limits = limits.into_iter().collect();
+    }
 }

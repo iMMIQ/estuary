@@ -16,7 +16,7 @@ use crate::{
     anthropic, chat_bridge,
     error::GatewayError,
     prefix::{PrefixInput, routing_text},
-    server::{AppState, RequestId},
+    server::{AppState, IngressAdmissionHandle, RequestId},
 };
 
 mod upstream;
@@ -86,6 +86,7 @@ pub async fn proxy(
     Extension(request_id): Extension<RequestId>,
     observation: Option<Extension<Arc<crate::session_log::Observation>>>,
     telemetry: Option<Extension<Arc<crate::observability::Observation>>>,
+    admission: Option<Extension<IngressAdmissionHandle>>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -93,6 +94,7 @@ pub async fn proxy(
 ) -> Response {
     let observation = observation.map(|Extension(log)| log);
     let telemetry = telemetry.map(|Extension(telemetry)| telemetry);
+    let admission = admission.map(|Extension(handle)| handle);
     let body_started = std::time::Instant::now();
     let is_anthropic = matches!(endpoint.as_str(), "messages" | "messages/count_tokens")
         || endpoint.starts_with("files/");
@@ -119,6 +121,9 @@ pub async fn proxy(
             return error.into_response();
         }
     };
+    if let Some(admission) = &admission {
+        admission.adjust_bytes(body.len());
+    }
     if let Some(log) = &observation {
         log.request_body(&body, crate::session_log::micros(body_started.elapsed()));
     }
@@ -132,6 +137,7 @@ pub async fn proxy(
         body,
         observation.clone(),
         telemetry,
+        admission,
     )
     .await;
     if let Err(error) = &result
@@ -186,6 +192,7 @@ async fn proxy_inner(
     body: Bytes,
     observation: Option<Arc<crate::session_log::Observation>>,
     telemetry: Option<Arc<crate::observability::Observation>>,
+    admission: Option<IngressAdmissionHandle>,
 ) -> Result<Response, GatewayError> {
     if endpoint.starts_with("files/") {
         return Err(GatewayError::UnsupportedFeature(
@@ -294,7 +301,13 @@ async fn proxy_inner(
             .approximate_prefix_worth_tokenizing(&prefix_input);
         let tokenization = state
             .vllm
-            .tokenize_for_routing(&state.client, &endpoint, model, parsed, allow_remote)
+            .tokenize_for_routing(
+                &state.control_client,
+                &endpoint,
+                model,
+                parsed,
+                allow_remote,
+            )
             .await;
         state
             .metrics
@@ -331,6 +344,7 @@ async fn proxy_inner(
             record_prefix,
             observation,
             telemetry,
+            admission,
         },
     )
     .await
@@ -338,6 +352,7 @@ async fn proxy_inner(
 
 struct ProxyRequest {
     telemetry: Option<Arc<crate::observability::Observation>>,
+    admission: Option<IngressAdmissionHandle>,
     endpoint: String,
     method: Method,
     query: Option<String>,

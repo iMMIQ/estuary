@@ -48,18 +48,19 @@ use transport::{BoundedTcpListener, ConnectionTracker, connection_request_starte
 mod assets;
 use assets::{admin_asset, admin_index, admin_redirect};
 mod middleware;
+pub use middleware::IngressAdmissionHandle;
 use middleware::{
-    admit_public_request, assign_request_id, authorize_admin, observe_request,
-    track_public_response,
+    PublicRateLimiter, admit_public_request, assign_request_id, authorize_admin,
+    authorize_and_rate_limit_public, observe_request, track_public_response,
 };
 mod reconcile;
 use reconcile::run_control_reconciler;
 mod admin;
 mod logs;
 use admin::{
-    activate_process, admin_node, admin_nodes, admin_status, create_node, delete_ip_limit,
-    delete_node, drain_node, drain_process, live, metrics, preflight_node, process_status, ready,
-    resume_node, set_ip_limit, update_node,
+    activate_process, admin_events, admin_node, admin_nodes, admin_status, create_node,
+    delete_ip_limit, delete_node, drain_node, drain_process, live, metrics, preflight_node,
+    process_status, ready, resume_node, set_ip_limit, update_node,
 };
 
 #[derive(Clone, Debug)]
@@ -69,6 +70,7 @@ pub struct AppState {
     pub(crate) telemetry: Arc<Observability>,
     sampler_started: AtomicBool,
     pub(crate) client: reqwest::Client,
+    pub(crate) control_client: reqwest::Client,
     pub(crate) scheduler: Arc<Scheduler>,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) settings: Arc<Settings>,
@@ -77,6 +79,8 @@ pub struct AppState {
     pub(crate) process: Arc<ProcessLifecycle>,
     pub(crate) response_buffer: Arc<ResponseBufferBudget>,
     pub(crate) session_log: Arc<crate::session_log::LogSink>,
+    pub(crate) rate_limiter: PublicRateLimiter,
+    pub(crate) control_events: watch::Sender<u64>,
     connections: Arc<ConnectionTracker>,
     runtime_revisions: RwLock<HashMap<String, u64>>,
     control_revision: AtomicU64,
@@ -139,6 +143,15 @@ impl Gateway {
             .user_agent(concat!("estuary/", env!("ESTUARY_BUILD_VERSION")))
             .build()
             .context("failed to build upstream HTTP client")?;
+        let control_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(settings.server.connect_timeout_ms))
+            .pool_max_idle_per_host(8)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .no_proxy()
+            .redirect(Policy::none())
+            .user_agent(concat!("estuary/", env!("ESTUARY_BUILD_VERSION")))
+            .build()
+            .context("failed to build control-plane HTTP client")?;
         let scheduler = Arc::new(Scheduler::new(nodes.clone(), settings.routing.clone()));
         let vllm = VllmManager::new(Arc::clone(&scheduler));
         let metrics = Metrics::new();
@@ -147,14 +160,17 @@ impl Gateway {
             Arc::clone(&metrics),
         );
         let connections = Arc::new(ConnectionTracker::default());
+        connections.replace_limits(store.list_ip_limits()?);
         let session_log = crate::session_log::LogSink::new(settings.session_log.clone());
-        let telemetry = Observability::new();
+        let telemetry = Observability::with_max_scopes(settings.server.observability_max_scopes);
         telemetry.configure_models(scheduler.models());
+        let (control_events, _) = watch::channel(control_revision);
         Ok(Self {
             state: Arc::new(AppState {
                 telemetry,
                 sampler_started: AtomicBool::new(false),
                 client,
+                control_client,
                 scheduler,
                 metrics,
                 settings: Arc::new(settings),
@@ -167,6 +183,8 @@ impl Gateway {
                 },
                 response_buffer,
                 session_log,
+                rate_limiter: PublicRateLimiter::default(),
+                control_events,
                 connections,
                 runtime_revisions: RwLock::new(runtime_revisions),
                 control_revision: AtomicU64::new(control_revision),
@@ -188,6 +206,10 @@ impl Gateway {
             .layer(axum_middleware::from_fn_with_state(
                 Arc::clone(&self.state),
                 admit_public_request,
+            ))
+            .layer(axum_middleware::from_fn_with_state(
+                Arc::clone(&self.state),
+                authorize_and_rate_limit_public,
             ))
             .layer(axum_middleware::from_fn_with_state(
                 Arc::clone(&self.state),
@@ -214,6 +236,7 @@ impl Gateway {
             .route("/metrics", get(metrics))
             .route("/admin/nodes", get(nodes))
             .route("/admin/api/status", get(admin_status))
+            .route("/admin/api/events", get(admin_events))
             .route("/admin/api/observability", get(admin::observability))
             .route("/admin/api/logs/status", get(logs::status))
             .route("/admin/api/logs/requests", get(logs::requests))
@@ -340,13 +363,13 @@ impl Gateway {
         let (provider_shutdown, provider_receiver) = watch::channel(false);
         let (control_shutdown, control_receiver) = watch::channel(false);
         let mut health_handle = tokio::spawn(run_health_monitor(
-            self.state.client.clone(),
+            self.state.control_client.clone(),
             Arc::clone(&self.state.scheduler),
             self.state.settings.health.clone(),
             health_receiver,
         ));
         let mut provider_handle = tokio::spawn(
-            Arc::clone(&self.state.vllm).run(self.state.client.clone(), provider_receiver),
+            Arc::clone(&self.state.vllm).run(self.state.control_client.clone(), provider_receiver),
         );
         let mut control_handle = tokio::spawn(run_control_reconciler(
             Arc::clone(&self.state),

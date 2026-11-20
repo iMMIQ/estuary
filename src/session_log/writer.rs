@@ -50,7 +50,7 @@ pub(super) fn run(
             let command = tokio::select! {
                 command = receiver.recv() => command,
                 _ = tick.tick() => {
-                    flush(&mut connection, &mut batch, stats);
+                    flush(&mut connection, &mut batch, stats).await;
                     batch_bytes = 0;
                     if maintenance_at.elapsed() >= Duration::from_secs(60) {
                         if let Some(db) = &mut connection
@@ -65,7 +65,7 @@ pub(super) fn run(
             };
             match command {
                 Some(Command::Flush(reply)) => {
-                    flush(&mut connection, &mut batch, stats);
+                    flush(&mut connection, &mut batch, stats).await;
                     batch_bytes = 0;
                     let _ =
                         reply.send(connection.is_some() && stats.available.load(Ordering::Relaxed));
@@ -77,12 +77,12 @@ pub(super) fn run(
                     }
                     batch.push(command);
                     if batch.len() >= 100 || batch_bytes >= 1024 * 1024 {
-                        flush(&mut connection, &mut batch, stats);
+                        flush(&mut connection, &mut batch, stats).await;
                         batch_bytes = 0;
                     }
                 }
                 None => {
-                    flush(&mut connection, &mut batch, stats);
+                    flush(&mut connection, &mut batch, stats).await;
                     if let Some(db) = &connection {
                         let _ = store::interrupt_boot(db, boot);
                     }
@@ -93,7 +93,11 @@ pub(super) fn run(
     });
 }
 
-fn flush(connection: &mut Option<rusqlite::Connection>, batch: &mut Vec<Command>, stats: &Stats) {
+async fn flush(
+    connection: &mut Option<rusqlite::Connection>,
+    batch: &mut Vec<Command>,
+    stats: &Stats,
+) {
     if batch.is_empty() {
         return;
     }
@@ -106,8 +110,8 @@ fn flush(connection: &mut Option<rusqlite::Connection>, batch: &mut Vec<Command>
     };
     let mut result = write_batch(db, batch);
     // WAL writers serialize. Give a short-lived competing batch a bounded
-    // chance to commit before dropping content or declaring the logger failed.
-    for _ in 1..4 {
+    // exponential backoff before dropping content or declaring the logger failed.
+    for retry in 0..3u32 {
         let busy = result.as_ref().err().is_some_and(|error| {
             matches!(error.downcast_ref::<rusqlite::Error>(),
                 Some(rusqlite::Error::SqliteFailure(code, _))
@@ -116,6 +120,8 @@ fn flush(connection: &mut Option<rusqlite::Connection>, batch: &mut Vec<Command>
         if !busy {
             break;
         }
+        let backoff_ms = 10u64 << retry;
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         result = write_batch(db, batch);
     }
     if let Err(error) = result {
@@ -159,29 +165,11 @@ fn write_batch(db: &mut rusqlite::Connection, batch: &mut [Command]) -> anyhow::
         match command {
             Command::Start(record) => store::write_record(&tx, record)?,
             Command::Finish(record, payloads) => {
-                // Request exists before FK-bound payload rows; final metadata
-                // is written again after usage extraction.
+                // Prepare payloads and extract usage before writing the request
+                // row once, avoiding redundant UPDATE statements per finish.
+                let prepared = store::prepare_payloads(record, payloads);
                 store::write_record(&tx, record)?;
-                store::write_payloads(&tx, record, payloads, &mut cache)?;
-                let mut metadata = record.clone();
-                metadata.attempts.clear();
-                metadata.events.clear();
-                let mut value = serde_json::to_value(metadata)?;
-                super::inspect::redact(&mut value);
-                tx.execute(
-                    "UPDATE requests SET data=?1 WHERE id=?2",
-                    rusqlite::params![serde_json::to_string(&value)?, record.id],
-                )?;
-                for attempt in &record.attempts {
-                    tx.execute(
-                        "UPDATE attempts SET data=?1 WHERE request_id=?2 AND number=?3",
-                        rusqlite::params![
-                            store::redacted_json(attempt)?,
-                            record.id,
-                            attempt.number
-                        ],
-                    )?;
-                }
+                store::write_prepared_payloads(&tx, &record.id, &prepared, &mut cache)?;
             }
             Command::Flush(_) => unreachable!(),
         }

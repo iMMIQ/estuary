@@ -1,12 +1,24 @@
-use std::{net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    net::IpAddr,
+    sync::{Arc, atomic::Ordering as AtomicOrdering},
+    time::Duration,
+};
 
 use anyhow::Result;
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{ETAG, IF_NONE_MATCH},
+    },
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::error;
@@ -102,19 +114,69 @@ pub(super) async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-pub(super) async fn admin_nodes(State(state): State<Arc<AppState>>) -> Response {
+pub(super) async fn admin_nodes(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let revision = state
+        .store
+        .revision_async()
+        .await
+        .unwrap_or_else(|_| state.control_revision.load(AtomicOrdering::Acquire));
+    let etag = format!("W/\"rev-{revision}\"");
+    if headers
+        .get(IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|candidate| candidate.trim() == etag)
+    {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        if let Ok(value) = HeaderValue::from_str(&etag) {
+            response.headers_mut().insert(ETAG, value);
+        }
+        return response;
+    }
     match state.store.list_async().await {
-        Ok(nodes) => Json(json!({
-            "nodes": nodes
-                .into_iter()
-                .filter_map(|stored| {
-                    let node = state.scheduler.node(&stored.config.id)?;
-                    Some(admin_node_payload(&state, &stored, &node))
-                })
-                .collect::<Vec<_>>()
-        }))
-        .into_response(),
+        Ok(nodes) => {
+            let mut response = Json(json!({
+                "nodes": nodes
+                    .into_iter()
+                    .filter_map(|stored| {
+                        let node = state.scheduler.node(&stored.config.id)?;
+                        Some(admin_node_payload(&state, &stored, &node))
+                    })
+                    .collect::<Vec<_>>()
+            }))
+            .into_response();
+            if let Ok(value) = HeaderValue::from_str(&etag) {
+                response.headers_mut().insert(ETAG, value);
+            }
+            response
+        }
         Err(error) => admin_internal_error("could not load node configurations", &error),
+    }
+}
+
+pub(super) async fn admin_events(
+    State(state): State<Arc<AppState>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let mut rx = state.control_events.subscribe();
+    let initial = *rx.borrow_and_update();
+    let stream = async_stream::stream! {
+        yield Ok(Event::default().event("revision").data(initial.to_string()));
+        while rx.changed().await.is_ok() {
+            let revision = *rx.borrow_and_update();
+            yield Ok(Event::default().event("revision").data(revision.to_string()));
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
+async fn publish_control_revision(state: &AppState) {
+    if let Ok(revision) = state.store.revision_async().await {
+        state
+            .control_revision
+            .store(revision, AtomicOrdering::Release);
+        let _ = state.control_events.send(revision);
     }
 }
 
@@ -296,7 +358,12 @@ pub(super) async fn set_ip_limit(
             "limit must be between 1 and the public connection limit",
         );
     }
+    let _mutation = state.admin_mutation.lock().await;
+    if let Err(error) = state.store.set_ip_limit_async(ip, input.limit).await {
+        return admin_internal_error("could not persist IP connection limit", &error);
+    }
     state.connections.set_limit(ip, input.limit);
+    publish_control_revision(&state).await;
     Json(json!({"ip": ip, "limit": input.limit})).into_response()
 }
 
@@ -307,7 +374,18 @@ pub(super) async fn delete_ip_limit(
     let Ok(ip) = ip.parse::<IpAddr>() else {
         return admin_message(StatusCode::BAD_REQUEST, "invalid_ip", "invalid IP address");
     };
-    Json(json!({"deleted": state.connections.remove_limit(ip)})).into_response()
+    let _mutation = state.admin_mutation.lock().await;
+    let deleted = match state.store.delete_ip_limit_async(ip).await {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            return admin_internal_error("could not delete persisted IP connection limit", &error);
+        }
+    };
+    let removed_live = state.connections.remove_limit(ip);
+    if deleted {
+        publish_control_revision(&state).await;
+    }
+    Json(json!({"deleted": deleted || removed_live})).into_response()
 }
 
 pub(super) async fn admin_node(
@@ -459,6 +537,7 @@ pub(super) async fn create_node(
         .runtime_revisions
         .write()
         .insert(config.id.clone(), stored.revision);
+    publish_control_revision(&state).await;
     (
         StatusCode::CREATED,
         Json(admin_node_payload(&state, &stored, &node)),
@@ -547,6 +626,7 @@ pub(super) async fn update_node(
         .runtime_revisions
         .write()
         .insert(node_id, updated.revision);
+    publish_control_revision(&state).await;
     Json(admin_node_payload(&state, &updated, &replacement)).into_response()
 }
 
@@ -607,6 +687,7 @@ pub(super) async fn delete_node(
     state.scheduler.remove_node(&node_id);
     state.metrics.remove_node(&node_id);
     state.runtime_revisions.write().remove(&node_id);
+    publish_control_revision(&state).await;
     Json(json!({"deleted": true, "node": node_id})).into_response()
 }
 
@@ -634,8 +715,8 @@ async fn prepare_node_candidate(
         state.settings.circuit_breaker.clone(),
     )?;
     if !previous.is_some_and(|previous| node.same_upstream_config(previous)) {
-        preflight_vllm(&state.client, &node).await?;
-        preflight_health(&state.client, &node, &state.settings.health).await?;
+        preflight_vllm(&state.control_client, &node).await?;
+        preflight_health(&state.control_client, &node, &state.settings.health).await?;
     }
     Ok(node)
 }
@@ -755,6 +836,7 @@ async fn persist_node_draining(
         .runtime_revisions
         .write()
         .insert(node_id.to_owned(), stored.revision);
+    publish_control_revision(state).await;
     Ok((node, stored.revision))
 }
 

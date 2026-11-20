@@ -384,3 +384,77 @@ async fn drain_preserves_an_accepted_connection_until_its_first_request() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn public_api_key_auth_and_rpm_rate_limiting() {
+    let mut settings = Settings::default();
+    settings.server.public_api_keys = vec!["sk-valid-key".to_owned()];
+    settings.server.public_rpm_limit = Some(2);
+    let gateway = Gateway::build(settings).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, gateway.public_router())
+            .await
+            .unwrap();
+    });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let url = format!("http://{addr}/v1/models");
+
+    // Missing key is rejected with 401.
+    let response = client.get(&url).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // Valid Bearer key succeeds up to the RPM limit.
+    for _ in 0..2 {
+        let response = client
+            .get(&url)
+            .header("authorization", "Bearer sk-valid-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // Third request in the same window is throttled with 429 and Retry-After.
+    let response = client
+        .get(&url)
+        .header("x-api-key", "sk-valid-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().contains_key("retry-after"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn admin_nodes_supports_etag_not_modified() {
+    let gateway = Gateway::build(Settings::default()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, gateway.admin_router()).await.unwrap();
+    });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let url = format!("http://{addr}/admin/api/nodes");
+
+    let first = client.get(&url).send().await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let etag = first
+        .headers()
+        .get("etag")
+        .expect("ETag header present")
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    let second = client
+        .get(&url)
+        .header("if-none-match", etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+    server.abort();
+}

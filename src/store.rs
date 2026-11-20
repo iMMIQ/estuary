@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{net::IpAddr, path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
@@ -7,34 +7,56 @@ use rusqlite_migration::{M, Migrations};
 use serde::Serialize;
 
 use crate::config::{NodeConfig, validate_node_config};
+use crate::crypto;
 use crate::time::unix_millis;
 
-const MIGRATION_LIST: &[M<'static>] = &[M::up(
-    "CREATE TABLE node_configs (
-        id TEXT PRIMARY KEY NOT NULL,
-        config_json TEXT NOT NULL,
-        revision INTEGER NOT NULL CHECK (revision > 0),
-        created_at_unix_ms INTEGER NOT NULL,
-        updated_at_unix_ms INTEGER NOT NULL
-    );
-    CREATE TABLE control_state (
-        singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
-        revision INTEGER NOT NULL CHECK (revision > 0)
-    );
-    INSERT INTO control_state (singleton, revision) VALUES (1, 1);
-    CREATE TRIGGER node_configs_control_insert
-    AFTER INSERT ON node_configs BEGIN
-        UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
-    END;
-    CREATE TRIGGER node_configs_control_update
-    AFTER UPDATE ON node_configs BEGIN
-        UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
-    END;
-    CREATE TRIGGER node_configs_control_delete
-    AFTER DELETE ON node_configs BEGIN
-        UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
-    END;",
-)];
+const MIGRATION_LIST: &[M<'static>] = &[
+    M::up(
+        "CREATE TABLE node_configs (
+            id TEXT PRIMARY KEY NOT NULL,
+            config_json TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision > 0),
+            created_at_unix_ms INTEGER NOT NULL,
+            updated_at_unix_ms INTEGER NOT NULL
+        );
+        CREATE TABLE control_state (
+            singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+            revision INTEGER NOT NULL CHECK (revision > 0)
+        );
+        INSERT INTO control_state (singleton, revision) VALUES (1, 1);
+        CREATE TRIGGER node_configs_control_insert
+        AFTER INSERT ON node_configs BEGIN
+            UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
+        END;
+        CREATE TRIGGER node_configs_control_update
+        AFTER UPDATE ON node_configs BEGIN
+            UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
+        END;
+        CREATE TRIGGER node_configs_control_delete
+        AFTER DELETE ON node_configs BEGIN
+            UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
+        END;",
+    ),
+    M::up(
+        "CREATE TABLE ip_limits (
+            ip TEXT PRIMARY KEY NOT NULL,
+            max_connections INTEGER NOT NULL CHECK (max_connections > 0),
+            updated_at_unix_ms INTEGER NOT NULL
+        );
+        CREATE TRIGGER ip_limits_control_insert
+        AFTER INSERT ON ip_limits BEGIN
+            UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
+        END;
+        CREATE TRIGGER ip_limits_control_update
+        AFTER UPDATE ON ip_limits BEGIN
+            UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
+        END;
+        CREATE TRIGGER ip_limits_control_delete
+        AFTER DELETE ON ip_limits BEGIN
+            UPDATE control_state SET revision = revision + 1 WHERE singleton = 1;
+        END;",
+    ),
+];
 const MIGRATIONS: Migrations<'static> = Migrations::from_slice(MIGRATION_LIST);
 
 #[derive(Clone, Debug, Serialize)]
@@ -142,7 +164,9 @@ impl NodeStore {
         if config.id != id {
             bail!("node id cannot be changed during update");
         }
-        let encoded = serde_json::to_string(config)?;
+        let mut persisted = config.clone();
+        crypto::encrypt_node_secrets(&mut persisted);
+        let encoded = serde_json::to_string(&persisted)?;
         let now = unix_millis();
         let revision = expected_revision.saturating_add(1);
         let mut connection = self.connection.lock();
@@ -206,6 +230,65 @@ impl NodeStore {
         Ok(())
     }
 
+    pub fn list_ip_limits(&self) -> Result<Vec<(IpAddr, usize)>> {
+        let connection = self.connection.lock();
+        let mut statement =
+            connection.prepare("SELECT ip, max_connections FROM ip_limits ORDER BY ip")?;
+        let rows = statement.query_map([], |row| {
+            let ip: String = row.get(0)?;
+            let limit: usize = row.get(1)?;
+            Ok((ip, limit))
+        })?;
+        let mut limits = Vec::new();
+        for row in rows {
+            let (ip, limit) = row.context("failed to load IP limit")?;
+            let ip = ip
+                .parse::<IpAddr>()
+                .with_context(|| format!("invalid persisted IP limit address {ip:?}"))?;
+            limits.push((ip, limit));
+        }
+        Ok(limits)
+    }
+
+    pub fn set_ip_limit(&self, ip: IpAddr, limit: usize) -> Result<()> {
+        let now = unix_millis();
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO ip_limits (ip, max_connections, updated_at_unix_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(ip) DO UPDATE SET
+                max_connections = excluded.max_connections,
+                updated_at_unix_ms = excluded.updated_at_unix_ms",
+            params![ip.to_string(), limit, now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_ip_limit(&self, ip: IpAddr) -> Result<bool> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed =
+            transaction.execute("DELETE FROM ip_limits WHERE ip = ?1", [ip.to_string()])?;
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub async fn list_ip_limits_async(self: &Arc<Self>) -> Result<Vec<(IpAddr, usize)>> {
+        self.run_blocking(Self::list_ip_limits).await
+    }
+
+    pub async fn set_ip_limit_async(self: &Arc<Self>, ip: IpAddr, limit: usize) -> Result<()> {
+        self.run_blocking(move |store| store.set_ip_limit(ip, limit))
+            .await
+    }
+
+    pub async fn delete_ip_limit_async(self: &Arc<Self>, ip: IpAddr) -> Result<bool> {
+        self.run_blocking(move |store| store.delete_ip_limit(ip))
+            .await
+    }
+
     pub async fn list_async(self: &Arc<Self>) -> Result<Vec<StoredNode>> {
         self.run_blocking(Self::list).await
     }
@@ -260,7 +343,9 @@ impl NodeStore {
 
 fn insert_node(connection: &Connection, config: &NodeConfig) -> Result<StoredNode> {
     validate_node_config(config)?;
-    let encoded = serde_json::to_string(config)?;
+    let mut persisted = config.clone();
+    crypto::encrypt_node_secrets(&mut persisted);
+    let encoded = serde_json::to_string(&persisted)?;
     let now = unix_millis();
     connection
         .execute(
@@ -280,7 +365,7 @@ fn insert_node(connection: &Connection, config: &NodeConfig) -> Result<StoredNod
 
 fn decode_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNode> {
     let encoded: String = row.get(0)?;
-    let decode = || -> serde_json::Result<NodeConfig> {
+    let decode = || -> anyhow::Result<NodeConfig> {
         let mut value: serde_json::Value = serde_json::from_str(&encoded)?;
         // Keep old persisted nodes readable without carrying retired switches
         // through runtime configuration or accepting them in new API requests.
@@ -291,13 +376,15 @@ fn decode_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNode> {
             provider.remove("anthropic_protocol");
             provider.remove("flatten_codex_namespaces");
         }
-        serde_json::from_value(value)
+        let mut config: NodeConfig = serde_json::from_value(value)?;
+        crypto::decrypt_node_secrets(&mut config)?;
+        Ok(config)
     };
     let config = decode().map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
             encoded.len(),
             rusqlite::types::Type::Text,
-            Box::new(error),
+            error.into(),
         )
     })?;
     Ok(StoredNode {
@@ -505,6 +592,35 @@ mod tests {
 
         drop(first);
         drop(second);
+        for candidate in [
+            path.clone(),
+            path.with_extension("db-wal"),
+            path.with_extension("db-shm"),
+        ] {
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
+    fn ip_limits_persist_and_bump_control_revision() {
+        let path = std::env::temp_dir().join(format!("estuary-ip-{}.db", uuid::Uuid::now_v7()));
+        let ip: IpAddr = "198.51.100.10".parse().unwrap();
+        let initial_rev;
+        {
+            let store = NodeStore::open(&path).unwrap();
+            initial_rev = store.revision().unwrap();
+            store.set_ip_limit(ip, 42).unwrap();
+            assert!(store.revision().unwrap() > initial_rev);
+            assert_eq!(store.list_ip_limits().unwrap(), vec![(ip, 42)]);
+        }
+        {
+            let store = NodeStore::open(&path).unwrap();
+            assert_eq!(store.list_ip_limits().unwrap(), vec![(ip, 42)]);
+            let rev_before_delete = store.revision().unwrap();
+            assert!(store.delete_ip_limit(ip).unwrap());
+            assert!(store.revision().unwrap() > rev_before_delete);
+            assert!(store.list_ip_limits().unwrap().is_empty());
+        }
         for candidate in [
             path.clone(),
             path.with_extension("db-wal"),

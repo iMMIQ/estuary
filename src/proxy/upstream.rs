@@ -24,7 +24,7 @@ use super::{ProxyRequest, UpstreamResponseMode};
 #[allow(clippy::too_many_lines)]
 pub(super) async fn proxy_with_retries(
     state: Arc<AppState>,
-    request: ProxyRequest,
+    mut request: ProxyRequest,
 ) -> Result<Response, GatewayError> {
     let mut excluded = HashSet::new();
     let mut attempt = 0usize;
@@ -78,9 +78,9 @@ pub(super) async fn proxy_with_retries(
                 GatewayError::Internal
             })?;
         let upstream_endpoint_log = upstream_endpoint.to_owned();
-        let upstream_body = mapped_body(
+        let upstream_body = mapped_body_in_place(
             &request.original_body,
-            request.parsed_body.as_ref(),
+            request.parsed_body.as_mut(),
             selection.upstream_model.as_deref(),
             request.public_model.as_deref(),
             request.count_tokens,
@@ -254,6 +254,9 @@ pub(super) async fn proxy_with_retries(
         let upstream_body_timeout =
             Duration::from_millis(state.settings.server.upstream_body_timeout_ms);
         if !status.is_success() {
+            if let Some(admission) = &request.admission {
+                admission.release_bytes();
+            }
             if !status.is_server_error() && status != StatusCode::TOO_MANY_REQUESTS {
                 selection.lease.record_success(header_latency);
             }
@@ -291,7 +294,12 @@ pub(super) async fn proxy_with_retries(
             )
             .await;
             match buffered {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    if let Some(admission) = &request.admission {
+                        admission.release_bytes();
+                    }
+                    return Ok(response);
+                }
                 Err(error) => {
                     let retryable = attempt < state.settings.retry.max_attempts
                         && has_untried_alternative(
@@ -318,6 +326,9 @@ pub(super) async fn proxy_with_retries(
                     return Err(error);
                 }
             }
+        }
+        if let Some(admission) = &request.admission {
+            admission.release_bytes();
         }
         return Ok(streaming_response(
             response,
@@ -352,9 +363,12 @@ pub(super) fn has_untried_alternative(
     state.scheduler.has_alternative(model, &next_excluded)
 }
 
-pub(super) fn mapped_body(
+/// Serialize the upstream request body by temporarily patching only the
+/// top-level fields (`model`, `return_mm_kwargs`, `stream`) in place and
+/// restoring them afterwards, avoiding a full deep clone of large JSON prompts.
+pub(super) fn mapped_body_in_place(
     original: &Bytes,
-    parsed: Option<&Value>,
+    parsed: Option<&mut Value>,
     upstream_model: Option<&str>,
     public_model: Option<&str>,
     count_tokens: bool,
@@ -362,18 +376,65 @@ pub(super) fn mapped_body(
     if upstream_model == public_model && !count_tokens {
         return Ok(original.clone());
     }
-    let mut value = parsed.cloned().ok_or(GatewayError::InvalidJson)?;
+    let value = parsed.ok_or(GatewayError::InvalidJson)?;
     let object = value.as_object_mut().ok_or_else(|| {
         GatewayError::InvalidRequest("JSON request body must be an object".to_owned())
     })?;
-    if let Some(model) = upstream_model {
-        object.insert("model".into(), model.into());
-    }
-    if count_tokens {
-        object.insert("return_mm_kwargs".into(), false.into());
-        object.insert("stream".into(), false.into());
-    }
-    sonic_rs::to_vec(&value)
+    let previous_model = upstream_model.map(|model| object.insert("model".into(), model.into()));
+    let previous_mm = count_tokens.then(|| object.insert("return_mm_kwargs".into(), false.into()));
+    let previous_stream = count_tokens.then(|| object.insert("stream".into(), false.into()));
+
+    let encoded = sonic_rs::to_vec(&*object)
         .map(Bytes::from)
-        .map_err(|_| GatewayError::Internal)
+        .map_err(|_| GatewayError::Internal);
+
+    if let Some(prev) = previous_model {
+        match prev {
+            Some(old) => {
+                object.insert("model".into(), old);
+            }
+            None => {
+                object.remove("model");
+            }
+        }
+    }
+    if let Some(prev) = previous_mm {
+        match prev {
+            Some(old) => {
+                object.insert("return_mm_kwargs".into(), old);
+            }
+            None => {
+                object.remove("return_mm_kwargs");
+            }
+        }
+    }
+    if let Some(prev) = previous_stream {
+        match prev {
+            Some(old) => {
+                object.insert("stream".into(), old);
+            }
+            None => {
+                object.remove("stream");
+            }
+        }
+    }
+    encoded
+}
+
+#[cfg(test)]
+pub(super) fn mapped_body(
+    original: &Bytes,
+    parsed: Option<&Value>,
+    upstream_model: Option<&str>,
+    public_model: Option<&str>,
+    count_tokens: bool,
+) -> Result<Bytes, GatewayError> {
+    let mut cloned = parsed.cloned();
+    mapped_body_in_place(
+        original,
+        cloned.as_mut(),
+        upstream_model,
+        public_model,
+        count_tokens,
+    )
 }

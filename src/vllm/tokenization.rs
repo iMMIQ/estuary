@@ -188,17 +188,14 @@ async fn send_tokenization(
 pub(super) fn tokenization_key(
     endpoint: &str,
     public_model: &str,
-    node_id: &str,
-    instance_id: u64,
     generation: u64,
     payload: &Map<String, JsonValue>,
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    for value in [endpoint, public_model, node_id] {
+    for value in [endpoint, public_model] {
         hasher.update(value.as_bytes());
         hasher.update(&[0]);
     }
-    hasher.update(&instance_id.to_le_bytes());
     hasher.update(&generation.to_le_bytes());
     if let Ok(encoded) = sonic_rs::to_vec(payload) {
         hasher.update(&encoded);

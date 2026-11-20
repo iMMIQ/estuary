@@ -140,6 +140,14 @@ struct ServerOverrides {
     max_buffered_response_bytes: Option<usize>,
     #[arg(long, env = "ESTUARY_EXPOSE_NODE_HEADER")]
     expose_node_header: Option<bool>,
+    #[arg(long, env = "ESTUARY_PUBLIC_API_KEYS", value_delimiter = ',')]
+    public_api_keys: Option<Vec<String>>,
+    #[arg(long, env = "ESTUARY_PUBLIC_RPM_LIMIT")]
+    public_rpm_limit: Option<u32>,
+    #[arg(long, env = "ESTUARY_TRUST_PROXY_HEADERS")]
+    trust_proxy_headers: Option<bool>,
+    #[arg(long, env = "ESTUARY_OBSERVABILITY_MAX_SCOPES")]
+    observability_max_scopes: Option<usize>,
 }
 
 #[derive(Debug, Default, Args, Serialize)]

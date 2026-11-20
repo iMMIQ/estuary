@@ -90,6 +90,21 @@ impl Settings {
         if self.server.max_buffered_response_bytes > tokio::sync::Semaphore::MAX_PERMITS {
             bail!("server.max_buffered_response_bytes exceeds the runtime semaphore limit");
         }
+        if self
+            .server
+            .public_api_keys
+            .iter()
+            .any(|key| key.trim().is_empty())
+        {
+            bail!("server.public_api_keys entries must not be empty");
+        }
+        if self.server.public_rpm_limit == Some(0) {
+            bail!("server.public_rpm_limit must be greater than zero");
+        }
+        if self.server.observability_max_scopes == 0 || self.server.observability_max_scopes > 4096
+        {
+            bail!("server.observability_max_scopes must be between 1 and 4096");
+        }
 
         if self.routing.queue_max_requests == 0 || self.routing.queue_max_bytes < 1024 {
             bail!("routing queue limits must be greater than zero");
