@@ -7,14 +7,36 @@ use serde::Serialize;
 
 use crate::observability::{Rate, smooth};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub(crate) enum CounterKind {
+    PromptTokens = 0,
+    GenerationTokens = 1,
+    Requests = 2,
+    PrefixQueries = 3,
+    PrefixHits = 4,
+    Preemptions = 5,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderCounter {
     pub key: String,
-    pub kind: usize,
+    pub kind: CounterKind,
     pub value: f64,
 }
 
+pub(crate) fn sum_counter_kind(counters: &[ProviderCounter], kind: CounterKind) -> Option<f64> {
+    let mut iter = counters
+        .iter()
+        .filter(|counter| counter.kind == kind && counter.value.is_finite() && counter.value >= 0.0)
+        .map(|counter| counter.value)
+        .peekable();
+    iter.peek()?;
+    Some(iter.sum())
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
 pub struct EngineTelemetry {
     pub input: Rate,
     pub output: Rate,
@@ -30,6 +52,7 @@ pub struct EngineTelemetry {
     pub request_nodes: usize,
     pub resets: u64,
 }
+
 impl EngineTelemetry {
     pub(crate) fn aggregate(values: &[Self], expected_nodes: usize) -> Self {
         let sum = |read: fn(&Self) -> Option<f64>| {
@@ -37,43 +60,35 @@ impl EngineTelemetry {
             valid.peek()?;
             Some(valid.sum::<f64>())
         };
-        let rate = |read: fn(&Self) -> Rate| Rate {
-            raw: {
-                let values = values
-                    .iter()
-                    .filter_map(|v| read(v).raw)
-                    .collect::<Vec<_>>();
-                (!values.is_empty()).then(|| values.iter().sum())
-            },
-            smoothed: {
-                let values = values
-                    .iter()
-                    .filter_map(|v| read(v).smoothed)
-                    .collect::<Vec<_>>();
-                (!values.is_empty()).then(|| values.iter().sum())
-            },
-            mean_60s: {
-                let values = values
-                    .iter()
-                    .filter_map(|v| read(v).mean_60s)
-                    .collect::<Vec<_>>();
-                (!values.is_empty()).then(|| values.iter().sum())
-            },
+        let rate = |raw: fn(&Self) -> Option<f64>,
+                    smoothed: fn(&Self) -> Option<f64>,
+                    mean_60s: fn(&Self) -> Option<f64>| Rate {
+            raw: sum(raw),
+            smoothed: sum(smoothed),
+            mean_60s: sum(mean_60s),
         };
         // Pair numerator and denominator from the same reporting engines.
-        let paired = values
+        let (has_cache, hits, queries) = values
             .iter()
             .filter_map(|v| Some((v.cache_hits_60s?, v.cache_queries_60s?)))
-            .collect::<Vec<_>>();
-        let hits = paired.iter().map(|v| v.0).sum::<f64>();
-        let queries = paired.iter().map(|v| v.1).sum::<f64>();
+            .fold((false, 0.0, 0.0), |(_, hits, queries), (h, q)| {
+                (true, hits + h, queries + q)
+            });
         Self {
-            input: rate(|v| v.input),
-            output: rate(|v| v.output),
-            requests: rate(|v| v.requests),
+            input: rate(|v| v.input.raw, |v| v.input.smoothed, |v| v.input.mean_60s),
+            output: rate(
+                |v| v.output.raw,
+                |v| v.output.smoothed,
+                |v| v.output.mean_60s,
+            ),
+            requests: rate(
+                |v| v.requests.raw,
+                |v| v.requests.smoothed,
+                |v| v.requests.mean_60s,
+            ),
             cache_hit_ratio: super::prefix_cache_hit_rate(Some(hits), Some(queries)),
-            cache_hits_60s: (!paired.is_empty()).then_some(hits),
-            cache_queries_60s: (!paired.is_empty()).then_some(queries),
+            cache_hits_60s: has_cache.then_some(hits),
+            cache_queries_60s: has_cache.then_some(queries),
             preemptions_per_minute: sum(|v| v.preemptions_per_minute),
             reporting_nodes: values.len(),
             expected_nodes,
@@ -91,6 +106,14 @@ struct Delta {
     elapsed: f64,
     values: [Option<f64>; 6],
 }
+
+impl Delta {
+    fn included_seconds(&self, now: Instant) -> f64 {
+        self.elapsed
+            .min((60.0 - now.duration_since(self.at).as_secs_f64()).max(0.0))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct Tracker {
     previous: HashMap<String, f64>,
@@ -98,6 +121,7 @@ pub(super) struct Tracker {
     history: VecDeque<Delta>,
     pub snapshot: EngineTelemetry,
 }
+
 impl Tracker {
     pub fn update(&mut self, counters: Vec<ProviderCounter>, now: Instant, max_gap: Duration) {
         if counters.len() > 512 {
@@ -138,7 +162,8 @@ impl Tracker {
         {
             self.history.pop_front();
         }
-        let rate = |index: usize, previous: Rate| {
+        let rate = |kind: CounterKind, previous: Rate| {
+            let index = kind as usize;
             let raw = values[index].zip(elapsed).and_then(|(delta, elapsed)| {
                 (elapsed > 0.0 && elapsed <= 60.0).then_some(delta / elapsed)
             });
@@ -148,54 +173,63 @@ impl Tracker {
                 mean_60s: self.mean(index, now),
             }
         };
-        let paired = self
+        let (queries_60s, hits_60s) = self
             .history
             .iter()
-            .filter_map(|delta| Some((delta.values[3]?, delta.values[4]?, delta)))
+            .filter_map(|delta| {
+                Some((
+                    delta.values[CounterKind::PrefixQueries as usize]?,
+                    delta.values[CounterKind::PrefixHits as usize]?,
+                    delta,
+                ))
+            })
             .fold((0.0, 0.0), |(queries, hits), (q, h, delta)| {
-                let included = delta
-                    .elapsed
-                    .min((60.0 - now.duration_since(delta.at).as_secs_f64()).max(0.0))
-                    / delta.elapsed;
-                (queries + q * included, hits + h * included)
+                let frac = delta.included_seconds(now) / delta.elapsed;
+                (queries + q * frac, hits + h * frac)
             });
+        let has_cache = values[CounterKind::PrefixQueries as usize].is_some()
+            && values[CounterKind::PrefixHits as usize].is_some();
         self.snapshot = EngineTelemetry {
-            input: rate(0, self.snapshot.input),
-            output: rate(1, self.snapshot.output),
-            requests: rate(2, self.snapshot.requests),
-            cache_hit_ratio: (values[3].is_some() && values[4].is_some() && paired.0 > 0.0)
-                .then(|| (paired.1 / paired.0).clamp(0.0, 1.0)),
-            cache_queries_60s: values[3].and(values[4]).map(|_| paired.0),
-            cache_hits_60s: values[3].and(values[4]).map(|_| paired.1),
-            preemptions_per_minute: values[5]
-                .and_then(|_| self.mean(5, now).map(|mean| mean * 60.0)),
+            input: rate(CounterKind::PromptTokens, self.snapshot.input),
+            output: rate(CounterKind::GenerationTokens, self.snapshot.output),
+            requests: rate(CounterKind::Requests, self.snapshot.requests),
+            cache_hit_ratio: (has_cache && queries_60s > 0.0)
+                .then(|| (hits_60s / queries_60s).clamp(0.0, 1.0)),
+            cache_queries_60s: has_cache.then_some(queries_60s),
+            cache_hits_60s: has_cache.then_some(hits_60s),
+            preemptions_per_minute: values[CounterKind::Preemptions as usize].and_then(|_| {
+                self.mean(CounterKind::Preemptions as usize, now)
+                    .map(|mean| mean * 60.0)
+            }),
             reporting_nodes: 1,
             expected_nodes: 1,
-            input_nodes: usize::from(values[0].is_some()),
-            output_nodes: usize::from(values[1].is_some()),
-            request_nodes: usize::from(values[2].is_some()),
+            input_nodes: usize::from(values[CounterKind::PromptTokens as usize].is_some()),
+            output_nodes: usize::from(values[CounterKind::GenerationTokens as usize].is_some()),
+            request_nodes: usize::from(values[CounterKind::Requests as usize].is_some()),
             resets: self.snapshot.resets,
         };
     }
+
     fn deltas(&mut self, counters: Vec<ProviderCounter>, elapsed: Option<f64>) -> [Option<f64>; 6] {
         let mut values = [None; 6];
         let mut invalid = [false; 6];
         let mut current = HashMap::new();
         let mut resets = self.snapshot.resets;
-        for counter in counters.into_iter().take(512) {
-            if counter.kind >= 6 || !counter.value.is_finite() || counter.value < 0.0 {
+        let valid_elapsed = elapsed.is_some_and(|e| e.is_finite() && e > 0.0);
+        for counter in counters {
+            if !counter.value.is_finite() || counter.value < 0.0 {
                 continue;
             }
+            let kind = counter.kind as usize;
             let previous = self.previous.get(&counter.key).copied();
             if previous.is_some_and(|previous| counter.value < previous) {
                 resets += 1;
             }
-            match super::counter_rate(Some(counter.value), previous, elapsed) {
-                Some(rate) => {
-                    values[counter.kind] =
-                        Some(values[counter.kind].unwrap_or(0.0) + rate * elapsed.unwrap_or(0.0));
+            match previous {
+                Some(prev) if valid_elapsed && prev.is_finite() && counter.value >= prev => {
+                    values[kind] = Some(values[kind].unwrap_or(0.0) + (counter.value - prev));
                 }
-                None => invalid[counter.kind] = true,
+                _ => invalid[kind] = true,
             }
             current.insert(counter.key, counter.value);
         }
@@ -211,14 +245,13 @@ impl Tracker {
         self.snapshot.resets = resets;
         values
     }
+
     fn mean(&self, index: usize, now: Instant) -> Option<f64> {
         let mut tokens = 0.0;
         let mut covered = 0.0;
         for delta in &self.history {
             if let Some(value) = delta.values[index] {
-                let included = delta
-                    .elapsed
-                    .min((60.0 - now.duration_since(delta.at).as_secs_f64()).max(0.0));
+                let included = delta.included_seconds(now);
                 tokens += value * included / delta.elapsed;
                 covered += included;
             }
@@ -231,20 +264,22 @@ impl Tracker {
 mod tests {
     use super::*;
     use std::time::Duration;
+
     fn counters(a: f64, b: f64) -> Vec<ProviderCounter> {
         vec![
             ProviderCounter {
                 key: "a".into(),
-                kind: 1,
+                kind: CounterKind::GenerationTokens,
                 value: a,
             },
             ProviderCounter {
                 key: "b".into(),
-                kind: 1,
+                kind: CounterKind::GenerationTokens,
                 value: b,
             },
         ]
     }
+
     #[test]
     fn each_engine_counter_resets_before_aggregation() {
         let mut tracker = Tracker::default();

@@ -5,6 +5,26 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 build_version=$(sh "${root}/deploy/build-version.sh")
 results=$(mktemp -d)
 trap 'rm -rf -- "${results}"' EXIT
+
+dockerfile_arg() {
+    sed -n "s/^ARG $1=//p" "${root}/Dockerfile" | head -n 1
+}
+
+normalize_image() {
+    local image=$1
+    if [[ ${image} == */* ]]; then
+        printf '%s' "${image}"
+    else
+        printf 'library/%s' "${image}"
+    fi
+}
+
+alpine_image=$(normalize_image "$(dockerfile_arg ALPINE_IMAGE)")
+rust_image=$(normalize_image "$(dockerfile_arg RUST_IMAGE)")
+bun_image=$(normalize_image "$(dockerfile_arg BUN_IMAGE)")
+node_image=$(normalize_image "$(dockerfile_arg NODE_IMAGE)")
+alpine_version=${alpine_image#*:}
+
 case $(uname -m) in
     x86_64) alpine_arch=x86_64 ;;
     aarch64 | arm64) alpine_arch=aarch64 ;;
@@ -31,7 +51,7 @@ probe_apk() {
     for repository in main community; do
         curl --fail --location --silent --connect-timeout 3 --max-time 10 \
             --output /dev/null \
-            "${base}/v3.21/${repository}/${alpine_arch}/APKINDEX.tar.gz" || return 0
+            "${base}/v${alpine_version}/${repository}/${alpine_arch}/APKINDEX.tar.gz" || return 0
     done
     elapsed=$(($(date +%s%3N) - start))
     printf '%s\t%s\t%s\n' "${elapsed}" "${name}" "${base}" \
@@ -41,7 +61,7 @@ probe_apk() {
 probe_docker() {
     local name=$1 prefix=$2 start elapsed code image
     start=$(date +%s%3N)
-    for image in library/alpine:3.21 library/rust:1.98.1-alpine3.22 oven/bun:1.4.4-alpine library/node:26.12.1-alpine3.24; do
+    for image in "${alpine_image}" "${rust_image}" "${bun_image}" "${node_image}"; do
         code=$(curl --location --silent --output /dev/null --write-out '%{http_code}' \
             --connect-timeout 3 --max-time 8 \
             --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
@@ -102,10 +122,10 @@ cd "${root}"
 printf 'Build version: %s\n' "${build_version}" >&2
 exec docker build --network host --tag "${ESTUARY_IMAGE:-estuary:local}" \
     --build-arg "ESTUARY_BUILD_VERSION=${build_version}" \
-    --build-arg "ALPINE_IMAGE=${docker_registry}/library/alpine:3.21" \
-    --build-arg "RUST_IMAGE=${docker_registry}/library/rust:1.98.1-alpine3.22" \
-    --build-arg "BUN_IMAGE=${docker_registry}/oven/bun:1.4.4-alpine" \
-    --build-arg "NODE_IMAGE=${docker_registry}/library/node:26.12.1-alpine3.24" \
+    --build-arg "ALPINE_IMAGE=${docker_registry}/${alpine_image}" \
+    --build-arg "RUST_IMAGE=${docker_registry}/${rust_image}" \
+    --build-arg "BUN_IMAGE=${docker_registry}/${bun_image}" \
+    --build-arg "NODE_IMAGE=${docker_registry}/${node_image}" \
     --build-arg "APK_REPOSITORY=${apk_repository}" \
     --build-arg "CARGO_REGISTRY=${cargo_registry}" \
     --build-arg "NPM_REGISTRY=${npm_registry}" \

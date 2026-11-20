@@ -16,6 +16,38 @@ use crate::{
 
 use super::{KV_HEALTH_POLL_MAX, KvUpstreamUnhealthy};
 
+#[derive(Default)]
+pub(super) struct KvSyncState {
+    pub(super) last_seq: Option<u64>,
+    pub(super) synchronized: bool,
+}
+
+impl KvSyncState {
+    fn invalidate(
+        &mut self,
+        node: &Node,
+        exact_cache: &ExactCacheDirectory,
+        prefix: &PrefixDirectory,
+    ) {
+        invalidate_cache_state(node, exact_cache, prefix);
+        self.last_seq = None;
+        self.synchronized = false;
+    }
+
+    fn reset_unhealthy(
+        &mut self,
+        node: &Node,
+        exact_cache: &ExactCacheDirectory,
+        prefix: &PrefixDirectory,
+    ) {
+        self.invalidate(node, exact_cache, prefix);
+        node.record_kv_event_error(
+            "KV cache state invalidated because the vLLM upstream is unhealthy; awaiting full replay"
+                .to_owned(),
+        );
+    }
+}
+
 pub(super) async fn run_event_supervisor(
     node: Arc<Node>,
     exact_cache: Arc<ExactCacheDirectory>,
@@ -23,8 +55,7 @@ pub(super) async fn run_event_supervisor(
     config: VllmKvEventsConfig,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut last_seq = None;
-    let mut synchronized = false;
+    let mut sync = KvSyncState::default();
     let mut suspended_for_health = false;
     loop {
         if *shutdown.borrow() {
@@ -32,13 +63,7 @@ pub(super) async fn run_event_supervisor(
         }
         if node.health() == HealthState::Unhealthy {
             if !suspended_for_health {
-                reset_unhealthy_cache_state(
-                    &node,
-                    &exact_cache,
-                    &prefix,
-                    &mut last_seq,
-                    &mut synchronized,
-                );
+                sync.reset_unhealthy(&node, &exact_cache, &prefix);
                 suspended_for_health = true;
                 warn!(
                     node = node.id(),
@@ -67,8 +92,7 @@ pub(super) async fn run_event_supervisor(
             &exact_cache,
             &prefix,
             &config,
-            &mut last_seq,
-            &mut synchronized,
+            &mut sync,
             &mut shutdown,
         )
         .await
@@ -78,13 +102,7 @@ pub(super) async fn run_event_supervisor(
                 let session_detected_unhealthy = error.is::<KvUpstreamUnhealthy>();
                 if session_detected_unhealthy || node.health() == HealthState::Unhealthy {
                     if !session_detected_unhealthy && !suspended_for_health {
-                        reset_unhealthy_cache_state(
-                            &node,
-                            &exact_cache,
-                            &prefix,
-                            &mut last_seq,
-                            &mut synchronized,
-                        );
+                        sync.reset_unhealthy(&node, &exact_cache, &prefix);
                     }
                     suspended_for_health = true;
                     warn!(
@@ -109,14 +127,12 @@ pub(super) async fn run_event_supervisor(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) async fn run_event_session(
     node: &Node,
     exact_cache: &ExactCacheDirectory,
     prefix: &PrefixDirectory,
     config: &VllmKvEventsConfig,
-    last_seq: &mut Option<u64>,
-    synchronized: &mut bool,
+    sync: &mut KvSyncState,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let mut socket = SubSocket::new();
@@ -127,28 +143,36 @@ pub(super) async fn run_event_session(
     info!(node = node.id(), endpoint = %config.endpoint, "subscribed to vLLM KV events");
 
     let mut replay_high_water = None;
-    if let Some(replay_endpoint) = config.replay_endpoint.as_ref() {
-        let start = replay_start_sequence(*last_seq, *synchronized);
-        match replay_available(node, exact_cache, prefix, config, replay_endpoint, start).await {
+    if let Some(replay_endpoint) = config.replay_endpoint.as_deref() {
+        let start = replay_start_sequence(sync.last_seq, sync.synchronized);
+        match replay_range(
+            node,
+            exact_cache,
+            prefix,
+            config,
+            replay_endpoint,
+            start,
+            None,
+        )
+        .await
+        {
             Ok(Some(replayed_through)) => {
-                *last_seq = Some(replayed_through);
-                *synchronized = true;
+                sync.last_seq = Some(replayed_through);
+                sync.synchronized = true;
                 replay_high_water = Some(replayed_through);
                 exact_cache.resume_node_owned(node.id(), node.instance_id());
                 node.record_kv_event_success();
             }
-            Ok(None) if *synchronized => {
+            Ok(None) if sync.synchronized => {
                 exact_cache.resume_node_owned(node.id(), node.instance_id());
                 node.record_kv_event_success();
             }
             Ok(None) => {
-                synchronize_empty_replay(node, exact_cache, prefix, synchronized)?;
+                synchronize_empty_replay(node, exact_cache, prefix, &mut sync.synchronized)?;
                 node.record_kv_event_success();
             }
             Err(error) => {
-                invalidate_cache_state(node, exact_cache, prefix);
-                *last_seq = None;
-                *synchronized = false;
+                sync.invalidate(node, exact_cache, prefix);
                 node.record_kv_event_error(format!("KV replay synchronization failed: {error}"));
                 warn!(node = node.id(), error = %error, "could not synchronize vLLM KV replay buffer");
             }
@@ -170,121 +194,125 @@ pub(super) async fn run_event_session(
             }
             _ = health_interval.tick() => {
                 if node.health() == HealthState::Unhealthy {
-                    reset_unhealthy_cache_state(
-                        node,
-                        exact_cache,
-                        prefix,
-                        last_seq,
-                        synchronized,
-                    );
+                    sync.reset_unhealthy(node, exact_cache, prefix);
                     return Err(KvUpstreamUnhealthy.into());
                 }
                 continue;
             }
             message = socket.recv() => message?,
         };
-        let frames = message.into_vec();
-        if frames
-            .first()
-            .is_none_or(|topic| topic.as_ref() != config.topic.as_bytes())
-        {
-            continue;
-        }
-        if frames.len() != 3 {
-            invalidate_cache_state(node, exact_cache, prefix);
-            *last_seq = None;
-            *synchronized = false;
-            bail!("KV publisher sent {} frames instead of 3", frames.len());
-        }
-        let seq = decode_sequence(&frames[1]).inspect_err(|_| {
-            invalidate_cache_state(node, exact_cache, prefix);
-            *last_seq = None;
-            *synchronized = false;
-        })?;
-        if replay_high_water.is_some_and(|high_water| seq <= high_water) {
-            continue;
-        }
-        replay_high_water = None;
-        if let Some(previous) = *last_seq {
-            if seq <= previous {
-                if seq == previous {
-                    continue;
-                }
-                invalidate_cache_state(node, exact_cache, prefix);
-                *last_seq = None;
-                *synchronized = false;
-                warn!(
-                    node = node.id(),
-                    previous, seq, "vLLM KV sequence reset; cache state cleared"
-                );
-                node.record_kv_event_error(format!(
-                    "KV sequence reset from {previous} to {seq}; awaiting full resynchronization"
-                ));
-            } else if *synchronized && seq > previous.saturating_add(1) {
-                let recovered = recover_gap(
+        process_event_frames(
+            node,
+            exact_cache,
+            prefix,
+            config,
+            sync,
+            &mut replay_high_water,
+            message.into_vec(),
+        )
+        .await?;
+    }
+}
+
+async fn process_event_frames(
+    node: &Node,
+    exact_cache: &ExactCacheDirectory,
+    prefix: &PrefixDirectory,
+    config: &VllmKvEventsConfig,
+    sync: &mut KvSyncState,
+    replay_high_water: &mut Option<u64>,
+    frames: Vec<Bytes>,
+) -> Result<()> {
+    if frames
+        .first()
+        .is_none_or(|topic| topic.as_ref() != config.topic.as_bytes())
+    {
+        return Ok(());
+    }
+    if frames.len() != 3 {
+        sync.invalidate(node, exact_cache, prefix);
+        bail!("KV publisher sent {} frames instead of 3", frames.len());
+    }
+    let Ok(seq) = decode_sequence(&frames[1]) else {
+        sync.invalidate(node, exact_cache, prefix);
+        bail!("KV event sequence is not 8 bytes");
+    };
+    if replay_high_water.is_some_and(|high_water| seq <= high_water) {
+        return Ok(());
+    }
+    *replay_high_water = None;
+    if let Some(previous) = sync.last_seq {
+        if seq <= previous {
+            if seq == previous {
+                return Ok(());
+            }
+            sync.invalidate(node, exact_cache, prefix);
+            warn!(
+                node = node.id(),
+                previous, seq, "vLLM KV sequence reset; cache state cleared"
+            );
+            node.record_kv_event_error(format!(
+                "KV sequence reset from {previous} to {seq}; awaiting full resynchronization"
+            ));
+        } else if sync.synchronized && seq > previous.saturating_add(1) {
+            let recovered = match config.replay_endpoint.as_deref() {
+                Some(endpoint) => replay_range(
                     node,
                     exact_cache,
                     prefix,
                     config,
+                    endpoint,
                     previous.saturating_add(1),
-                    seq,
+                    Some(seq),
                 )
-                .await;
-                if let Err(error) = recovered {
-                    invalidate_cache_state(node, exact_cache, prefix);
-                    *last_seq = None;
-                    *synchronized = false;
-                    node.record_kv_event_error(format!("KV replay gap recovery failed: {error}"));
-                    warn!(node = node.id(), error = %error, "could not replay KV event gap; cache state cleared");
-                }
+                .await
+                .map(|_| ()),
+                None => Err(anyhow!("replay endpoint is not configured")),
+            };
+            if let Err(error) = recovered {
+                sync.invalidate(node, exact_cache, prefix);
+                node.record_kv_event_error(format!("KV replay gap recovery failed: {error}"));
+                warn!(node = node.id(), error = %error, "could not replay KV event gap; cache state cleared");
             }
         }
-        if last_seq.is_none() && !*synchronized {
-            if seq == 0 {
-                *synchronized = true;
-            } else if config.replay_endpoint.is_some() {
-                match recover_gap(node, exact_cache, prefix, config, 0, seq).await {
-                    Ok(()) => *synchronized = true,
-                    Err(error) => {
-                        invalidate_cache_state(node, exact_cache, prefix);
-                        node.record_kv_event_error(format!(
-                            "initial KV replay synchronization failed: {error}"
-                        ));
-                        warn!(node = node.id(), error = %error, "could not establish initial KV event history");
-                    }
-                }
-            }
-        }
-        match apply_payload(node, exact_cache, prefix, config, &frames[2], *synchronized) {
-            Ok(became_synchronized) => *synchronized |= became_synchronized,
-            Err(error) => {
-                *last_seq = None;
-                *synchronized = false;
-                return Err(error);
-            }
-        }
-        *last_seq = synchronized.then_some(seq);
     }
+    if sync.last_seq.is_none() && !sync.synchronized {
+        if seq == 0 {
+            sync.synchronized = true;
+        } else if let Some(endpoint) = config.replay_endpoint.as_deref() {
+            match replay_range(node, exact_cache, prefix, config, endpoint, 0, Some(seq)).await {
+                Ok(_) => sync.synchronized = true,
+                Err(error) => {
+                    invalidate_cache_state(node, exact_cache, prefix);
+                    node.record_kv_event_error(format!(
+                        "initial KV replay synchronization failed: {error}"
+                    ));
+                    warn!(node = node.id(), error = %error, "could not establish initial KV event history");
+                }
+            }
+        }
+    }
+    match apply_payload(
+        node,
+        exact_cache,
+        prefix,
+        config,
+        &frames[2],
+        sync.synchronized,
+    ) {
+        Ok(became_synchronized) => sync.synchronized |= became_synchronized,
+        Err(error) => {
+            sync.last_seq = None;
+            sync.synchronized = false;
+            return Err(error);
+        }
+    }
+    sync.last_seq = sync.synchronized.then_some(seq);
+    Ok(())
 }
 
-pub(super) fn kv_health_poll_interval(config: &VllmKvEventsConfig) -> Duration {
+fn kv_health_poll_interval(config: &VllmKvEventsConfig) -> Duration {
     Duration::from_millis(config.reconnect_ms).min(KV_HEALTH_POLL_MAX)
-}
-
-pub(super) fn reset_unhealthy_cache_state(
-    node: &Node,
-    exact_cache: &ExactCacheDirectory,
-    prefix: &PrefixDirectory,
-    last_seq: &mut Option<u64>,
-    synchronized: &mut bool,
-) {
-    invalidate_cache_state(node, exact_cache, prefix);
-    *last_seq = None;
-    *synchronized = false;
-    node.record_kv_event_error(
-        "KV cache state invalidated because the vLLM upstream is unhealthy; awaiting full replay"
-            .to_owned(),
-    );
 }
 
 pub(super) fn synchronize_empty_replay(
@@ -307,13 +335,14 @@ pub(super) fn replay_start_sequence(last_seq: Option<u64>, synchronized: bool) -
     }
 }
 
-pub(super) async fn replay_available(
+async fn replay_range(
     node: &Node,
     exact_cache: &ExactCacheDirectory,
     prefix: &PrefixDirectory,
     config: &VllmKvEventsConfig,
     endpoint: &str,
     start: u64,
+    stop: Option<u64>,
 ) -> Result<Option<u64>> {
     let mut socket = DealerSocket::new();
     tokio::time::timeout(Duration::from_secs(5), socket.connect(endpoint))
@@ -348,7 +377,7 @@ pub(super) async fn replay_available(
             _ => bail!("invalid KV replay frame layout"),
         };
         let seq = decode_sequence(seq_frame)?;
-        if seq != expected {
+        if seq != expected || stop.is_some_and(|stop| seq >= stop) {
             bail!("KV replay was not contiguous at sequence {expected}");
         }
         apply_payload(node, exact_cache, prefix, config, payload, true)?;
@@ -357,68 +386,15 @@ pub(super) async fn replay_available(
             .checked_add(1)
             .ok_or_else(|| anyhow!("KV replay sequence overflow"))?;
     }
+    if let Some(stop) = stop
+        && expected != stop
+    {
+        bail!("KV replay ended at {expected}, expected {stop}");
+    }
     Ok(replayed_through)
 }
 
-pub(super) async fn recover_gap(
-    node: &Node,
-    exact_cache: &ExactCacheDirectory,
-    prefix: &PrefixDirectory,
-    config: &VllmKvEventsConfig,
-    start: u64,
-    stop: u64,
-) -> Result<()> {
-    let endpoint = config
-        .replay_endpoint
-        .as_ref()
-        .ok_or_else(|| anyhow!("replay endpoint is not configured"))?;
-    let mut socket = DealerSocket::new();
-    tokio::time::timeout(Duration::from_secs(5), socket.connect(endpoint))
-        .await
-        .context("timed out connecting to KV replay endpoint")??;
-    let request = ZmqMessage::try_from(vec![
-        Bytes::new(),
-        Bytes::copy_from_slice(&start.to_be_bytes()),
-    ])
-    .map_err(|error| anyhow!(error.to_string()))?;
-    socket.send(request).await?;
-
-    let mut expected = start;
-    loop {
-        let message = tokio::time::timeout(
-            Duration::from_millis(node.provider().request_timeout_ms),
-            socket.recv(),
-        )
-        .await
-        .context("timed out waiting for KV replay")??;
-        let mut frames = message.into_vec();
-        if frames.first().is_some_and(Bytes::is_empty) {
-            frames.remove(0);
-        }
-        if frames.last().is_some_and(Bytes::is_empty) {
-            break;
-        }
-        let (seq_frame, payload) = match frames.as_slice() {
-            [seq, payload] => (seq, payload),
-            [topic, seq, payload] if topic.as_ref() == config.topic.as_bytes() => (seq, payload),
-            _ => bail!("invalid KV replay frame layout"),
-        };
-        let seq = decode_sequence(seq_frame)?;
-        if seq != expected || seq >= stop {
-            bail!("KV replay was not contiguous at sequence {expected}");
-        }
-        apply_payload(node, exact_cache, prefix, config, payload, true)?;
-        expected = expected
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("KV replay sequence overflow"))?;
-    }
-    if expected != stop {
-        bail!("KV replay ended at {expected}, expected {stop}");
-    }
-    Ok(())
-}
-
-pub(super) fn decode_sequence(frame: &[u8]) -> Result<u64> {
+fn decode_sequence(frame: &[u8]) -> Result<u64> {
     let bytes: [u8; 8] = frame
         .try_into()
         .map_err(|_| anyhow!("KV event sequence is not 8 bytes"))?;
@@ -472,7 +448,7 @@ pub(super) fn apply_payload(
     Ok(synchronized)
 }
 
-pub(super) fn invalidate_cache_state(
+fn invalidate_cache_state(
     node: &Node,
     exact_cache: &ExactCacheDirectory,
     prefix: &PrefixDirectory,
@@ -507,7 +483,7 @@ pub(super) fn decode_event(event: &Value) -> Option<Result<CacheMutation>> {
     }
 }
 
-pub(super) fn decode_stored(map: &[(Value, Value)]) -> Result<Option<CacheMutation>> {
+fn decode_stored(map: &[(Value, Value)]) -> Result<Option<CacheMutation>> {
     if !is_local_gpu_event(map) || has_special_cache_keys(map) {
         return Ok(None);
     }
@@ -529,7 +505,7 @@ pub(super) fn decode_stored(map: &[(Value, Value)]) -> Result<Option<CacheMutati
     }))
 }
 
-pub(super) fn decode_removed(map: &[(Value, Value)]) -> Result<Option<CacheMutation>> {
+fn decode_removed(map: &[(Value, Value)]) -> Result<Option<CacheMutation>> {
     if !is_local_gpu_event(map) {
         return Ok(None);
     }
@@ -539,7 +515,7 @@ pub(super) fn decode_removed(map: &[(Value, Value)]) -> Result<Option<CacheMutat
     }))
 }
 
-pub(super) fn is_local_gpu_event(map: &[(Value, Value)]) -> bool {
+fn is_local_gpu_event(map: &[(Value, Value)]) -> bool {
     let gpu = field(map, "medium").and_then(Value::as_str) == Some("GPU");
     let local = !matches!(
         field(map, "locality").and_then(Value::as_str),
@@ -548,16 +524,14 @@ pub(super) fn is_local_gpu_event(map: &[(Value, Value)]) -> bool {
     gpu && local
 }
 
-pub(super) fn has_special_cache_keys(map: &[(Value, Value)]) -> bool {
-    if field(map, "lora_name").is_some_and(|value| !value.is_nil()) {
-        return true;
-    }
-    field(map, "extra_keys")
-        .and_then(Value::as_array)
-        .is_some_and(|values| values.iter().any(|value| !value.is_nil()))
+fn has_special_cache_keys(map: &[(Value, Value)]) -> bool {
+    field(map, "lora_name").is_some_and(|value| !value.is_nil())
+        || field(map, "extra_keys")
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.iter().any(|value| !value.is_nil()))
 }
 
-pub(super) fn hashes_field(map: &[(Value, Value)], name: &str) -> Result<Vec<BlockHash>> {
+fn hashes_field(map: &[(Value, Value)], name: &str) -> Result<Vec<BlockHash>> {
     field_required(map, name)?
         .as_array()
         .ok_or_else(|| anyhow!("KV {name} is not an array"))?
@@ -566,7 +540,7 @@ pub(super) fn hashes_field(map: &[(Value, Value)], name: &str) -> Result<Vec<Blo
         .collect()
 }
 
-pub(super) fn decode_hash(value: &Value) -> Result<BlockHash> {
+fn decode_hash(value: &Value) -> Result<BlockHash> {
     match value {
         Value::Binary(bytes) => Ok(BlockHash::Bytes(bytes.clone())),
         Value::Integer(integer) => integer
@@ -577,7 +551,7 @@ pub(super) fn decode_hash(value: &Value) -> Result<BlockHash> {
     }
 }
 
-pub(super) fn integer_array(value: &Value) -> Result<Vec<u64>> {
+fn integer_array(value: &Value) -> Result<Vec<u64>> {
     value
         .as_array()
         .ok_or_else(|| anyhow!("KV token_ids is not an array"))?
@@ -586,13 +560,13 @@ pub(super) fn integer_array(value: &Value) -> Result<Vec<u64>> {
         .collect()
 }
 
-pub(super) fn unsigned(value: &Value) -> Result<u64> {
+fn unsigned(value: &Value) -> Result<u64> {
     value
         .as_u64()
         .ok_or_else(|| anyhow!("KV integer is negative or out of range"))
 }
 
-pub(super) fn optional_group(map: &[(Value, Value)]) -> Result<i64> {
+fn optional_group(map: &[(Value, Value)]) -> Result<i64> {
     match field(map, "group_idx") {
         None | Some(Value::Nil) => Ok(0),
         Some(value) => value
@@ -602,11 +576,11 @@ pub(super) fn optional_group(map: &[(Value, Value)]) -> Result<i64> {
     }
 }
 
-pub(super) fn field_required<'a>(map: &'a [(Value, Value)], name: &str) -> Result<&'a Value> {
+fn field_required<'a>(map: &'a [(Value, Value)], name: &str) -> Result<&'a Value> {
     field(map, name).ok_or_else(|| anyhow!("KV event is missing {name}"))
 }
 
-pub(super) fn field<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a Value> {
+fn field<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a Value> {
     map.iter()
         .find(|(key, _)| key.as_str() == Some(name))
         .map(|(_, value)| value)

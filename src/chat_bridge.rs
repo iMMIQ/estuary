@@ -5,11 +5,11 @@ use bytes::Bytes;
 use deepseek_recipe::{
     anthropic::messages::{
         request::MessagesRequest,
-        response::{MessagesChunkGenerator, MessagesResponse},
+        response::{MessagesChunkGenerator, MessagesResponse, MessagesStreamEvent},
     },
     openai::responses::{
         request::{ResponsesInput, ResponsesRequest},
-        response::{ResponsesChunkGenerator, ResponsesResponse},
+        response::{ResponsesChunkGenerator, ResponsesResponse, ResponsesStreamEvent},
     },
     request::{
         ConversationRequest, ConversionOptions, ModelVersion, ProtocolRequest, ResponseOptions,
@@ -25,7 +25,7 @@ use deepseek_recipe_core::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{error::GatewayError, sse};
+use crate::{error::GatewayError, inference_stats::Usage, sse};
 
 const IMAGE_SPECIAL_TOKEN: &str = SpecialToken::Image.default_str();
 
@@ -455,55 +455,38 @@ fn serialize_chat(
     Ok(chat)
 }
 
-#[derive(Default)]
-struct Usage {
-    input: usize,
-    cached: usize,
-    created: usize,
-    output: usize,
-    reasoning: usize,
-}
-impl Usage {
-    fn observe(&mut self, value: &Value) {
-        if let Some(n) = value["prompt_tokens"].as_u64() {
-            self.input = usize::try_from(n).unwrap_or(usize::MAX);
-        }
-        if let Some(n) = value["prompt_tokens_details"]["cached_tokens"]
-            .as_u64()
-            .or_else(|| value["prompt_cache_hit_tokens"].as_u64())
-        {
-            self.cached = usize::try_from(n).unwrap_or(usize::MAX);
-        }
-        if let Some(n) = value["prompt_tokens_details"]["created_cache_tokens"]
-            .as_u64()
-            .or_else(|| value["prompt_tokens_details"]["cache_write_tokens"].as_u64())
-        {
-            self.created = usize::try_from(n).unwrap_or(usize::MAX);
-        }
-        if let Some(n) = value["completion_tokens"].as_u64() {
-            self.output = usize::try_from(n).unwrap_or(usize::MAX);
-        }
-        if let Some(n) = value["completion_tokens_details"]["reasoning_tokens"].as_u64() {
-            self.reasoning = usize::try_from(n).unwrap_or(usize::MAX);
-        }
-    }
-    fn value(&self, messages: bool) -> Value {
-        if messages {
-            json!({"input_tokens":self.input.saturating_sub(self.cached).saturating_sub(self.created),"cache_read_input_tokens":self.cached,"cache_creation_input_tokens":self.created,"output_tokens":self.output})
-        } else {
-            json!({"input_tokens":self.input,"input_tokens_details":{"cached_tokens":self.cached,"cache_write_tokens":self.created},"output_tokens":self.output,"output_tokens_details":{"reasoning_tokens":self.reasoning},"total_tokens":self.input.saturating_add(self.output)})
-        }
+fn format_usage(usage: Usage, messages: bool) -> Value {
+    let input = usage.input_tokens.unwrap_or(0);
+    let cached = usage.cached_tokens.unwrap_or(0);
+    let created = usage.cache_write_tokens.unwrap_or(0);
+    let output = usage.output_tokens.unwrap_or(0);
+    let reasoning = usage.reasoning_tokens.unwrap_or(0);
+    if messages {
+        json!({
+            "input_tokens": input.saturating_sub(cached).saturating_sub(created),
+            "cache_read_input_tokens": cached,
+            "cache_creation_input_tokens": created,
+            "output_tokens": output
+        })
+    } else {
+        json!({
+            "input_tokens": input,
+            "input_tokens_details": {"cached_tokens": cached, "cache_write_tokens": created},
+            "output_tokens": output,
+            "output_tokens_details": {"reasoning_tokens": reasoning},
+            "total_tokens": input.saturating_add(output)
+        })
     }
 }
 
 enum Generator {
     Messages {
         generator: MessagesChunkGenerator,
-        response: Box<MessagesResponse>,
+        response: Option<Box<MessagesResponse>>,
     },
     Responses {
         generator: Box<ResponsesChunkGenerator>,
-        response: Box<ResponsesResponse>,
+        response: Option<Box<ResponsesResponse>>,
     },
 }
 #[derive(Default)]
@@ -515,6 +498,7 @@ struct Tool {
 pub(crate) struct StreamConverter {
     generator: Generator,
     context: Context,
+    buffered: bool,
     usage: Usage,
     tools: BTreeMap<usize, Tool>,
     started: bool,
@@ -525,6 +509,14 @@ pub(crate) struct StreamConverter {
 }
 impl StreamConverter {
     pub(crate) fn new(context: Context, model: String) -> Self {
+        Self::with_mode(context, model, false)
+    }
+
+    fn new_buffered(context: Context, model: String) -> Self {
+        Self::with_mode(context, model, true)
+    }
+
+    fn with_mode(context: Context, model: String, buffered: bool) -> Self {
         let id = format!(
             "{}{}",
             if context.messages { "msg_" } else { "resp_" },
@@ -533,7 +525,7 @@ impl StreamConverter {
         let generator = if context.messages {
             Generator::Messages {
                 generator: MessagesChunkGenerator::new(id.clone(), model.clone(), false),
-                response: Box::new(MessagesResponse::new(id, model, 0, 0, 0)),
+                response: buffered.then(|| Box::new(MessagesResponse::new(id, model, 0, 0, 0))),
             }
         } else {
             // The generator only needs the resolved response settings. Keep
@@ -544,17 +536,14 @@ impl StreamConverter {
             request.conversation.thinking_mode = false;
             request.response_options = context.response_options.clone();
             Generator::Responses {
-                generator: Box::new(ResponsesRequest::chunk_generator(
-                    &request,
-                    id.clone(),
-                    model.clone(),
-                )),
-                response: Box::new(ResponsesResponse::new(id, model, 0, 0, 0)),
+                generator: Box::new(ResponsesRequest::chunk_generator(&request, id, model)),
+                response: None,
             }
         };
         Self {
             generator,
             context,
+            buffered,
             usage: Usage::default(),
             tools: BTreeMap::new(),
             started: false,
@@ -564,18 +553,33 @@ impl StreamConverter {
             provider_metrics: None,
         }
     }
+
     async fn emit(&mut self, chunk: OutputChunk) -> Result<Vec<sse::Event>, GatewayError> {
-        let mut values = Vec::new();
+        let mut out = Vec::new();
         match &mut self.generator {
             Generator::Messages {
                 generator,
                 response,
             } => {
                 for event in generator.generate(chunk).await {
+                    if self.buffered {
+                        if let Some(target) = response.as_mut() {
+                            target.accumulate(event);
+                        }
+                        continue;
+                    }
                     let name = MessagesResponse::sse_event_name(&event).unwrap_or_default();
-                    let value = serde_json::to_value(&event).map_err(|_| GatewayError::Internal)?;
-                    response.accumulate(event);
-                    values.push((name, value));
+                    let sse_event = if matches!(event, MessagesStreamEvent::MessageDelta { .. }) {
+                        let mut value =
+                            serde_json::to_value(&event).map_err(|_| GatewayError::Internal)?;
+                        value["usage"] = format_usage(self.usage, true);
+                        sse::Event::json(name, &value)
+                    } else {
+                        let data =
+                            serde_json::to_string(&event).map_err(|_| GatewayError::Internal)?;
+                        sse::Event::new(name, data)
+                    };
+                    out.push(sse_event);
                 }
             }
             Generator::Responses {
@@ -583,30 +587,39 @@ impl StreamConverter {
                 response,
             } => {
                 for event in generator.generate(chunk).await {
-                    let name = ResponsesResponse::sse_event_name(&event).unwrap_or_default();
-                    let value = serde_json::to_value(&event).map_err(|_| GatewayError::Internal)?;
-                    response.accumulate(event);
-                    values.push((name, value));
-                }
-            }
-        }
-        for (_, value) in &mut values {
-            match value["type"].as_str() {
-                Some("message_delta") => value["usage"] = self.usage.value(true),
-                Some("response.completed" | "response.incomplete") => {
-                    value["response"]["usage"] = self.usage.value(false);
-                    if let Some(metrics) = &self.provider_metrics {
-                        value["response"]["metrics"] = metrics.clone();
+                    if self.buffered {
+                        if let ResponsesStreamEvent::Completed { response: done, .. }
+                        | ResponsesStreamEvent::Incomplete { response: done, .. } = event
+                        {
+                            *response = Some(Box::new(done));
+                        }
+                        continue;
                     }
+                    let name = ResponsesResponse::sse_event_name(&event).unwrap_or_default();
+                    let sse_event = if matches!(
+                        event,
+                        ResponsesStreamEvent::Completed { .. }
+                            | ResponsesStreamEvent::Incomplete { .. }
+                    ) {
+                        let mut value =
+                            serde_json::to_value(&event).map_err(|_| GatewayError::Internal)?;
+                        value["response"]["usage"] = format_usage(self.usage, false);
+                        if let Some(metrics) = &self.provider_metrics {
+                            value["response"]["metrics"] = metrics.clone();
+                        }
+                        sse::Event::json(name, &value)
+                    } else {
+                        let data =
+                            serde_json::to_string(&event).map_err(|_| GatewayError::Internal)?;
+                        sse::Event::new(name, data)
+                    };
+                    out.push(sse_event);
                 }
-                _ => {}
             }
         }
-        Ok(values
-            .iter()
-            .map(|(name, value)| sse::Event::json(*name, value))
-            .collect())
+        Ok(out)
     }
+
     async fn start(&mut self) -> Result<Vec<sse::Event>, GatewayError> {
         if self.started {
             return Ok(Vec::new());
@@ -615,28 +628,21 @@ impl StreamConverter {
         self.emit(OutputChunk::Start {
             system_fingerprint: None,
             prompt_usage: PromptUsage {
-                prompt_tokens: self.usage.input,
-                prompt_cache_hit_tokens: self.usage.cached,
+                prompt_tokens: self.usage.input_tokens.unwrap_or(0),
+                prompt_cache_hit_tokens: self.usage.cached_tokens.unwrap_or(0),
             },
         })
         .await
     }
-    pub(crate) async fn push_event(
+
+    pub(crate) async fn push_value(
         &mut self,
-        event: &sse::Event,
+        value: &Value,
     ) -> Result<Vec<sse::Event>, GatewayError> {
-        if event.data() == "[DONE]" {
-            return self.finish().await;
-        }
-        let value: Value = serde_json::from_str(event.data())
-            .map_err(|_| GatewayError::InvalidUpstreamResponse)?;
-        self.push(&value).await
-    }
-    async fn push(&mut self, value: &Value) -> Result<Vec<sse::Event>, GatewayError> {
         if self.finished || value.get("error").is_some() {
             return Err(GatewayError::InvalidUpstreamResponse);
         }
-        self.usage.observe(&value["usage"]);
+        self.usage.observe(value);
         if let Some(metrics) = value.get("metrics") {
             self.provider_metrics = Some(metrics.clone());
         }
@@ -716,6 +722,7 @@ impl StreamConverter {
         }
         Ok(events)
     }
+
     pub(crate) async fn finish(&mut self) -> Result<Vec<sse::Event>, GatewayError> {
         if self.finished {
             return Ok(Vec::new());
@@ -753,8 +760,8 @@ impl StreamConverter {
                 finish_reason: reason,
                 stop_sequence: None,
                 completion_usage: CompletionUsage {
-                    completion_tokens: self.usage.output,
-                    reasoning_tokens: Some(self.usage.reasoning),
+                    completion_tokens: self.usage.output_tokens.unwrap_or(0),
+                    reasoning_tokens: Some(self.usage.reasoning_tokens.unwrap_or(0)),
                 },
             })
             .await?,
@@ -762,13 +769,21 @@ impl StreamConverter {
         self.finished = true;
         Ok(events)
     }
+
     fn response(&self) -> Result<Bytes, GatewayError> {
         let mut value = match &self.generator {
-            Generator::Messages { response, .. } => serde_json::to_value(response),
-            Generator::Responses { response, .. } => serde_json::to_value(response),
+            Generator::Messages {
+                response: Some(response),
+                ..
+            } => serde_json::to_value(response),
+            Generator::Responses {
+                response: Some(response),
+                ..
+            } => serde_json::to_value(response),
+            _ => return Err(GatewayError::Internal),
         }
         .map_err(|_| GatewayError::Internal)?;
-        value["usage"] = self.usage.value(self.context.messages);
+        value["usage"] = format_usage(self.usage, self.context.messages);
         if let Some(metrics) = &self.provider_metrics {
             value["metrics"] = metrics.clone();
         }
@@ -778,6 +793,18 @@ impl StreamConverter {
     }
 }
 
+pub(crate) async fn convert_response_value(
+    value: &Value,
+    context: &Context,
+    model: &str,
+) -> Result<Bytes, GatewayError> {
+    let mut converter = StreamConverter::new_buffered(context.clone(), model.into());
+    converter.push_value(value).await?;
+    converter.finish().await?;
+    converter.response()
+}
+
+#[cfg(test)]
 pub(crate) async fn convert_response(
     body: &[u8],
     context: &Context,
@@ -785,10 +812,7 @@ pub(crate) async fn convert_response(
 ) -> Result<Bytes, GatewayError> {
     let value: Value =
         serde_json::from_slice(body).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
-    let mut converter = StreamConverter::new(context.clone(), model.into());
-    converter.push(&value).await?;
-    converter.finish().await?;
-    converter.response()
+    convert_response_value(&value, context, model).await
 }
 
 #[cfg(test)]
@@ -1023,21 +1047,20 @@ mod tests {
             };
             let mut converter = StreamConverter::new(ctx.clone(), "public".into());
             converter
-                .push_event(&sse::Event::json(
-                    "",
+                .push_value(
                     &json!({"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}),
-                ))
+                )
                 .await
                 .unwrap();
             let terminal = converter
-                .push_event(&sse::Event::json(
-                    "",
-                    &json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
-                ))
+                .push_value(&json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}))
                 .await
                 .unwrap();
             assert!(terminal.is_empty());
-            converter.push_event(&sse::Event::json("",&json!({"choices":[],"usage":{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":880},"completion_tokens":4}}))).await.unwrap();
+            converter
+                .push_value(&json!({"choices":[],"usage":{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":880},"completion_tokens":4}}))
+                .await
+                .unwrap();
             let events = converter.finish().await.unwrap();
             let values: Vec<Value> = events
                 .iter()
@@ -1078,9 +1101,11 @@ mod transport_tests {
             b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},".as_slice(),
             b"\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".as_slice(),
         ];
-        let input = sse::parse_chunks(chunks.iter().map(|v| Bytes::copy_from_slice(v)).collect())
-            .await
-            .unwrap();
+        let mut parser = sse::SseParser::new(1024);
+        let mut input = Vec::new();
+        for chunk in chunks {
+            parser.push(chunk, |event| input.push(event.unwrap().to_vec()));
+        }
         let context = Context {
             messages: true,
             thinking: false,
@@ -1089,8 +1114,13 @@ mod transport_tests {
         };
         let mut converter = StreamConverter::new(context, "m".into());
         let mut output = Vec::new();
-        for event in input {
-            output.extend(converter.push_event(&event).await.unwrap());
+        for data in input {
+            if data == b"[DONE]" {
+                output.extend(converter.finish().await.unwrap());
+            } else {
+                let value: Value = serde_json::from_slice(&data).unwrap();
+                output.extend(converter.push_value(&value).await.unwrap());
+            }
         }
         let bytes = sse::encode(output).await;
         assert!(String::from_utf8_lossy(&bytes).contains("event: message_stop"));
@@ -1142,16 +1172,22 @@ mod compatibility_tests {
             "temperature":0.3,"max_output_tokens":64,
             "tools":[{"type":"function","name":"run","parameters":{"type":"object"}}]});
         let (_, context) = prepare("responses", source).unwrap();
-        let mut converter = StreamConverter::new(context.unwrap(), "public".into());
+        let context = context.unwrap();
         let reply = json!({"choices":[{"message":{"tool_calls":[{"function":{"name":"run","arguments":"{}"}}]},"finish_reason":"tool_calls"}]});
-        converter.push(&reply).await.unwrap();
+        let mut converter = StreamConverter::new(context.clone(), "public".into());
+        converter.push_value(&reply).await.unwrap();
         let events = converter.finish().await.unwrap();
         let completed: Value = events
             .iter()
             .map(|event| serde_json::from_str::<Value>(event.data()).unwrap())
             .find(|event| event["type"] == "response.completed")
             .unwrap();
-        let buffered: Value = serde_json::from_slice(&converter.response().unwrap()).unwrap();
+        let buffered: Value = serde_json::from_slice(
+            &convert_response_value(&reply, &context, "public")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         for response in [&completed["response"], &buffered] {
             assert_eq!(response["model"], "public");
             assert_eq!(response["tool_choice"], "required");
@@ -1187,18 +1223,18 @@ mod compatibility_tests {
     #[tokio::test]
     async fn interleaved_parallel_tool_fragments_complete_without_argument_loss() {
         let (_, context) = prepare("responses", json!({"model":"m","input":"go"})).unwrap();
-        let mut converter = StreamConverter::new(context.unwrap(), "m".into());
+        let mut converter = StreamConverter::new_buffered(context.unwrap(), "m".into());
         for delta in [
             json!({"tool_calls":[{"index":0,"function":{"name":"first","arguments":"{\"a\":"}},{"index":1,"function":{"name":"second","arguments":"{\"b\":"}}]}),
             json!({"tool_calls":[{"index":1,"function":{"arguments":"2}"}},{"index":0,"function":{"arguments":"1}"}}]}),
         ] {
             converter
-                .push(&json!({"choices":[{"delta":delta,"finish_reason":null}]}))
+                .push_value(&json!({"choices":[{"delta":delta,"finish_reason":null}]}))
                 .await
                 .unwrap();
         }
         converter
-            .push(&json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}))
+            .push_value(&json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}))
             .await
             .unwrap();
         converter.finish().await.unwrap();
@@ -1272,8 +1308,9 @@ mod tool_stream_tests {
                 response_options: ResponseOptions::default(),
                 tool_names: HashMap::new(),
             };
-            let mut converter = StreamConverter::new(context, "public".into());
-            converter.push(&json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"Read","arguments":arguments}}]},"finish_reason":"tool_calls"}]})).await.unwrap();
+            let reply = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"Read","arguments":arguments}}]},"finish_reason":"tool_calls"}]});
+            let mut converter = StreamConverter::new(context.clone(), "public".into());
+            converter.push_value(&reply).await.unwrap();
             let events = converter.finish().await.unwrap();
             let values: Vec<Value> = events
                 .iter()
@@ -1293,7 +1330,12 @@ mod tool_stream_tests {
                 })
                 .collect();
             assert_eq!(fragments, arguments);
-            let response: Value = serde_json::from_slice(&converter.response().unwrap()).unwrap();
+            let response: Value = serde_json::from_slice(
+                &convert_response_value(&reply, &context, "public")
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
             if messages {
                 let start = values
                     .iter()

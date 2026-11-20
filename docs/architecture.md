@@ -263,25 +263,6 @@ withdrawal delay, the public listener stops accepting while accepted queues and
 responses continue. The process exits when they finish or when
 `shutdown_grace_ms` expires.
 
-## Supervisor and Rollout
-
-The production deployment process binds the public socket once and passes it
-directly to the active worker. Inference bytes do not pass through the deployment
-process. The stable management listener forwards control-plane traffic to the
-active worker and serves the version manager at `/deploy/`.
-
-During a switch, a candidate starts paused, initializes its control-plane state,
-passes the required readiness gate, and activates the inherited listener. The
-previous worker then stops accepting and drains existing responses. Management
-writes are frozen for the short transition. Candidate failure leaves the active
-worker unchanged.
-
-The running supervisor is not replaced by worker rollout. Its stable `current`
-link selects the new binary after the next external process restart. A supervisor
-crash or container replacement closes the owned listener, so zero-downtime
-supervisor replacement requires redundancy outside this process. Operational
-commands and persistent paths are documented in [deployment](../deploy/README.md).
-
 ## Boundaries
 
 - Public inference has no inbound authentication.

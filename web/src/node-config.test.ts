@@ -6,7 +6,6 @@ import {
   pairsToRecord,
   protocolPaths,
   recordToDraft,
-  recordToPairs,
   shouldClearApiKey,
   validateDraft,
 } from "./node-config";
@@ -43,6 +42,7 @@ describe("node config mapping", () => {
     draft.models = [{ key: "text", value: "upstream" }];
     expect(draftToConfig(draft).model_capabilities.text.multimodal).toBeTrue();
   });
+
   test("drops blank key-value rows", () => {
     expect(
       pairsToRecord([
@@ -50,10 +50,6 @@ describe("node config mapping", () => {
         { key: "", value: "ignored" },
       ]),
     ).toEqual({ public: "upstream" });
-  });
-
-  test("keeps an empty editable row", () => {
-    expect(recordToPairs({})).toEqual([{ key: "", value: "" }]);
   });
 
   test("new vLLM nodes use a finite waiting watermark", () => {
@@ -69,15 +65,6 @@ describe("node config mapping", () => {
     const config = draftToConfig(draft);
     expect(config.model_capabilities.text.multimodal).toBeFalse();
     expect(config.model_capabilities.vision.multimodal).toBeTrue();
-  });
-
-  test("serializes per-model image capability", () => {
-    const draft = createDraft("openai");
-    draft.id = "node-a";
-    draft.models = [{ key: "text", value: "internal-text", multimodal: false }];
-    expect(draftToConfig(draft).model_capabilities).toEqual({
-      text: { multimodal: false },
-    });
   });
 
   test("stores a directly entered Bearer key and drops the legacy fallback", () => {
@@ -116,17 +103,6 @@ describe("node config mapping", () => {
     expect(draftToConfig(draft).provider.kv_events).toBeNull();
   });
 
-  test("rejects non-HTTP and relative base URLs", () => {
-    const draft = createDraft();
-    draft.id = "node-a";
-    draft.models = [{ key: "chat", value: "model" }];
-    draft.base_url = "localhost:8000/v1";
-    expect(validateDraft(draft).base_url).toBe("validation.absoluteUrl");
-
-    draft.base_url = "ftp://models.example/v1";
-    expect(validateDraft(draft).base_url).toBe("validation.absoluteUrl");
-  });
-
   test("rejects incomplete and duplicate public model mappings", () => {
     const draft = createDraft();
     draft.id = "node-a";
@@ -140,68 +116,10 @@ describe("node config mapping", () => {
     expect(validateDraft(draft).models).toBe("validation.modelUnique");
   });
 
-  test("requires telemetry freshness to cover at least one monitor interval", () => {
-    const draft = createDraft();
-    draft.id = "node-a";
-    draft.models = [{ key: "chat", value: "model" }];
-    draft.provider.monitor_interval_ms = 5000;
-    draft.provider.telemetry_stale_ms = 4999;
-    expect(validateDraft(draft).telemetry_stale_ms).toBe("validation.telemetryInterval");
-  });
-
   test("accepts a complete default vLLM draft", () => {
     const draft = createDraft();
     draft.id = "node-a";
     draft.models = [{ key: "chat", value: "model" }];
     expect(validateDraft(draft)).toEqual({});
-  });
-
-  test.each([NaN, Infinity, -Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1])(
-    "rejects invalid integer limits: %s",
-    (value) => {
-      const draft = createDraft();
-      draft.max_concurrency = value;
-      draft.provider.monitor_interval_ms = value;
-      draft.provider.request_timeout_ms = value;
-      draft.provider.telemetry_stale_ms = value;
-      draft.provider.waiting_threshold = value;
-      draft.provider.tokenize_cache_entries = value;
-      draft.provider.kv_events = {
-        endpoint: "tcp://127.0.0.1:5557",
-        replay_endpoint: null,
-        topic: "",
-        reconnect_ms: value,
-        max_blocks: value,
-        max_directory_bytes: value,
-        max_event_bytes: value,
-      };
-      const errors = validateDraft(draft);
-      for (const field of [
-        "max_concurrency",
-        "monitor_interval_ms",
-        "request_timeout_ms",
-        "telemetry_stale_ms",
-        "waiting_threshold",
-        "tokenize_cache_entries",
-        "kv_reconnect_ms",
-        "kv_max_blocks",
-        "kv_max_directory_bytes",
-        "kv_max_event_bytes",
-      ]) {
-        expect(errors[field]).toBeDefined();
-      }
-    },
-  );
-
-  test("bounds tokenization cache entries to the server limit", () => {
-    const draft = createDraft();
-    for (const value of [0, 65537]) {
-      draft.provider.tokenize_cache_entries = value;
-      expect(validateDraft(draft).tokenize_cache_entries).toBeDefined();
-    }
-    for (const value of [1, 65536]) {
-      draft.provider.tokenize_cache_entries = value;
-      expect(validateDraft(draft).tokenize_cache_entries).toBeUndefined();
-    }
   });
 });

@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     convert::Infallible,
     future::pending,
@@ -18,95 +20,26 @@ use axum::{
     routing::post,
 };
 use bytes::Bytes;
+use common::{IO_TIMEOUT, TestServer, gateway_settings, node_config, spawn_gateway, test_client};
 use estuary::{
-    Gateway, Settings,
-    config::{ModelCapabilityConfig, NodeConfig, RetryConfig},
+    Gateway,
+    config::{ModelCapabilityConfig, NodeConfig},
 };
 use futures_util::stream;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     sync::{mpsc, oneshot},
-    task::JoinHandle,
     time::{sleep, timeout},
 };
-
-const IO_TIMEOUT: Duration = Duration::from_secs(3);
-
-struct TestServer {
-    base_url: String,
-    task: JoinHandle<()>,
-}
-
-impl TestServer {
-    async fn spawn(router: Router) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let address = listener.local_addr().expect("test server address");
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .await
-                .expect("test server failed");
-        });
-        Self {
-            base_url: format!("http://{address}"),
-            task,
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url)
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-fn test_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("test client")
-}
 
 fn node(
     id: &str,
     upstream: &TestServer,
     models: impl IntoIterator<Item = (&'static str, &'static str)>,
 ) -> NodeConfig {
-    NodeConfig {
-        id: id.to_owned(),
-        base_url: format!("{}/v1", upstream.base_url),
-        models: models
-            .into_iter()
-            .map(|(public, upstream)| (public.to_owned(), upstream.to_owned()))
-            .collect(),
-        ..NodeConfig::default()
-    }
-}
-
-async fn spawn_gateway(nodes: Vec<NodeConfig>) -> TestServer {
-    let settings = gateway_settings(nodes);
-    let gateway = Gateway::build(settings).expect("build gateway");
-    TestServer::spawn(gateway.public_router()).await
-}
-
-fn gateway_settings(nodes: Vec<NodeConfig>) -> Settings {
-    let mut settings = Settings {
-        nodes,
-        retry: RetryConfig {
-            max_attempts: 1,
-            ..RetryConfig::default()
-        },
-        ..Settings::default()
-    };
-    settings.health.route_while_starting = true;
-    settings
+    node_config(id, &upstream.base_url, models)
 }
 
 #[tokio::test]

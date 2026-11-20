@@ -33,6 +33,7 @@ const BOUNDS: [f64; BINS] = histogram_bounds();
 macro_rules! counters {
     ($($field:ident),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, Default, Serialize)]
+        #[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
         pub struct Counts { $(pub $field: u64,)+ }
         impl Counts {
             pub(super) fn add(&mut self, other: Self) {
@@ -74,9 +75,9 @@ impl Counts {
 
 #[derive(Clone, Debug)]
 pub(super) struct Histogram {
-    pub bins: [u64; BINS],
-    pub sum: f64,
-    pub count: u64,
+    bins: [u64; BINS],
+    sum: f64,
+    count: u64,
 }
 impl Default for Histogram {
     fn default() -> Self {
@@ -87,7 +88,7 @@ impl Default for Histogram {
         }
     }
 }
-pub(super) fn bound(index: usize) -> f64 {
+fn bound(index: usize) -> f64 {
     BOUNDS[index]
 }
 impl Histogram {
@@ -137,6 +138,7 @@ impl Histogram {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
 pub struct Distribution {
     pub samples: u64,
     pub p50: Option<f64>,
@@ -145,12 +147,14 @@ pub struct Distribution {
     pub overflow: u64,
 }
 #[derive(Clone, Copy, Debug, Default, Serialize)]
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
 pub struct Rate {
     pub raw: Option<f64>,
     pub smoothed: Option<f64>,
     pub mean_60s: Option<f64>,
 }
 #[derive(Clone, Copy, Debug, Default, Serialize)]
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
 pub struct Rates {
     pub incoming: Rate,
     pub completed: Rate,

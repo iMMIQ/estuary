@@ -23,10 +23,11 @@ mod capacity;
 mod telemetry;
 use capacity::{Capacity, CapacityPermit};
 pub use telemetry::EngineTelemetry;
-pub(crate) use telemetry::ProviderCounter;
+pub(crate) use telemetry::{CounterKind, ProviderCounter, sum_counter_kind};
 static NEXT_NODE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum HealthState {
     Starting,
@@ -36,6 +37,7 @@ pub enum HealthState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderState {
     Generic,
@@ -45,6 +47,7 @@ pub enum ProviderState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleState {
     Serving,
@@ -52,6 +55,7 @@ pub enum LifecycleState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum CircuitState {
     Closed,
@@ -85,7 +89,6 @@ struct CircuitRuntime {
     epoch: u64,
     opened_until: Option<Instant>,
     opened_until_unix_ms: Option<u64>,
-    last_change_unix_ms: u64,
 }
 
 impl Default for CircuitRuntime {
@@ -98,7 +101,6 @@ impl Default for CircuitRuntime {
             epoch: 0,
             opened_until: None,
             opened_until_unix_ms: None,
-            last_change_unix_ms: unix_millis(),
         }
     }
 }
@@ -109,28 +111,49 @@ struct CircuitTicket {
     half_open: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct ProviderRuntime {
     counters: telemetry::Tracker,
-    state: Option<ProviderState>,
+    state: ProviderState,
     version: Option<String>,
     running: usize,
     waiting: usize,
     kv_cache_usage: Option<f64>,
-    prompt_tokens_total: Option<f64>,
-    generation_tokens_total: Option<f64>,
-    requests_total: Option<f64>,
-    prompt_tokens_per_second: Option<f64>,
-    generation_tokens_per_second: Option<f64>,
-    requests_per_second: Option<f64>,
     prefix_cache_queries_total: Option<f64>,
     prefix_cache_hits_total: Option<f64>,
-    prefix_cache_hit_rate: Option<f64>,
     preemptions_total: Option<f64>,
     telemetry_updated_unix_ms: Option<u64>,
     compatibility_error: Option<String>,
     telemetry_error: Option<String>,
     kv_event_error: Option<String>,
+}
+
+impl ProviderRuntime {
+    fn new(kind: ProviderKind) -> Self {
+        Self {
+            counters: telemetry::Tracker::default(),
+            state: match kind {
+                ProviderKind::Openai => ProviderState::Generic,
+                ProviderKind::Vllm => ProviderState::Checking,
+            },
+            version: None,
+            running: 0,
+            waiting: 0,
+            kv_cache_usage: None,
+            prefix_cache_queries_total: None,
+            prefix_cache_hits_total: None,
+            preemptions_total: None,
+            telemetry_updated_unix_ms: None,
+            compatibility_error: None,
+            telemetry_error: None,
+            kv_event_error: None,
+        }
+    }
+
+    fn is_fresh(&self, stale_ms: u64) -> bool {
+        self.telemetry_updated_unix_ms
+            .is_some_and(|updated| unix_millis().saturating_sub(updated) <= stale_ms)
+    }
 }
 
 impl HealthState {
@@ -150,10 +173,6 @@ impl HealthState {
             3 => Self::Unhealthy,
             _ => Self::Starting,
         }
-    }
-
-    pub fn is_routable(self) -> bool {
-        matches!(self, Self::Healthy | Self::Degraded)
     }
 }
 
@@ -193,6 +212,7 @@ impl Default for RuntimeStats {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
 pub struct NodeSnapshot {
     pub instance_id: u64,
     pub engine: EngineTelemetry,
@@ -239,12 +259,19 @@ pub(crate) struct VllmMetricsSnapshot {
     pub running: usize,
     pub waiting: usize,
     pub kv_cache_usage: Option<f64>,
-    pub prompt_tokens_total: Option<f64>,
-    pub generation_tokens_total: Option<f64>,
-    pub requests_total: Option<f64>,
-    pub prefix_cache_queries_total: Option<f64>,
-    pub prefix_cache_hits_total: Option<f64>,
-    pub preemptions_total: Option<f64>,
+}
+
+#[derive(Debug)]
+struct CapacityRuntime {
+    capacity: Arc<Capacity>,
+    active: AtomicUsize,
+    workload: Mutex<Workload>,
+}
+
+#[derive(Debug, Default)]
+struct EngineRuntime {
+    circuit: Mutex<CircuitRuntime>,
+    stats: Mutex<RuntimeStats>,
 }
 
 #[derive(Debug)]
@@ -266,12 +293,21 @@ pub struct Node {
     retired: AtomicBool,
     retired_notify: Notify,
     circuit_config: CircuitBreakerConfig,
-    circuit: Arc<Mutex<CircuitRuntime>>,
-    capacity: Arc<Capacity>,
-    active: Arc<AtomicUsize>,
+    engine: Arc<EngineRuntime>,
+    capacity: Arc<CapacityRuntime>,
     health: Arc<AtomicU8>,
-    stats: Arc<Mutex<RuntimeStats>>,
-    workload: Arc<Mutex<Workload>>,
+}
+
+fn insert_sensitive_header(
+    headers: &mut HeaderMap,
+    name: HeaderName,
+    raw: &str,
+    context: &str,
+) -> Result<()> {
+    let mut value = HeaderValue::from_str(raw).with_context(|| context.to_owned())?;
+    value.set_sensitive(true);
+    headers.insert(name, value);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -310,10 +346,12 @@ impl Node {
         let mut headers = HeaderMap::new();
         for (name, value) in &config.headers {
             let name = HeaderName::from_bytes(name.as_bytes())?;
-            let mut value = HeaderValue::from_str(value)
-                .with_context(|| format!("node {} has invalid value for {name}", config.id))?;
-            value.set_sensitive(true);
-            headers.insert(name, value);
+            insert_sensitive_header(
+                &mut headers,
+                name.clone(),
+                value,
+                &format!("node {} has invalid value for {name}", config.id),
+            )?;
         }
         for (name, variable) in &config.headers_from_env {
             let name = HeaderName::from_bytes(name.as_bytes())?;
@@ -329,33 +367,33 @@ impl Node {
                     config.id
                 );
             }
-            let mut value = HeaderValue::from_str(&secret).with_context(|| {
-                format!("node {} has invalid environment header {name}", config.id)
-            })?;
-            value.set_sensitive(true);
-            headers.insert(name, value);
+            insert_sensitive_header(
+                &mut headers,
+                name.clone(),
+                &secret,
+                &format!("node {} has invalid environment header {name}", config.id),
+            )?;
         }
-        let api_key = if let Some(key) = &config.api_key {
-            Some(key.clone())
-        } else if let Some(variable) = &config.api_key_env {
-            Some(env::var(variable).with_context(|| {
+        let api_key = match (&config.api_key, &config.api_key_env) {
+            (Some(key), _) => Some(key.clone()),
+            (None, Some(variable)) => Some(env::var(variable).with_context(|| {
                 format!(
                     "node {} requires missing environment variable {variable}",
                     config.id
                 )
-            })?)
-        } else {
-            None
+            })?),
+            (None, None) => None,
         };
         if let Some(key) = api_key {
             if key.trim().is_empty() {
                 bail!("node {} API key is empty", config.id);
             }
-            let mut value = HeaderValue::from_str(&format!("Bearer {key}")).with_context(|| {
-                format!("node {} API key is not a valid header value", config.id)
-            })?;
-            value.set_sensitive(true);
-            headers.insert(AUTHORIZATION, value);
+            insert_sensitive_header(
+                &mut headers,
+                AUTHORIZATION,
+                &format!("Bearer {key}"),
+                &format!("node {} API key is not a valid header value", config.id),
+            )?;
         }
 
         Ok(Arc::new(Self {
@@ -368,14 +406,8 @@ impl Node {
             max_concurrency: config.max_concurrency,
             weight: config.weight,
             headers,
+            provider_runtime: Mutex::new(ProviderRuntime::new(config.provider.kind)),
             provider: config.provider.clone(),
-            provider_runtime: Mutex::new(ProviderRuntime {
-                state: Some(match config.provider.kind {
-                    ProviderKind::Openai => ProviderState::Generic,
-                    ProviderKind::Vllm => ProviderState::Checking,
-                }),
-                ..ProviderRuntime::default()
-            }),
             provider_generation: AtomicU64::new(0),
             route_while_starting,
             lifecycle: AtomicU8::new(
@@ -389,12 +421,13 @@ impl Node {
             retired: AtomicBool::new(false),
             retired_notify: Notify::new(),
             circuit_config,
-            circuit: Arc::new(Mutex::new(CircuitRuntime::default())),
-            capacity: Capacity::new(config.max_concurrency),
-            active: Arc::new(AtomicUsize::new(0)),
+            engine: Arc::new(EngineRuntime::default()),
+            capacity: Arc::new(CapacityRuntime {
+                capacity: Capacity::new(config.max_concurrency),
+                active: AtomicUsize::new(0),
+                workload: Mutex::new(Workload::default()),
+            }),
             health: Arc::new(AtomicU8::new(HealthState::Starting.encode())),
-            stats: Arc::new(Mutex::new(RuntimeStats::default())),
-            workload: Arc::new(Mutex::new(Workload::default())),
         }))
     }
 
@@ -438,29 +471,32 @@ impl Node {
             retired: AtomicBool::new(false),
             retired_notify: Notify::new(),
             circuit_config: self.circuit_config.clone(),
-            circuit: Arc::clone(if same_engine {
-                &previous.circuit
+            engine: Arc::clone(if same_engine {
+                &previous.engine
             } else {
-                &self.circuit
+                &self.engine
             }),
             capacity: Arc::clone(&previous.capacity),
-            active: Arc::clone(&previous.active),
             health: Arc::clone(if same_upstream {
                 &previous.health
             } else {
                 &self.health
             }),
-            stats: Arc::clone(if same_engine {
-                &previous.stats
-            } else {
-                &self.stats
-            }),
-            workload: Arc::clone(&previous.workload),
         })
     }
 
     pub(crate) fn resize_capacity(&self) {
-        self.capacity.resize(self.max_concurrency);
+        self.capacity.capacity.resize(self.max_concurrency);
+    }
+
+    pub(crate) fn apply_headers(
+        &self,
+        mut request: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
+        request
     }
 
     pub fn id(&self) -> &str {
@@ -480,7 +516,7 @@ impl Node {
     }
 
     pub fn active(&self) -> usize {
-        self.active.load(Ordering::Relaxed)
+        self.capacity.active.load(Ordering::Relaxed)
     }
 
     pub fn health(&self) -> HealthState {
@@ -509,7 +545,7 @@ impl Node {
     }
 
     pub fn set_draining(&self, draining: bool) -> bool {
-        let _circuit = self.circuit.lock();
+        let _circuit = self.engine.circuit.lock();
         let next = if draining {
             LifecycleState::Draining
         } else {
@@ -519,7 +555,7 @@ impl Node {
     }
 
     pub fn circuit_state(&self) -> CircuitState {
-        let mut circuit = self.circuit.lock();
+        let mut circuit = self.engine.circuit.lock();
         Self::refresh_circuit_locked(&mut circuit);
         circuit.state
     }
@@ -545,10 +581,7 @@ impl Node {
     }
 
     pub fn provider_state(&self) -> ProviderState {
-        self.provider_runtime
-            .lock()
-            .state
-            .unwrap_or(ProviderState::Checking)
+        self.provider_runtime.lock().state
     }
 
     pub fn provider_is_ready(&self) -> bool {
@@ -579,7 +612,7 @@ impl Node {
 
     pub fn record_vllm_ready(&self, version: String) {
         let mut runtime = self.provider_runtime.lock();
-        if runtime.state == Some(ProviderState::Incompatible)
+        if runtime.state == ProviderState::Incompatible
             || runtime
                 .version
                 .as_ref()
@@ -588,20 +621,20 @@ impl Node {
             self.bump_provider_generation();
             runtime.counters = telemetry::Tracker::default();
         }
-        runtime.state = Some(ProviderState::Ready);
+        runtime.state = ProviderState::Ready;
         runtime.version = Some(version);
         runtime.compatibility_error = None;
     }
 
     pub fn record_vllm_incompatible(&self, version: Option<String>, error: String) -> bool {
         let mut runtime = self.provider_runtime.lock();
-        let changed = runtime.state != Some(ProviderState::Incompatible)
+        let changed = runtime.state != ProviderState::Incompatible
             || runtime.version.as_ref() != version.as_ref()
             || runtime.compatibility_error.as_ref() != Some(&error);
         if changed {
             self.bump_provider_generation();
         }
-        runtime.state = Some(ProviderState::Incompatible);
+        runtime.state = ProviderState::Incompatible;
         runtime.version = version;
         runtime.compatibility_error = Some(error);
         runtime.telemetry_updated_unix_ms = None;
@@ -634,47 +667,22 @@ impl Node {
 
     pub(crate) fn record_vllm_metrics(&self, telemetry: VllmMetricsSnapshot) {
         let updated_at = unix_millis();
+        let prefix_queries =
+            sum_counter_kind(&telemetry.counter_series, CounterKind::PrefixQueries);
+        let prefix_hits = sum_counter_kind(&telemetry.counter_series, CounterKind::PrefixHits);
+        let preemptions = sum_counter_kind(&telemetry.counter_series, CounterKind::Preemptions);
         let mut runtime = self.provider_runtime.lock();
-        let counters = if telemetry.counter_series.is_empty() {
-            [
-                telemetry.prompt_tokens_total,
-                telemetry.generation_tokens_total,
-                telemetry.requests_total,
-                telemetry.prefix_cache_queries_total,
-                telemetry.prefix_cache_hits_total,
-                telemetry.preemptions_total,
-            ]
-            .into_iter()
-            .enumerate()
-            .filter_map(|(kind, value)| {
-                value.map(|value| ProviderCounter {
-                    key: kind.to_string(),
-                    kind,
-                    value,
-                })
-            })
-            .collect()
-        } else {
-            telemetry.counter_series
-        };
         runtime.counters.update(
-            counters,
+            telemetry.counter_series,
             Instant::now(),
             Duration::from_millis(self.provider.telemetry_stale_ms),
         );
-        runtime.prompt_tokens_per_second = runtime.counters.snapshot.input.smoothed;
-        runtime.generation_tokens_per_second = runtime.counters.snapshot.output.smoothed;
-        runtime.requests_per_second = runtime.counters.snapshot.requests.smoothed;
         runtime.running = telemetry.running;
         runtime.waiting = telemetry.waiting;
         runtime.kv_cache_usage = telemetry.kv_cache_usage;
-        runtime.prompt_tokens_total = telemetry.prompt_tokens_total;
-        runtime.generation_tokens_total = telemetry.generation_tokens_total;
-        runtime.requests_total = telemetry.requests_total;
-        runtime.prefix_cache_queries_total = telemetry.prefix_cache_queries_total;
-        runtime.prefix_cache_hits_total = telemetry.prefix_cache_hits_total;
-        runtime.prefix_cache_hit_rate = runtime.counters.snapshot.cache_hit_ratio;
-        runtime.preemptions_total = telemetry.preemptions_total;
+        runtime.prefix_cache_queries_total = prefix_queries;
+        runtime.prefix_cache_hits_total = prefix_hits;
+        runtime.preemptions_total = preemptions;
         runtime.telemetry_updated_unix_ms = Some(updated_at);
         runtime.telemetry_error = None;
     }
@@ -685,10 +693,7 @@ impl Node {
             return local;
         }
         let runtime = self.provider_runtime.lock();
-        let fresh = runtime.telemetry_updated_unix_ms.is_some_and(|updated| {
-            unix_millis().saturating_sub(updated) <= self.provider.telemetry_stale_ms
-        });
-        if fresh {
+        if runtime.is_fresh(self.provider.telemetry_stale_ms) {
             local.max(runtime.running.saturating_add(runtime.waiting))
         } else {
             local
@@ -701,10 +706,7 @@ impl Node {
         }
         let runtime = self.provider_runtime.lock();
         runtime
-            .telemetry_updated_unix_ms
-            .is_some_and(|updated| {
-                unix_millis().saturating_sub(updated) <= self.provider.telemetry_stale_ms
-            })
+            .is_fresh(self.provider.telemetry_stale_ms)
             .then_some(runtime.waiting)
     }
 
@@ -752,7 +754,7 @@ impl Node {
     }
 
     fn circuit_accepting_requests(&self) -> bool {
-        let mut circuit = self.circuit.lock();
+        let mut circuit = self.engine.circuit.lock();
         Self::refresh_circuit_locked(&mut circuit);
         match circuit.state {
             CircuitState::Closed => true,
@@ -764,18 +766,14 @@ impl Node {
     }
 
     fn begin_circuit_request(&self) -> Option<CircuitTicket> {
-        if self.is_retired()
-            || self.lifecycle() != LifecycleState::Serving
-            || !self.is_health_state_routable(self.health())
-            || !self.provider_is_ready()
-        {
+        if !self.provider_is_ready() {
             return None;
         }
-        let mut circuit = self.circuit.lock();
+        let mut circuit = self.engine.circuit.lock();
         if self.is_retired()
             || self.lifecycle() != LifecycleState::Serving
             || !self.is_health_state_routable(self.health())
-            || self.active() >= self.capacity.limit()
+            || self.active() >= self.capacity.capacity.limit()
         {
             return None;
         }
@@ -796,7 +794,7 @@ impl Node {
             }
             CircuitState::Open | CircuitState::HalfOpen => None,
         }?;
-        self.active.fetch_add(1, Ordering::AcqRel);
+        self.capacity.active.fetch_add(1, Ordering::AcqRel);
         Some(ticket)
     }
 
@@ -812,7 +810,6 @@ impl Node {
             circuit.opened_until = None;
             circuit.opened_until_unix_ms = None;
             circuit.epoch = circuit.epoch.wrapping_add(1);
-            circuit.last_change_unix_ms = unix_millis();
         }
     }
 
@@ -820,14 +817,14 @@ impl Node {
         if !ticket.half_open {
             return;
         }
-        let mut circuit = self.circuit.lock();
+        let mut circuit = self.engine.circuit.lock();
         if circuit.state == CircuitState::HalfOpen && circuit.epoch == ticket.epoch {
             circuit.half_open_in_flight = circuit.half_open_in_flight.saturating_sub(1);
         }
     }
 
     fn record_circuit_success(&self, ticket: Option<CircuitTicket>) {
-        let mut circuit = self.circuit.lock();
+        let mut circuit = self.engine.circuit.lock();
         Self::refresh_circuit_locked(&mut circuit);
         match circuit.state {
             CircuitState::Closed => circuit.consecutive_failures = 0,
@@ -844,7 +841,6 @@ impl Node {
                     circuit.opened_until = None;
                     circuit.opened_until_unix_ms = None;
                     circuit.epoch = circuit.epoch.wrapping_add(1);
-                    circuit.last_change_unix_ms = unix_millis();
                 }
             }
             CircuitState::Open | CircuitState::HalfOpen => {}
@@ -852,7 +848,7 @@ impl Node {
     }
 
     fn record_circuit_failure(&self, ticket: Option<CircuitTicket>) {
-        let mut circuit = self.circuit.lock();
+        let mut circuit = self.engine.circuit.lock();
         Self::refresh_circuit_locked(&mut circuit);
         let should_open = match circuit.state {
             CircuitState::Closed => {
@@ -872,12 +868,11 @@ impl Node {
             circuit.opened_until = Some(Instant::now() + self.circuit_config.open_duration());
             circuit.opened_until_unix_ms = Some(now.saturating_add(self.circuit_config.open_ms));
             circuit.epoch = circuit.epoch.wrapping_add(1);
-            circuit.last_change_unix_ms = now;
         }
     }
 
     pub fn try_acquire(self: &Arc<Self>, idle_notify: Arc<Notify>) -> Option<NodeLease> {
-        let permit = self.capacity.try_acquire()?;
+        let permit = self.capacity.capacity.try_acquire()?;
         let circuit_ticket = self.begin_circuit_request()?;
         Some(NodeLease {
             node: Arc::clone(self),
@@ -902,7 +897,7 @@ impl Node {
         let permit = tokio::select! {
             biased;
             () = &mut retired => return None,
-            permit = self.capacity.acquire() => permit,
+            permit = self.capacity.capacity.acquire() => permit,
         };
         Some(NodeReservation {
             node: Arc::clone(&self),
@@ -911,7 +906,7 @@ impl Node {
     }
 
     pub fn score_stats(&self, stale_after: Duration) -> Option<(f64, f64)> {
-        let stats = self.stats.lock();
+        let stats = self.engine.stats.lock();
         let recent_request = stats
             .request_stats_updated_at
             .filter(|updated| updated.elapsed() <= stale_after)
@@ -930,12 +925,12 @@ impl Node {
     }
 
     pub(crate) fn scheduling_workload(&self) -> Workload {
-        *self.workload.lock()
+        *self.capacity.workload.lock()
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub(crate) fn typical_output_tokens(&self, stale_after: Duration) -> usize {
-        let stats = self.stats.lock();
+        let stats = self.engine.stats.lock();
         if stats
             .output_updated_at
             .is_some_and(|updated| updated.elapsed() <= stale_after)
@@ -951,7 +946,7 @@ impl Node {
     }
 
     fn record_request_success_with_ticket(&self, latency: Duration, ticket: Option<CircuitTicket>) {
-        let mut stats = self.stats.lock();
+        let mut stats = self.engine.stats.lock();
         update_ewma(&mut stats.latency_ewma_ms, latency.as_secs_f64() * 1_000.0);
         stats.error_ewma *= 1.0 - EWMA_ALPHA;
         stats.request_stats_updated_at = Some(Instant::now());
@@ -961,7 +956,7 @@ impl Node {
     }
 
     pub fn record_overload(&self) {
-        let mut stats = self.stats.lock();
+        let mut stats = self.engine.stats.lock();
         stats.error_ewma = ewma(stats.error_ewma, 0.5);
         stats.request_stats_updated_at = Some(Instant::now());
     }
@@ -970,29 +965,45 @@ impl Node {
         self.record_passive_failure_with_ticket(message, health, None);
     }
 
+    fn apply_failure_health_locked(
+        &self,
+        failures: u32,
+        threshold: u32,
+        message: String,
+        stats: &mut RuntimeStats,
+    ) {
+        stats.consecutive_probe_successes = 0;
+        stats.last_error = Some(message);
+        if failures >= threshold {
+            self.set_health_locked(HealthState::Unhealthy, stats);
+        } else if self.health() == HealthState::Healthy {
+            self.set_health_locked(HealthState::Degraded, stats);
+        }
+    }
+
     fn record_passive_failure_with_ticket(
         &self,
         message: impl Into<String>,
         health: &HealthConfig,
         ticket: Option<CircuitTicket>,
     ) {
-        let mut stats = self.stats.lock();
+        let mut stats = self.engine.stats.lock();
         stats.error_ewma = ewma(stats.error_ewma, 1.0);
         stats.request_stats_updated_at = Some(Instant::now());
-        stats.consecutive_probe_successes = 0;
         stats.consecutive_passive_failures = stats.consecutive_passive_failures.saturating_add(1);
-        stats.last_error = Some(message.into());
-        if stats.consecutive_passive_failures >= health.passive_failure_threshold {
-            self.set_health_locked(HealthState::Unhealthy, &mut stats);
-        } else if self.health() == HealthState::Healthy {
-            self.set_health_locked(HealthState::Degraded, &mut stats);
-        }
+        let failures = stats.consecutive_passive_failures;
+        self.apply_failure_health_locked(
+            failures,
+            health.passive_failure_threshold,
+            message.into(),
+            &mut stats,
+        );
         drop(stats);
         self.record_circuit_failure(ticket);
     }
 
     pub fn record_probe_success(&self, health: &HealthConfig) {
-        let mut stats = self.stats.lock();
+        let mut stats = self.engine.stats.lock();
         let current_health = self.health();
         stats.consecutive_active_failures = 0;
         match current_health {
@@ -1020,16 +1031,16 @@ impl Node {
     }
 
     pub fn record_probe_failure(&self, message: impl Into<String>, health: &HealthConfig) -> bool {
-        let mut stats = self.stats.lock();
+        let mut stats = self.engine.stats.lock();
         let previous = self.health();
-        stats.consecutive_probe_successes = 0;
         stats.consecutive_active_failures = stats.consecutive_active_failures.saturating_add(1);
-        stats.last_error = Some(message.into());
-        if stats.consecutive_active_failures >= health.unhealthy_threshold {
-            self.set_health_locked(HealthState::Unhealthy, &mut stats);
-        } else if self.health() == HealthState::Healthy {
-            self.set_health_locked(HealthState::Degraded, &mut stats);
-        }
+        let failures = stats.consecutive_active_failures;
+        self.apply_failure_health_locked(
+            failures,
+            health.unhealthy_threshold,
+            message.into(),
+            &mut stats,
+        );
         self.health() != previous
     }
 
@@ -1043,14 +1054,19 @@ impl Node {
     pub fn snapshot(&self) -> NodeSnapshot {
         let active = self.active();
         let workload = self.scheduling_workload();
-        let stats = self.stats.lock();
+        let stats = self.engine.stats.lock();
         let provider = self.provider_runtime.lock();
-        let mut circuit = self.circuit.lock();
+        let mut circuit = self.engine.circuit.lock();
         Self::refresh_circuit_locked(&mut circuit);
         let has_telemetry = provider.telemetry_updated_unix_ms.is_some();
+        let engine = provider.counters.snapshot.clone();
         NodeSnapshot {
             instance_id: self.instance_id(),
-            engine: provider.counters.snapshot.clone(),
+            prompt_tokens_per_second: engine.input.smoothed,
+            generation_tokens_per_second: engine.output.smoothed,
+            requests_per_second: engine.requests.smoothed,
+            prefix_cache_hit_rate: engine.cache_hit_ratio,
+            engine,
             id: self.id.clone(),
             base_url: self.base_url.as_str().trim_end_matches('/').to_owned(),
             health: self.health(),
@@ -1061,6 +1077,7 @@ impl Node {
             circuit_half_open_in_flight: circuit.half_open_in_flight,
             active,
             available: self
+                .capacity
                 .capacity
                 .available()
                 .min(self.max_concurrency.saturating_sub(active)),
@@ -1074,18 +1091,14 @@ impl Node {
             last_error: stats.last_error.clone(),
             last_change_unix_ms: stats.last_change_unix_ms,
             provider: self.provider.kind,
-            provider_state: provider.state.unwrap_or(ProviderState::Checking),
+            provider_state: provider.state,
             provider_version: provider.version.clone(),
             provider_generation: self.provider_generation(),
             upstream_running: has_telemetry.then_some(provider.running),
             upstream_waiting: has_telemetry.then_some(provider.waiting),
             kv_cache_usage: provider.kv_cache_usage,
-            prompt_tokens_per_second: provider.prompt_tokens_per_second,
-            generation_tokens_per_second: provider.generation_tokens_per_second,
-            requests_per_second: provider.requests_per_second,
             prefix_cache_queries_total: provider.prefix_cache_queries_total,
             prefix_cache_hits_total: provider.prefix_cache_hits_total,
-            prefix_cache_hit_rate: provider.prefix_cache_hit_rate,
             preemptions_total: provider.preemptions_total,
             provider_telemetry_updated_unix_ms: provider.telemetry_updated_unix_ms,
             provider_last_error: provider
@@ -1096,19 +1109,6 @@ impl Node {
                 .cloned(),
         }
     }
-}
-
-fn counter_rate(current: Option<f64>, previous: Option<f64>, elapsed: Option<f64>) -> Option<f64> {
-    let (current, previous, elapsed) = (current?, previous?, elapsed?);
-    if !current.is_finite()
-        || !previous.is_finite()
-        || !elapsed.is_finite()
-        || current < previous
-        || elapsed <= 0.0
-    {
-        return None;
-    }
-    Some((current - previous) / elapsed)
 }
 
 fn prefix_cache_hit_rate(hits: Option<f64>, queries: Option<f64>) -> Option<f64> {
@@ -1165,7 +1165,7 @@ impl NodeLease {
         let prefill_tokens = prefill_tokens as u128;
         let decode_tokens = decode_tokens as u128;
         let mut own = self.workload.lock();
-        let mut total = self.node.workload.lock();
+        let mut total = self.node.capacity.workload.lock();
         total.prefill_tokens = total
             .prefill_tokens
             .saturating_sub(own.prefill_tokens)
@@ -1183,17 +1183,17 @@ impl NodeLease {
     pub(crate) fn record_first_token(&self, latency: Duration) {
         {
             let mut own = self.workload.lock();
-            let mut total = self.node.workload.lock();
+            let mut total = self.node.capacity.workload.lock();
             total.prefill_tokens = total.prefill_tokens.saturating_sub(own.prefill_tokens);
             own.prefill_tokens = 0;
         }
-        let mut stats = self.node.stats.lock();
+        let mut stats = self.node.engine.stats.lock();
         update_ewma(&mut stats.ttft_ewma_ms, latency.as_secs_f64() * 1_000.0);
         stats.ttft_updated_at = Some(Instant::now());
     }
 
     pub(crate) fn record_output_tokens(&self, tokens: usize) {
-        let mut stats = self.node.stats.lock();
+        let mut stats = self.node.engine.stats.lock();
         let per_generation = tokens.div_ceil(self.generations.load(Ordering::Relaxed));
         update_ewma(&mut stats.output_tokens_ewma, per_generation as f64);
         stats.output_updated_at = Some(Instant::now());
@@ -1221,11 +1221,11 @@ impl Drop for NodeLease {
     fn drop(&mut self) {
         let own = self.workload.get_mut();
         {
-            let mut total = self.node.workload.lock();
+            let mut total = self.node.capacity.workload.lock();
             total.prefill_tokens = total.prefill_tokens.saturating_sub(own.prefill_tokens);
             total.decode_tokens = total.decode_tokens.saturating_sub(own.decode_tokens);
         }
-        self.node.active.fetch_sub(1, Ordering::AcqRel);
+        self.node.capacity.active.fetch_sub(1, Ordering::AcqRel);
         if let Some(ticket) = self.circuit_ticket.take() {
             self.node.release_circuit_ticket(ticket);
         }
@@ -1273,12 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn vllm_counter_rates_handle_resets_and_prefix_hit_ratio() {
-        assert_eq!(
-            counter_rate(Some(140.0), Some(100.0), Some(2.0)),
-            Some(20.0)
-        );
-        assert_eq!(counter_rate(Some(20.0), Some(100.0), Some(2.0)), None);
+    fn prefix_cache_hit_ratio_handles_zero_queries() {
         assert_eq!(
             prefix_cache_hit_rate(Some(625.0), Some(1000.0)),
             Some(0.625)

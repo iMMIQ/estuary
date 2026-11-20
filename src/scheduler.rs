@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     future::Future,
     pin::Pin,
     sync::{
@@ -48,6 +48,20 @@ struct Candidate {
     score: f64,
 }
 
+impl Candidate {
+    fn into_selection(self, lease: NodeLease, generations: usize) -> Selection {
+        lease.assign_workload(self.prefill_tokens, self.decode_tokens, generations);
+        Selection {
+            node: self.node,
+            lease,
+            upstream_model: self.upstream_model,
+            prefix_match_chars: self.prefix_match_chars,
+            prefix_match_tokens: self.prefix_match_tokens,
+            score: self.score,
+        }
+    }
+}
+
 type PendingAcquisition =
     Pin<Box<dyn Future<Output = (Candidate, Option<NodeReservation>)> + Send + 'static>>;
 
@@ -58,7 +72,6 @@ pub struct Scheduler {
     prefix: Arc<PrefixDirectory>,
     exact_cache: Arc<ExactCacheDirectory>,
     notify: Arc<Notify>,
-    model_notifies: RwLock<HashMap<String, Arc<Notify>>>,
     idle_notify: Arc<Notify>,
     queue_slots: Arc<Semaphore>,
     queue_kib: Arc<Semaphore>,
@@ -147,6 +160,9 @@ impl Scheduler {
     pub fn new(nodes: Vec<Arc<Node>>, config: RoutingConfig) -> Self {
         let prefix = Arc::new(PrefixDirectory::new(&config.prefix));
         let exact_cache = Arc::new(ExactCacheDirectory::default());
+        for node in &nodes {
+            configure_exact_cache(&exact_cache, node);
+        }
         let queue_max_requests = config.queue_max_requests;
         let queue_max_kib = config.queue_max_bytes.div_ceil(1024).min(u32::MAX as usize);
         Self {
@@ -155,7 +171,6 @@ impl Scheduler {
             prefix,
             exact_cache,
             notify: Arc::new(Notify::new()),
-            model_notifies: RwLock::new(HashMap::new()),
             idle_notify: Arc::new(Notify::new()),
             queue_slots: Arc::new(Semaphore::new(queue_max_requests)),
             queue_kib: Arc::new(Semaphore::new(queue_max_kib)),
@@ -209,20 +224,12 @@ impl Scheduler {
             Arc::clone(&self.queued_bytes),
             rounded_bytes,
         );
-        let model_notify = model.map(|name| self.model_notifier(name));
         let mut registered = HashSet::new();
         let mut acquisitions = FuturesUnordered::<PendingAcquisition>::new();
         loop {
             let state_changed = self.notify.notified();
             tokio::pin!(state_changed);
             state_changed.as_mut().enable();
-            let model_changed = async {
-                match &model_notify {
-                    Some(notify) => notify.notified().await,
-                    None => std::future::pending().await,
-                }
-            };
-            tokio::pin!(model_changed);
 
             for candidate in self.ranked_candidates(model, &prefix_input, excluded)? {
                 if registered.insert(candidate.node_instance_id) {
@@ -243,71 +250,21 @@ impl Scheduler {
                     let Some(reservation) = reservation else {
                         continue;
                     };
-                    if !candidate.node.is_routable() {
-                        drop(reservation);
-                        continue;
-                    }
                     let refreshed = self
-                        .ranked_candidates(
-                            model,
-                            &prefix_input,
-                            excluded,
-                        )?
+                        .ranked_candidates(model, &prefix_input, excluded)?
                         .into_iter()
                         .find(|item| item.node_instance_id == candidate.node_instance_id);
                     let Some(candidate) = refreshed else {
                         drop(reservation);
                         continue;
                     };
-                    if !candidate.node.is_routable() {
-                        drop(reservation);
-                        continue;
-                    }
                     let Some(lease) = reservation.try_commit(Arc::clone(&self.idle_notify)) else {
                         continue;
                     };
-                    lease.assign_workload(candidate.prefill_tokens, candidate.decode_tokens, prefix_input.generations());
-                    return Ok(Selection {
-                        node: candidate.node,
-                        lease,
-                        upstream_model: candidate.upstream_model,
-                        prefix_match_chars: candidate.prefix_match_chars,
-                        prefix_match_tokens: candidate.prefix_match_tokens,
-                        score: candidate.score,
-                    });
+                    return Ok(candidate.into_selection(lease, prefix_input.generations()));
                 }
-                () = model_changed => {}
                 () = state_changed => {}
             }
-        }
-    }
-
-    fn model_notifier(&self, model: &str) -> Arc<Notify> {
-        if let Some(existing) = self.model_notifies.read().get(model) {
-            return Arc::clone(existing);
-        }
-        let mut notifies = self.model_notifies.write();
-        Arc::clone(
-            notifies
-                .entry(model.to_owned())
-                .or_insert_with(|| Arc::new(Notify::new())),
-        )
-    }
-
-    fn notify_for_node(&self, node: &Node) {
-        let mut has_wildcard = false;
-        let notifies = self.model_notifies.read();
-        for (public, _) in node.explicit_models() {
-            if let Some(notify) = notifies.get(public) {
-                notify.notify_waiters();
-            }
-        }
-        if node.upstream_model(None).is_some() {
-            has_wildcard = true;
-        }
-        drop(notifies);
-        if has_wildcard {
-            self.notify.notify_waiters();
         }
     }
 
@@ -339,19 +296,9 @@ impl Scheduler {
     ) -> Result<Option<Selection>, GatewayError> {
         for candidate in self.ranked_candidates(model, prefix_input, excluded)? {
             if let Some(lease) = candidate.node.try_acquire(Arc::clone(&self.idle_notify)) {
-                lease.assign_workload(
-                    candidate.prefill_tokens,
-                    candidate.decode_tokens,
-                    prefix_input.generations(),
-                );
-                return Ok(Some(Selection {
-                    node: candidate.node,
-                    lease,
-                    upstream_model: candidate.upstream_model,
-                    prefix_match_chars: candidate.prefix_match_chars,
-                    prefix_match_tokens: candidate.prefix_match_tokens,
-                    score: candidate.score,
-                }));
+                return Ok(Some(
+                    candidate.into_selection(lease, prefix_input.generations()),
+                ));
             }
         }
         Ok(None)
@@ -368,8 +315,8 @@ impl Scheduler {
         let prefix_match = self.prefix.best_match(prefix_input);
         let mut candidates = Vec::new();
 
-        let nodes = self.nodes();
-        for node in &nodes {
+        let nodes = self.nodes.read();
+        for node in nodes.iter() {
             if excluded.contains(node.id()) {
                 continue;
             }
@@ -472,21 +419,16 @@ impl Scheduler {
                     // A trustworthy zero is evidence of a miss, not permission to reuse stale history.
                     candidate.prefix_match_tokens = *tokens;
                     cached_tokens = (*tokens).min(input_tokens) as f64;
-                } else if let Some(chars) = prefix_match.node_matches.get(candidate.node.id()) {
+                } else if let Some(matched) = prefix_match.node_matches.get(candidate.node.id()) {
                     let ratio = if prefix_match.input_chars == 0 {
                         0.0
                     } else {
-                        *chars as f64 / prefix_match.input_chars as f64
+                        matched.chars as f64 / prefix_match.input_chars as f64
                     };
                     if ratio > self.config.prefix.cache_threshold {
-                        candidate.prefix_match_chars = *chars;
-                        let age = prefix_match
-                            .node_age_seconds
-                            .get(candidate.node.id())
-                            .copied()
-                            .unwrap_or(0.0);
+                        candidate.prefix_match_chars = matched.chars;
                         let confidence = 0.5
-                            * (-age * 1_000.0
+                            * (-matched.age_seconds * 1_000.0
                                 / self.config.prefix.approximate_half_life_ms.max(1) as f64)
                                 .exp2();
                         cached_tokens = affinity_tokens as f64 * ratio * confidence;
@@ -532,13 +474,10 @@ impl Scheduler {
 
     pub fn models(&self) -> Vec<String> {
         let mut models = self
-            .nodes()
-            .into_iter()
-            .flat_map(|node| {
-                node.explicit_models()
-                    .map(|(public, _)| public.to_owned())
-                    .collect::<Vec<_>>()
-            })
+            .nodes
+            .read()
+            .iter()
+            .flat_map(|node| node.explicit_models().map(|(public, _)| public.to_owned()))
             .collect::<Vec<_>>();
         models.sort();
         models.dedup();
@@ -546,29 +485,28 @@ impl Scheduler {
     }
 
     pub fn model_supports_multimodal(&self, model: &str) -> bool {
-        let matching = self
-            .nodes()
-            .into_iter()
+        let nodes = self.nodes.read();
+        nodes
+            .iter()
             .filter(|node| node.upstream_model(Some(model)).is_some())
-            .collect::<Vec<_>>();
-        matching.is_empty() || matching.iter().all(|node| node.supports_multimodal(model))
+            .all(|node| node.supports_multimodal(model))
     }
 
     pub fn ready(&self) -> bool {
-        self.nodes().iter().any(|node| node.is_routable())
+        self.nodes.read().iter().any(|node| node.is_routable())
     }
 
     pub fn set_node_draining(&self, node_id: &str, draining: bool) -> Option<Arc<Node>> {
-        let node = self.nodes().into_iter().find(|node| node.id() == node_id)?;
+        let node = self.node(node_id)?;
         if node.set_draining(draining) {
-            self.notify_for_node(&node);
+            self.notify.notify_waiters();
         }
         Some(node)
     }
 
     pub fn drain_all(&self) {
         let mut changed = false;
-        for node in self.nodes() {
+        for node in self.nodes.read().iter() {
             changed |= node.set_draining(true);
         }
         if changed {
@@ -610,7 +548,7 @@ impl Scheduler {
     }
 
     pub fn has_alternative(&self, model: Option<&str>, excluded: &HashSet<String>) -> bool {
-        self.nodes().iter().any(|node| {
+        self.nodes.read().iter().any(|node| {
             !excluded.contains(node.id())
                 && node.is_routable()
                 && node.upstream_model(model).is_some()
@@ -618,7 +556,11 @@ impl Scheduler {
     }
 
     pub fn node(&self, node_id: &str) -> Option<Arc<Node>> {
-        self.nodes().into_iter().find(|node| node.id() == node_id)
+        self.nodes
+            .read()
+            .iter()
+            .find(|node| node.id() == node_id)
+            .cloned()
     }
 
     pub fn add_node(&self, node: Arc<Node>) -> Result<(), GatewayError> {
@@ -629,19 +571,11 @@ impl Scheduler {
                 node.id()
             )));
         }
-        if let Some(events) = node.provider().kv_events.as_ref() {
-            self.exact_cache.configure_node_owned(
-                node.id(),
-                events.max_blocks,
-                events.max_directory_bytes,
-                node.instance_id(),
-            );
-        }
-        let notify_node = Arc::clone(&node);
+        configure_exact_cache(&self.exact_cache, &node);
         nodes.push(node);
         nodes.sort_by(|left, right| left.id().cmp(right.id()));
         drop(nodes);
-        self.notify_for_node(&notify_node);
+        self.notify.notify_waiters();
         Ok(())
     }
 
@@ -660,17 +594,9 @@ impl Scheduler {
         self.prefix.clear_node(node.id());
         self.exact_cache
             .remove_node_owned(node.id(), previous.instance_id());
-        if let Some(events) = node.provider().kv_events.as_ref() {
-            self.exact_cache.configure_node_owned(
-                node.id(),
-                events.max_blocks,
-                events.max_directory_bytes,
-                node.instance_id(),
-            );
-        }
+        configure_exact_cache(&self.exact_cache, node);
         drop(nodes);
-        self.notify_for_node(&previous);
-        self.notify_for_node(&replacement);
+        self.notify.notify_waiters();
         Ok(replacement)
     }
 
@@ -683,8 +609,19 @@ impl Scheduler {
         self.exact_cache
             .remove_node_owned(node_id, node.instance_id());
         drop(nodes);
-        self.notify_for_node(&node);
+        self.notify.notify_waiters();
         Some(node)
+    }
+}
+
+fn configure_exact_cache(exact_cache: &ExactCacheDirectory, node: &Node) {
+    if let Some(events) = node.provider().kv_events.as_ref() {
+        exact_cache.configure_node_owned(
+            node.id(),
+            events.max_blocks,
+            events.max_directory_bytes,
+            node.instance_id(),
+        );
     }
 }
 

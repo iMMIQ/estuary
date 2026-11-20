@@ -1,3 +1,5 @@
+use std::io::Read;
+
 use axum::{
     extract::Path,
     http::{
@@ -9,11 +11,23 @@ use axum::{
     },
     response::{IntoResponse, Redirect, Response},
 };
+use flate2::read::GzDecoder;
 use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
 #[folder = "web/dist"]
 pub(super) struct AdminAssets;
+
+fn is_gzip_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
+}
+
+fn has_asset(path: &str) -> bool {
+    !is_gzip_path(path)
+        && (AdminAssets::get(path).is_some() || AdminAssets::get(&format!("{path}.gz")).is_some())
+}
 
 pub(super) async fn admin_redirect() -> Redirect {
     Redirect::temporary("/admin/")
@@ -24,7 +38,7 @@ pub(super) async fn admin_index() -> Response {
 }
 
 pub(super) async fn admin_asset(Path(asset): Path<String>, headers: HeaderMap) -> Response {
-    if AdminAssets::get(&asset).is_some() {
+    if has_asset(&asset) {
         return embedded_admin_response(
             &asset,
             asset.starts_with("assets/"),
@@ -60,14 +74,24 @@ pub(super) fn accepts_gzip(headers: &HeaderMap) -> bool {
 }
 
 pub(super) fn embedded_admin_response(path: &str, immutable: bool, gzip: bool) -> Response {
-    let Some(asset) = AdminAssets::get(path) else {
+    if is_gzip_path(path) {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    let compressed = AdminAssets::get(&format!("{path}.gz"));
+    let (body, is_compressed) = match (gzip, compressed, AdminAssets::get(path)) {
+        (true, Some(asset), _) => (asset.data.into_owned(), true),
+        (_, _, Some(asset)) => (asset.data.into_owned(), false),
+        (false, Some(asset), None) => {
+            let mut decoder = GzDecoder::new(asset.data.as_ref());
+            let mut plain = Vec::new();
+            if decoder.read_to_end(&mut plain).is_err() {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            (plain, false)
+        }
+        (_, None, None) => return StatusCode::NOT_FOUND.into_response(),
     };
     let content_type = mime_guess::from_path(path).first_or_octet_stream();
-    let compressed = gzip
-        .then(|| AdminAssets::get(&format!("{path}.gz")))
-        .flatten();
-    let is_compressed = compressed.is_some();
     let cache_control = if immutable {
         "public, max-age=31536000, immutable"
     } else {
@@ -86,7 +110,7 @@ pub(super) fn embedded_admin_response(path: &str, immutable: bool, gzip: bool) -
             CONTENT_SECURITY_POLICY,
             "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
         )
-        .body(axum::body::Body::from(compressed.unwrap_or(asset).data.into_owned()))
+        .body(axum::body::Body::from(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     if is_compressed {
         response

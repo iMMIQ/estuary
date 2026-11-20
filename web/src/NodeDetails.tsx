@@ -13,11 +13,19 @@ import {
   Trash2,
 } from "lucide-react";
 import type { ReactNode } from "react";
-import { useTranslation } from "react-i18next";
+import { useTranslation } from "./i18n";
 import { metricNumber } from "./metric-series";
-import { effectiveCapability, effectiveModelMappings, protocolPaths } from "./node-config";
+import { effectiveCapability, effectiveModelMappings } from "./node-config";
 import type { NodeRecord } from "./types";
-import { formatPercent, formatTimestamp, HelpTip, StatusBadge } from "./ui";
+import {
+  DataRow,
+  formatMs,
+  formatPercent,
+  formatTimestamp,
+  HelpTip,
+  ProtocolReviewList,
+  StatusBadge,
+} from "./ui";
 
 function metricRate(
   value: number | null | undefined,
@@ -29,11 +37,14 @@ function metricRate(
   return `${metricNumber(value, locale)} ${unit}`;
 }
 
-function DataRow({ label, value }: { label: string; value: ReactNode }) {
+function MetricTile({ icon, label, value }: { icon: ReactNode; label: string; value: ReactNode }) {
   return (
-    <div className="data-row">
-      <span>{label}</span>
-      <strong>{value}</strong>
+    <div>
+      {icon}
+      <span>
+        {label}
+        <strong>{value}</strong>
+      </span>
     </div>
   );
 }
@@ -64,8 +75,7 @@ export function NodeDetails({
   onToggleDrain: () => void;
   onDelete: () => void;
 }) {
-  const { t, i18n } = useTranslation();
-  const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
+  const { t, locale } = useTranslation();
   const unavailable = t("common.unavailable");
   const runtime = node.runtime;
   const isVllm = node.config.provider.type === "vllm";
@@ -188,11 +198,7 @@ export function NodeDetails({
               <DataRow label={t("details.weight")} value={runtime.weight} />
               <DataRow
                 label={t("scheduler.ttft")}
-                value={
-                  runtime.ttft_ewma_ms == null
-                    ? unavailable
-                    : `${Math.round(runtime.ttft_ewma_ms)} ms`
-                }
+                value={formatMs(runtime.ttft_ewma_ms, unavailable)}
               />
               <DataRow
                 label={t("scheduler.prefill")}
@@ -292,126 +298,80 @@ export function NodeDetails({
         <Tabs.Panel value="metrics" pt="md">
           {observabilityPanel}
           <div className="metric-tile-grid">
-            <div>
-              <Gauge size={16} />
-              <span>
-                {t("scheduler.ttft")}
-                <strong>
-                  {runtime.ttft_ewma_ms == null
-                    ? unavailable
-                    : `${Math.round(runtime.ttft_ewma_ms)} ms`}
-                </strong>
-              </span>
-            </div>
-            <div>
-              <Activity size={16} />
-              <span>
-                {t("scheduler.prefill")}
-                <strong>
-                  {runtime.pending_prefill_tokens?.toLocaleString(locale) ?? unavailable}
-                </strong>
-              </span>
-            </div>
-            <div>
-              <Activity size={16} />
-              <span>
-                {t("scheduler.decode")}
-                <strong>
-                  {runtime.pending_decode_tokens?.toLocaleString(locale) ?? unavailable}
-                </strong>
-              </span>
-            </div>
-            <div>
-              <Activity size={16} />
-              <span>
-                {t("upstreams.localLoad")}
-                <strong>
-                  {runtime.active} / {runtime.max_concurrency}
-                </strong>
-              </span>
-            </div>
-            <div>
-              <Server size={16} />
-              <span>
-                {t("details.upstreamDemand")}
-                <strong>
-                  {running} / {waiting}
-                </strong>
-              </span>
-            </div>
-            <div>
-              <Gauge size={16} />
-              <span>
-                {t("vllm.promptThroughput")}
-                <strong>
-                  {metricRate(
-                    telemetry ? runtime.prompt_tokens_per_second : null,
-                    "tok/s",
-                    locale,
-                    unavailable,
-                  )}
-                </strong>
-              </span>
-            </div>
-            <div>
-              <Gauge size={16} />
-              <span>
-                {t("vllm.generationThroughput")}
-                <strong>
-                  {metricRate(
-                    telemetry ? runtime.generation_tokens_per_second : null,
-                    "tok/s",
-                    locale,
-                    unavailable,
-                  )}
-                </strong>
-              </span>
-            </div>
-            <div>
-              <Activity size={16} />
-              <span>
-                {t("vllm.completedRequests")}
-                <strong>
-                  {metricRate(
-                    telemetry ? runtime.requests_per_second : null,
-                    "req/s",
-                    locale,
-                    unavailable,
-                  )}
-                </strong>
-              </span>
-            </div>
-            <div>
-              <Layers3 size={16} />
-              <span>
-                {t("details.gpuPrefix")}
-                <strong>
-                  {formatPercent(telemetry ? runtime.kv_cache_usage : null, unavailable)} /{" "}
-                  {formatPercent(telemetry ? runtime.prefix_cache_hit_rate : null, unavailable)}
-                </strong>
-              </span>
-            </div>
-            <div>
-              <AlertTriangle size={16} />
-              <span>
-                {t("details.preemptions")}
-                <strong>
-                  {!telemetry || runtime.preemptions_total == null
-                    ? unavailable
-                    : runtime.preemptions_total.toLocaleString(locale)}
-                </strong>
-              </span>
-            </div>
-            <div>
-              <Gauge size={16} />
-              <span>
-                {t("details.latencyError")}
-                <strong>
-                  {Math.round(runtime.latency_ewma_ms)} ms / {(runtime.error_ewma * 100).toFixed(2)}
-                  %
-                </strong>
-              </span>
-            </div>
+            <MetricTile
+              icon={<Gauge size={16} />}
+              label={t("scheduler.ttft")}
+              value={formatMs(runtime.ttft_ewma_ms, unavailable)}
+            />
+            <MetricTile
+              icon={<Activity size={16} />}
+              label={t("scheduler.prefill")}
+              value={runtime.pending_prefill_tokens?.toLocaleString(locale) ?? unavailable}
+            />
+            <MetricTile
+              icon={<Activity size={16} />}
+              label={t("scheduler.decode")}
+              value={runtime.pending_decode_tokens?.toLocaleString(locale) ?? unavailable}
+            />
+            <MetricTile
+              icon={<Activity size={16} />}
+              label={t("upstreams.localLoad")}
+              value={`${runtime.active} / ${runtime.max_concurrency}`}
+            />
+            <MetricTile
+              icon={<Server size={16} />}
+              label={t("details.upstreamDemand")}
+              value={`${running} / ${waiting}`}
+            />
+            <MetricTile
+              icon={<Gauge size={16} />}
+              label={t("vllm.promptThroughput")}
+              value={metricRate(
+                telemetry ? runtime.prompt_tokens_per_second : null,
+                "tok/s",
+                locale,
+                unavailable,
+              )}
+            />
+            <MetricTile
+              icon={<Gauge size={16} />}
+              label={t("vllm.generationThroughput")}
+              value={metricRate(
+                telemetry ? runtime.generation_tokens_per_second : null,
+                "tok/s",
+                locale,
+                unavailable,
+              )}
+            />
+            <MetricTile
+              icon={<Activity size={16} />}
+              label={t("vllm.completedRequests")}
+              value={metricRate(
+                telemetry ? runtime.requests_per_second : null,
+                "req/s",
+                locale,
+                unavailable,
+              )}
+            />
+            <MetricTile
+              icon={<Layers3 size={16} />}
+              label={t("details.gpuPrefix")}
+              value={`${formatPercent(telemetry ? runtime.kv_cache_usage : null, unavailable)} / ${formatPercent(telemetry ? runtime.prefix_cache_hit_rate : null, unavailable)}`}
+            />
+            <MetricTile
+              icon={<AlertTriangle size={16} />}
+              label={t("details.preemptions")}
+              value={
+                !telemetry || runtime.preemptions_total == null
+                  ? unavailable
+                  : runtime.preemptions_total.toLocaleString(locale)
+              }
+            />
+            <MetricTile
+              icon={<Gauge size={16} />}
+              label={t("details.latencyError")}
+              value={`${Math.round(runtime.latency_ewma_ms)} ms / ${(runtime.error_ewma * 100).toFixed(2)}%`}
+            />
           </div>
         </Tabs.Panel>
 
@@ -449,13 +409,7 @@ export function NodeDetails({
               <h3>{t("protocol.effective")}</h3>
               <HelpTip subject={t("protocol.effective")}>{t("protocol.routing")}</HelpTip>
             </div>
-            {modelMappings.map(([model]) => (
-              <div className="protocol-review" key={model}>
-                <strong>{model}</strong>
-                <span>Codex: {protocolPaths.responses}</span>
-                <span>Claude: {protocolPaths.messages}</span>
-              </div>
-            ))}
+            <ProtocolReviewList mappings={modelMappings} />
           </section>
         </Tabs.Panel>
       </Tabs>

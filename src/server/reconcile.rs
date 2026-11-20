@@ -8,7 +8,7 @@ use tokio::sync::watch;
 use tracing::warn;
 
 use super::AppState;
-use super::admin::{prepare_node, prepare_node_update};
+use super::admin::prepare_node_candidate;
 
 pub(super) async fn run_control_reconciler(
     state: Arc<AppState>,
@@ -57,14 +57,10 @@ pub(super) async fn reconcile_control_plane(state: &Arc<AppState>) -> Result<()>
     }
 
     let _mutation = state.admin_mutation.lock().await;
-    let before = state.store.revision_async().await?;
-    let stored_nodes = state.store.list_async().await?;
-    let stored_ip_limits = state.store.list_ip_limits_async().await?;
-    let after = state.store.revision_async().await?;
-    if before != after {
-        return Ok(());
-    }
-    state.connections.replace_limits(stored_ip_limits);
+    let snapshot = state.store.snapshot_async().await?;
+    let stored_nodes = snapshot.nodes;
+    let after = snapshot.revision;
+    state.connections.replace_limits(snapshot.ip_limits);
 
     let persisted_ids = stored_nodes
         .iter()
@@ -84,11 +80,7 @@ pub(super) async fn reconcile_control_plane(state: &Arc<AppState>) -> Result<()>
         }
 
         let previous = state.scheduler.node(&stored.config.id);
-        let prepared = if let Some(previous) = &previous {
-            prepare_node_update(state, &stored.config, previous).await
-        } else {
-            prepare_node(state, &stored.config).await
-        };
+        let prepared = prepare_node_candidate(state, &stored.config, previous.as_deref()).await;
         let replacement = match prepared {
             Ok(node) => node,
             Err(error) => {

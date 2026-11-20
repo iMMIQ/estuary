@@ -1,18 +1,17 @@
-use std::{collections::HashMap, time::Duration};
+mod common;
 
 use axum::{
     Json, Router,
     routing::{get, post},
 };
+use common::{IO_TIMEOUT, TestServer, node_config, test_client as client};
 use estuary::{
     Gateway, Settings,
     config::{NodeConfig, ProviderKind},
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
-
-const IO_TIMEOUT: Duration = Duration::from_secs(3);
+use tokio::time::timeout;
 
 async fn live_update_upstreams(
     release: std::sync::Arc<tokio::sync::Semaphore>,
@@ -170,46 +169,8 @@ async fn connection_settings_change_live_while_old_response_uses_its_snapshot() 
     );
 }
 
-struct TestServer {
-    base_url: String,
-    task: JoinHandle<()>,
-}
-
-impl TestServer {
-    async fn spawn(router: Router) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        Self {
-            base_url: format!("http://{address}"),
-            task,
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url)
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-fn client() -> reqwest::Client {
-    reqwest::Client::builder().no_proxy().build().unwrap()
-}
-
 fn node(base_url: &str) -> NodeConfig {
-    NodeConfig {
-        id: "dynamic-a".to_owned(),
-        base_url: format!("{base_url}/v1"),
-        models: HashMap::from([("public-chat".to_owned(), "upstream-chat".to_owned())]),
-        ..NodeConfig::default()
-    }
+    node_config("dynamic-a", base_url, [("public-chat", "upstream-chat")])
 }
 
 fn assert_empty_gateway_status(status: &Value) {

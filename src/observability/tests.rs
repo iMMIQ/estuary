@@ -104,16 +104,23 @@ fn merged_percentiles_weight_observations_and_metrics_escape_labels() {
             Some("model\"\n\\"),
             None,
             true,
-            Counts::default(),
+            Counts {
+                success: 1,
+                ..Counts::default()
+            },
             [Some(if index == 99 { 10.0 } else { 0.1 }); 7],
         );
     }
     let snapshot = hub.snapshot("fleet", "", 300);
     assert!(snapshot.fleet.latency["ttft"].p95.unwrap() < 0.2);
-    let encoded = hub.encode_metrics("# EOF\n".into());
+    let scheduler =
+        crate::scheduler::Scheduler::new(Vec::new(), crate::config::RoutingConfig::default());
+    let encoded = crate::metrics::Metrics::new()
+        .encode(&scheduler, Some(&hub), None)
+        .unwrap();
     assert!(encoded.contains("model\\\"\\n\\\\"));
     assert_eq!(encoded.matches("# EOF").count(), 1);
-    assert!(encoded.contains("estuary_gateway_ttft_seconds_count{scope=\"fleet\",name=\"\"} 100"));
+    assert!(encoded.contains("estuary_gateway_success_total{scope=\"fleet\",name=\"\"} 100"));
 }
 
 #[test]

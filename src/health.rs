@@ -53,8 +53,9 @@ async fn probe_all(
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        probe(client, node, config).await;
-        scheduler.notify_state_change();
+        if probe(client, node, config).await {
+            scheduler.notify_state_change();
+        }
     }))
     .await;
 }
@@ -80,14 +81,14 @@ fn probe_jitter(
         .mul_f64(fraction * f64::from(config.jitter_percent) / 100.0)
 }
 
-async fn probe(client: &Client, node: &Arc<Node>, config: &HealthConfig) {
+async fn probe(client: &Client, node: &Arc<Node>, config: &HealthConfig) -> bool {
     let started = Instant::now();
-    let mut request = client
-        .get(node.health_url().clone())
-        .timeout(config.timeout());
-    for (name, value) in node.headers() {
-        request = request.header(name, value);
-    }
+    let previous = node.health();
+    let request = node.apply_headers(
+        client
+            .get(node.health_url().clone())
+            .timeout(config.timeout()),
+    );
     match request.send().await {
         Ok(response) if response.status().is_success() => {
             node.record_probe_success(config);
@@ -96,21 +97,26 @@ async fn probe(client: &Client, node: &Arc<Node>, config: &HealthConfig) {
                 elapsed_ms = started.elapsed().as_millis(),
                 "health probe succeeded"
             );
+            node.health() != previous
         }
         Ok(response) => {
             let message = format!("health probe returned {}", response.status());
-            if node.record_probe_failure(&message, config) {
+            let changed = node.record_probe_failure(&message, config);
+            if changed {
                 warn!(node = node.id(), status = %response.status(), "health state changed after probe failure");
             } else {
                 debug!(node = node.id(), status = %response.status(), "health probe remains unsuccessful");
             }
+            changed
         }
         Err(error) => {
-            if node.record_probe_failure(error.to_string(), config) {
+            let changed = node.record_probe_failure(error.to_string(), config);
+            if changed {
                 warn!(node = node.id(), error = %error, "health state changed after probe failure");
             } else {
                 debug!(node = node.id(), error = %error, "health probe remains unsuccessful");
             }
+            changed
         }
     }
 }
@@ -120,13 +126,12 @@ pub async fn preflight_health(
     node: &Arc<Node>,
     config: &HealthConfig,
 ) -> Result<()> {
-    let mut request = client
-        .get(node.health_url().clone())
-        .timeout(config.timeout());
-    for (name, value) in node.headers() {
-        request = request.header(name, value);
-    }
-    let response = request
+    let response = node
+        .apply_headers(
+            client
+                .get(node.health_url().clone())
+                .timeout(config.timeout()),
+        )
         .send()
         .await
         .with_context(|| format!("health check for node {:?} failed", node.id()))?;

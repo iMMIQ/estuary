@@ -1,11 +1,10 @@
 use super::headers::{connection_header_names, should_forward_request_header};
-use super::streaming::{LimitedSseInput, SseInputError};
 use super::upstream::mapped_body;
 use axum::http::{HeaderName, HeaderValue};
 use std::io;
 
 use bytes::Bytes;
-use futures_util::{StreamExt, stream};
+use futures_util::stream;
 use serde_json::json;
 
 use super::*;
@@ -31,41 +30,6 @@ async fn request_body_reader_enforces_size_and_idle_timeouts() {
         .await,
         Err(GatewayError::RequestTimeout)
     ));
-}
-
-#[tokio::test]
-async fn sse_input_rejects_an_event_over_the_configured_limit() {
-    let source = stream::iter([Ok::<_, io::Error>(Bytes::from_static(
-        b"data: too large\n\n",
-    ))]);
-    let error = LimitedSseInput::new(source, 8)
-        .next()
-        .await
-        .expect("one input chunk")
-        .expect_err("oversized event must fail");
-    assert!(matches!(error, SseInputError::EventTooLarge));
-}
-
-#[tokio::test]
-async fn sse_input_resets_its_limit_for_all_line_endings_and_split_boundaries() {
-    for chunks in [
-        vec![
-            Bytes::from_static(b"1234567\n"),
-            Bytes::from_static(b"\n1234567\n\n"),
-        ],
-        vec![
-            Bytes::from_static(b"1234567\r\n\r"),
-            Bytes::from_static(b"\n1234567\r\n\r\n"),
-        ],
-        vec![
-            Bytes::from_static(b"1234567\r"),
-            Bytes::from_static(b"\r1234567\r\r"),
-        ],
-    ] {
-        let source = stream::iter(chunks.into_iter().map(Ok::<_, io::Error>));
-        let results = LimitedSseInput::new(source, 11).collect::<Vec<_>>().await;
-        assert!(results.iter().all(Result::is_ok));
-    }
 }
 
 #[test]
@@ -261,7 +225,7 @@ fn claude_code_versions_share_the_same_sanitized_prefix() {
     let directory = crate::prefix::PrefixDirectory::new(&config);
     directory.record("node-a", &first);
     let matched = directory.best_match(&second);
-    assert_eq!(matched.node_ids, ["node-a"]);
+    assert_eq!(matched.best_nodes(), ["node-a"]);
     assert_eq!(matched.matched_chars, matched.input_chars);
 }
 

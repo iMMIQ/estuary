@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::{SocketAddr, TcpListener as StdTcpListener},
+    net::SocketAddr,
     path::Path as FsPath,
     sync::{
         Arc,
@@ -13,7 +13,6 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
-    http::StatusCode,
     middleware::{self as axum_middleware},
     routing::{any, get, put},
 };
@@ -23,7 +22,7 @@ use serde_json::json;
 use tokio::{
     net::TcpListener,
     sync::{Mutex as AsyncMutex, watch},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -58,9 +57,9 @@ use reconcile::run_control_reconciler;
 mod admin;
 mod logs;
 use admin::{
-    activate_process, admin_events, admin_node, admin_nodes, admin_status, create_node,
-    delete_ip_limit, delete_node, drain_node, drain_process, live, metrics, preflight_node,
-    process_status, ready, resume_node, set_ip_limit, update_node,
+    admin_events, admin_node, admin_nodes, admin_status, create_node, delete_ip_limit, delete_node,
+    drain_node, drain_process, live, metrics, preflight_node, process_status, ready, resume_node,
+    set_ip_limit, update_node,
 };
 
 #[derive(Clone, Debug)]
@@ -99,25 +98,16 @@ impl Gateway {
     pub fn build(settings: Settings) -> Result<Self> {
         let store = NodeStore::memory()?;
         store.seed_if_empty(&settings.nodes)?;
-        Self::build_with_store(settings, store, false)
+        Self::build_with_store(settings, store)
     }
 
     pub fn build_with_database(settings: Settings, path: impl AsRef<FsPath>) -> Result<Self> {
         crate::session_log::separate_database(&settings.session_log, path.as_ref())?;
         let store = NodeStore::open(path)?;
-        Self::build_with_store(settings, store, false)
+        Self::build_with_store(settings, store)
     }
 
-    pub fn build_with_database_paused(
-        settings: Settings,
-        path: impl AsRef<FsPath>,
-    ) -> Result<Self> {
-        crate::session_log::separate_database(&settings.session_log, path.as_ref())?;
-        let store = NodeStore::open(path)?;
-        Self::build_with_store(settings, store, true)
-    }
-
-    fn build_with_store(settings: Settings, store: Arc<NodeStore>, paused: bool) -> Result<Self> {
+    fn build_with_store(settings: Settings, store: Arc<NodeStore>) -> Result<Self> {
         settings.validate()?;
         let stored_nodes = store.list()?;
         let runtime_revisions = stored_nodes
@@ -135,23 +125,18 @@ impl Gateway {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(settings.server.connect_timeout_ms))
-            .pool_idle_timeout(Duration::from_secs(90))
-            .no_proxy()
-            .redirect(Policy::none())
-            .user_agent(concat!("estuary/", env!("ESTUARY_BUILD_VERSION")))
-            .build()
-            .context("failed to build upstream HTTP client")?;
-        let control_client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(settings.server.connect_timeout_ms))
-            .pool_max_idle_per_host(8)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .no_proxy()
-            .redirect(Policy::none())
-            .user_agent(concat!("estuary/", env!("ESTUARY_BUILD_VERSION")))
-            .build()
-            .context("failed to build control-plane HTTP client")?;
+        let client = build_http_client(
+            settings.server.connect_timeout_ms,
+            Duration::from_secs(90),
+            None,
+        )
+        .context("failed to build upstream HTTP client")?;
+        let control_client = build_http_client(
+            settings.server.connect_timeout_ms,
+            Duration::from_secs(30),
+            Some(8),
+        )
+        .context("failed to build control-plane HTTP client")?;
         let scheduler = Arc::new(Scheduler::new(nodes.clone(), settings.routing.clone()));
         let vllm = VllmManager::new(Arc::clone(&scheduler));
         let metrics = Metrics::new();
@@ -176,11 +161,7 @@ impl Gateway {
                 settings: Arc::new(settings),
                 vllm,
                 store,
-                process: if paused {
-                    ProcessLifecycle::new_paused()
-                } else {
-                    ProcessLifecycle::new()
-                },
+                process: ProcessLifecycle::new(),
                 response_buffer,
                 session_log,
                 rate_limiter: PublicRateLimiter::default(),
@@ -197,7 +178,6 @@ impl Gateway {
         self.start_telemetry();
         let max_body = self.state.settings.server.max_request_body_bytes;
         Router::new()
-            .route("/api/hello", get(api_hello))
             .route("/v1/models", get(proxy::list_models))
             .route("/v1/models/{model}", get(proxy::get_model))
             .route("/v1/{*path}", any(proxy::proxy))
@@ -214,10 +194,6 @@ impl Gateway {
             .layer(axum_middleware::from_fn_with_state(
                 Arc::clone(&self.state),
                 observe_request,
-            ))
-            .layer(axum_middleware::from_fn_with_state(
-                Arc::clone(&self.state),
-                middleware::log_public_request,
             ))
             .layer(axum_middleware::from_fn(assign_request_id))
             .layer(axum_middleware::from_fn_with_state(
@@ -247,7 +223,6 @@ impl Gateway {
                 put(set_ip_limit).delete(delete_ip_limit),
             )
             .route("/admin/api/process", get(process_status))
-            .route("/admin/api/process/activate", put(activate_process))
             .route("/admin/api/process/drain", put(drain_process))
             .route(
                 "/admin/api/nodes/preflight",
@@ -289,7 +264,7 @@ impl Gateway {
         let public_listener = TcpListener::bind(public_address)
             .await
             .with_context(|| format!("failed to bind public listener on {public_address}"))?;
-        self.run_with_listener(public_listener, false).await
+        self.run_with_listener(public_listener).await
     }
 
     fn start_telemetry(&self) {
@@ -333,21 +308,8 @@ impl Gateway {
         });
     }
 
-    pub async fn run_with_public_listener(self, listener: StdTcpListener) -> Result<()> {
-        listener
-            .set_nonblocking(true)
-            .context("failed to make inherited public listener non-blocking")?;
-        let listener = TcpListener::from_std(listener)
-            .context("failed to register inherited public listener with Tokio")?;
-        self.run_with_listener(listener, true).await
-    }
-
     #[allow(clippy::too_many_lines)]
-    async fn run_with_listener(
-        self,
-        public_listener: TcpListener,
-        stop_accept_before_withdrawal: bool,
-    ) -> Result<()> {
+    async fn run_with_listener(self, public_listener: TcpListener) -> Result<()> {
         let public_address = public_listener.local_addr()?;
         let admin_address: SocketAddr = self.state.settings.server.admin_listen.parse()?;
         let admin_listener = TcpListener::bind(admin_address)
@@ -359,22 +321,34 @@ impl Gateway {
         let public_cancellation = CancellationToken::new();
         let admin_cancellation = CancellationToken::new();
         let public_accept_cancellation = CancellationToken::new();
-        let (health_shutdown, health_receiver) = watch::channel(false);
-        let (provider_shutdown, provider_receiver) = watch::channel(false);
-        let (control_shutdown, control_receiver) = watch::channel(false);
-        let mut health_handle = tokio::spawn(run_health_monitor(
-            self.state.control_client.clone(),
-            Arc::clone(&self.state.scheduler),
-            self.state.settings.health.clone(),
-            health_receiver,
-        ));
-        let mut provider_handle = tokio::spawn(
-            Arc::clone(&self.state.vllm).run(self.state.control_client.clone(), provider_receiver),
-        );
-        let mut control_handle = tokio::spawn(run_control_reconciler(
-            Arc::clone(&self.state),
-            control_receiver,
-        ));
+        let (background_shutdown, background_receiver) = watch::channel(false);
+        let mut background_tasks: JoinSet<&'static str> = JoinSet::new();
+        {
+            let client = self.state.control_client.clone();
+            let scheduler = Arc::clone(&self.state.scheduler);
+            let health = self.state.settings.health.clone();
+            let rx = background_receiver.clone();
+            background_tasks.spawn(async move {
+                run_health_monitor(client, scheduler, health, rx).await;
+                "health monitor"
+            });
+        }
+        {
+            let vllm = Arc::clone(&self.state.vllm);
+            let client = self.state.control_client.clone();
+            let rx = background_receiver.clone();
+            background_tasks.spawn(async move {
+                vllm.run(client, rx).await;
+                "vLLM provider monitor"
+            });
+        }
+        {
+            let state = Arc::clone(&self.state);
+            background_tasks.spawn(async move {
+                run_control_reconciler(state, background_receiver).await;
+                "control-plane reconciler"
+            });
+        }
 
         let public_listener = BoundedTcpListener::new(
             public_listener,
@@ -384,7 +358,12 @@ impl Gateway {
             true,
             public_accept_cancellation.clone(),
         );
-        let public_pending = Arc::clone(&public_listener.pending_connections);
+        let public_pending = Arc::clone(
+            public_listener
+                .pending_connections
+                .as_ref()
+                .expect("public listener tracks pending connections"),
+        );
         let admin_listener = BoundedTcpListener::new(
             admin_listener,
             self.state.settings.server.max_admin_connections,
@@ -399,16 +378,7 @@ impl Gateway {
             .into_make_service_with_connect_info::<PendingConnection>();
         let admin_router = self.admin_router();
         let public_token = public_cancellation.clone();
-        let public_shutdown = public_cancellation.clone();
-        let public_process = Arc::clone(&self.state.process);
         let mut public_handle: JoinHandle<std::io::Result<()>> = tokio::spawn(async move {
-            tokio::select! {
-                () = public_process.activated() => {}
-                () = public_shutdown.cancelled() => return Ok(()),
-            }
-            if !public_process.accepting_traffic() {
-                return Ok(());
-            }
             axum::serve(public_listener, public_router)
                 .with_graceful_shutdown(public_token.cancelled_owned())
                 .await
@@ -422,9 +392,6 @@ impl Gateway {
 
         let mut public_done = false;
         let mut admin_done = false;
-        let mut health_done = false;
-        let mut provider_done = false;
-        let mut control_done = false;
         let mut first_error: Option<anyhow::Error> = None;
         tokio::select! {
             result = &mut public_handle => {
@@ -441,19 +408,11 @@ impl Gateway {
                 }
                 self.state.process.request_shutdown();
             }
-            result = &mut health_handle => {
-                health_done = true;
-                first_error = Some(unexpected_background_exit("health monitor", result));
-                self.state.process.request_shutdown();
-            }
-            result = &mut provider_handle => {
-                provider_done = true;
-                first_error = Some(unexpected_background_exit("vLLM provider monitor", result));
-                self.state.process.request_shutdown();
-            }
-            result = &mut control_handle => {
-                control_done = true;
-                first_error = Some(unexpected_background_exit("control-plane reconciler", result));
+            Some(result) = background_tasks.join_next() => {
+                first_error = Some(match result {
+                    Ok(name) => anyhow::anyhow!("{name} exited unexpectedly"),
+                    Err(error) => anyhow::anyhow!("background task failed: {error}"),
+                });
                 self.state.process.request_shutdown();
             }
             () = shutdown_signal() => {
@@ -476,28 +435,17 @@ impl Gateway {
                 &public_accept_cancellation,
                 &public_pending,
                 &admin_cancellation,
-                stop_accept_before_withdrawal,
             )
             .await
         {
             first_error.get_or_insert(error);
         }
-        let _ = health_shutdown.send(true);
-        let _ = provider_shutdown.send(true);
-        let _ = control_shutdown.send(true);
-        if !health_done && let Err(error) = health_handle.await {
-            first_error
-                .get_or_insert_with(|| anyhow::anyhow!("health monitor task failed: {error}"));
-        }
-        if !provider_done && let Err(error) = provider_handle.await {
-            first_error.get_or_insert_with(|| {
-                anyhow::anyhow!("vLLM provider monitor task failed: {error}")
-            });
-        }
-        if !control_done && let Err(error) = control_handle.await {
-            first_error.get_or_insert_with(|| {
-                anyhow::anyhow!("control-plane reconciler task failed: {error}")
-            });
+        let _ = background_shutdown.send(true);
+        while let Some(result) = background_tasks.join_next().await {
+            if let Err(error) = result {
+                first_error
+                    .get_or_insert_with(|| anyhow::anyhow!("background task failed: {error}"));
+            }
         }
         let remaining = Duration::from_millis(self.state.settings.server.shutdown_grace_ms)
             .saturating_sub(drain_started.elapsed())
@@ -523,13 +471,9 @@ impl Gateway {
         public_accept_cancellation: &CancellationToken,
         public_pending: &PendingConnections,
         admin_cancellation: &CancellationToken,
-        stop_accept_before_withdrawal: bool,
     ) -> Option<anyhow::Error> {
         let withdrawal_delay =
             Duration::from_millis(self.state.settings.server.withdrawal_delay_ms);
-        if !public_done && stop_accept_before_withdrawal {
-            public_accept_cancellation.cancel();
-        }
         if !public_done && !withdrawal_delay.is_zero() {
             info!(
                 ?withdrawal_delay,
@@ -572,14 +516,21 @@ impl Gateway {
     }
 }
 
-fn unexpected_background_exit(
-    name: &'static str,
-    result: Result<(), tokio::task::JoinError>,
-) -> anyhow::Error {
-    match result {
-        Ok(()) => anyhow::anyhow!("{name} exited unexpectedly"),
-        Err(error) => anyhow::anyhow!("{name} task failed: {error}"),
+fn build_http_client(
+    connect_timeout_ms: u64,
+    pool_idle_timeout: Duration,
+    max_idle_per_host: Option<usize>,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(connect_timeout_ms))
+        .pool_idle_timeout(pool_idle_timeout)
+        .no_proxy()
+        .redirect(Policy::none())
+        .user_agent(concat!("estuary/", env!("ESTUARY_BUILD_VERSION")));
+    if let Some(max_idle) = max_idle_per_host {
+        builder = builder.pool_max_idle_per_host(max_idle);
     }
+    builder.build()
 }
 
 async fn finish_server(
@@ -605,10 +556,6 @@ fn flatten_server_result(
 ) -> Result<()> {
     result.context("server task panicked")??;
     Ok(())
-}
-
-async fn api_hello() -> StatusCode {
-    StatusCode::NO_CONTENT
 }
 
 async fn nodes(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {

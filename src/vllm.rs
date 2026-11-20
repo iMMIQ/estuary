@@ -10,18 +10,12 @@ use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::Client;
 use serde_json::Value as JsonValue;
-use tokio::{
-    sync::{Notify, watch},
-    task::JoinHandle,
-    time::MissedTickBehavior,
-};
+use tokio::{sync::watch, task::JoinHandle, time::MissedTickBehavior};
 use tracing::{debug, warn};
 
 use crate::{
     config::ProviderKind,
-    kv_cache::ExactCacheDirectory,
     node::{Node, ProviderState},
-    prefix::PrefixDirectory,
     scheduler::Scheduler,
 };
 
@@ -77,9 +71,6 @@ impl Drop for InflightGuard<'_> {
 #[derive(Debug)]
 pub struct VllmManager {
     scheduler: Arc<Scheduler>,
-    exact_cache: Arc<ExactCacheDirectory>,
-    prefix: Arc<PrefixDirectory>,
-    state_notify: Arc<Notify>,
     token_cache: Mutex<TokenizationCache>,
     inflight: Mutex<HashMap<[u8; 32], InflightTokenization>>,
 }
@@ -120,28 +111,14 @@ struct TaskRestart {
 
 impl VllmManager {
     pub fn new(scheduler: Arc<Scheduler>) -> Arc<Self> {
-        let nodes = scheduler.nodes();
-        let exact_cache = Arc::clone(scheduler.exact_cache_directory());
-        let cache_entries = nodes
+        let cache_entries = scheduler
+            .nodes()
             .iter()
             .filter(|node| node.provider().kind == ProviderKind::Vllm)
             .map(|node| node.provider().tokenize_cache_entries)
             .max()
             .unwrap_or(1);
-        for node in &nodes {
-            if let Some(events) = node.provider().kv_events.as_ref() {
-                exact_cache.configure_node_owned(
-                    node.id(),
-                    events.max_blocks,
-                    events.max_directory_bytes,
-                    node.instance_id(),
-                );
-            }
-        }
         Arc::new(Self {
-            exact_cache,
-            prefix: Arc::clone(scheduler.prefix_directory()),
-            state_notify: scheduler.state_notifier(),
             scheduler,
             token_cache: Mutex::new(TokenizationCache::new(cache_entries)),
             inflight: Mutex::new(HashMap::new()),
@@ -166,19 +143,6 @@ impl VllmManager {
         for (_, task) in tasks {
             stop_managed_tasks(task).await;
         }
-    }
-
-    pub fn has_exact_cache_for_model(&self, public_model: &str) -> bool {
-        self.scheduler.nodes().into_iter().any(|node| {
-            node.provider().kind == ProviderKind::Vllm
-                && node.provider_state() == ProviderState::Ready
-                && node.is_routable()
-                && node.upstream_model(Some(public_model)).is_some()
-                && {
-                    let snapshot = self.exact_cache.snapshot(node.id());
-                    snapshot.authoritative && snapshot.blocks > 0
-                }
-        })
     }
 
     async fn reconcile_tasks(
@@ -232,8 +196,7 @@ impl VllmManager {
                     restart.failures = 0;
                 }
                 restart.failures = restart.failures.saturating_add(1);
-                let delay = task_restart_delay(restart.failures);
-                restart.not_before = Instant::now() + delay;
+                restart.not_before = Instant::now() + task_restart_delay(restart.failures);
             }
         }
         for (id, node) in nodes {
@@ -258,18 +221,18 @@ impl VllmManager {
 
     fn spawn_node_tasks(&self, client: Client, node: Arc<Node>) -> ManagedNodeTasks {
         let (shutdown, receiver) = watch::channel(false);
+        let exact_cache = Arc::clone(self.scheduler.exact_cache_directory());
+        let prefix = Arc::clone(self.scheduler.prefix_directory());
         let mut handles = vec![tokio::spawn(run_node_monitor(
             client,
             Arc::clone(&node),
-            Arc::clone(&self.exact_cache),
-            Arc::clone(&self.prefix),
-            Arc::clone(&self.state_notify),
+            Arc::clone(&exact_cache),
+            Arc::clone(&prefix),
+            self.scheduler.state_notifier(),
             receiver.clone(),
         ))];
         if let Some(config) = node.provider().kv_events.clone() {
             let event_node = Arc::clone(&node);
-            let exact_cache = Arc::clone(&self.exact_cache);
-            let prefix = Arc::clone(&self.prefix);
             handles.push(tokio::spawn(async move {
                 run_event_supervisor(event_node, exact_cache, prefix, config, receiver).await;
             }));
@@ -283,7 +246,6 @@ impl VllmManager {
     }
 
     /// Tokenize the final upstream payload after client protocol conversion.
-    #[allow(clippy::too_many_lines)]
     pub async fn tokenize_for_routing(
         &self,
         client: &Client,
@@ -312,37 +274,32 @@ impl VllmManager {
             .scheduler
             .nodes()
             .into_iter()
-            .filter(|node| {
-                node.provider().kind == ProviderKind::Vllm
+            .filter_map(|node| {
+                let upstream_model = (node.provider().kind == ProviderKind::Vllm
                     && node.provider_state() == ProviderState::Ready
-                    && node.is_routable()
-                    && node.upstream_model(Some(public_model)).is_some()
+                    && node.is_routable())
+                .then(|| node.upstream_model(Some(public_model)).flatten())??;
+                Some((node, upstream_model))
             })
             .collect::<Vec<_>>();
-        let has_exact_blocks = candidates.iter().any(|node| {
-            let snapshot = self.exact_cache.snapshot(node.id());
+        let exact_cache = self.scheduler.exact_cache_directory();
+        let has_exact_blocks = candidates.iter().any(|(node, _)| {
+            let snapshot = exact_cache.snapshot(node.id());
             snapshot.authoritative && snapshot.blocks > 0
         });
         if !has_exact_blocks {
             return RoutingTokenization::new(None, "directory_unavailable", started);
         }
-        candidates.sort_by_key(|node| (node.scheduling_load(), node.id().to_owned()));
+        candidates.sort_by_key(|(node, _)| (node.scheduling_load(), node.id().to_owned()));
 
-        let Some(node) = candidates.first() else {
-            return RoutingTokenization::new(None, "unavailable", started);
-        };
+        let (node, upstream_model) = &candidates[0];
         let Some(mut prompt) = prepare_tokenization(endpoint, body, &node.provider().tokenize_path)
         else {
             return RoutingTokenization::new(None, "unsupported_payload", started);
         };
-        let Some(Some(upstream_model)) = node.upstream_model(Some(public_model)) else {
-            return RoutingTokenization::new(None, "unavailable", started);
-        };
-        // A public-model pool must use equivalent tokenizers and templates.
-        // Every candidate receives this same normalized prompt, with its model alias.
         let node_ids = candidates
             .iter()
-            .map(|node| node.id().to_owned())
+            .map(|(node, _)| node.id().to_owned())
             .collect::<Vec<_>>();
         let mut payload = prompt.payload;
         payload.insert(
@@ -350,7 +307,10 @@ impl VllmManager {
             JsonValue::String(upstream_model.clone()),
         );
         if let Some(fallback) = &mut prompt.fallback {
-            fallback.insert("model".to_owned(), JsonValue::String(upstream_model));
+            fallback.insert(
+                "model".to_owned(),
+                JsonValue::String(upstream_model.clone()),
+            );
         }
         let key = tokenization_key(
             &prompt.path,
@@ -363,6 +323,31 @@ impl VllmManager {
             result.node_ids = Some(node_ids);
             return result;
         }
+        self.coalesce_tokenization(
+            client,
+            node,
+            key,
+            &prompt.path,
+            payload,
+            prompt.fallback,
+            node_ids,
+            started,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn coalesce_tokenization(
+        &self,
+        client: &Client,
+        node: &Node,
+        key: [u8; 32],
+        path: &str,
+        payload: serde_json::Map<String, JsonValue>,
+        fallback: Option<serde_json::Map<String, JsonValue>>,
+        node_ids: Vec<String>,
+        started: Instant,
+    ) -> RoutingTokenization {
         // Singleflight: coalesce concurrent tokenization requests for the same
         // pool-scoped prompt key so cold bursts do not stampede upstream /render.
         let (guard, mut follower) = {
@@ -385,30 +370,26 @@ impl VllmManager {
         let timeout = Duration::from_millis(node.provider().request_timeout_ms);
         if let Some(mut rx) = follower.take() {
             let waited = tokio::time::timeout(timeout, async {
-                loop {
-                    if let Some(tokens) = rx.borrow().clone() {
-                        return Ok(tokens);
-                    }
-                    if rx.changed().await.is_err() {
-                        return Err(());
-                    }
-                }
+                rx.wait_for(Option::is_some)
+                    .await
+                    .ok()
+                    .and_then(|value| value.clone())
             })
             .await;
             return match waited {
-                Ok(Ok(Some(tokens))) => {
+                Ok(Some(Some(tokens))) => {
                     let mut result = RoutingTokenization::new(Some(tokens), "cache_hit", started);
                     result.node_ids = Some(node_ids);
                     result
                 }
-                Ok(Ok(None) | Err(())) => RoutingTokenization::new(None, "upstream_error", started),
+                Ok(_) => RoutingTokenization::new(None, "upstream_error", started),
                 Err(_) => RoutingTokenization::new(None, "deadline", started),
             };
         }
         let guard = guard.expect("leader always owns inflight guard");
         match tokio::time::timeout(
             timeout,
-            request_tokenization(client, node, &prompt.path, payload, prompt.fallback),
+            request_tokenization(client, node, path, payload, fallback),
         )
         .await
         {

@@ -21,7 +21,6 @@ using concurrency, observed load, latency, errors, and prompt-prefix locality.
   Chinese management application.
 - Bounded request admission, response buffering, streaming backpressure, and
   graceful shutdown.
-- A built-in deployment layer for binary upload, version switching, and rollback.
 - Docker and static Linux binary deployment.
 
 ## API
@@ -75,6 +74,7 @@ Dependency versions are selected from stable releases published through 2026-11-
 requires that series. Commit both `Cargo.lock` and `web/bun.lock` when updating dependencies.
 
 ```bash
+(cd web && bun install --frozen-lockfile && bun run build)
 mkdir -p data
 cargo run --release -- \
   --database ./data/estuary.db \
@@ -82,16 +82,17 @@ cargo run --release -- \
   --admin-listen 127.0.0.1:9090
 ```
 
-Open `http://127.0.0.1:9090/admin/` and add an upstream node. An empty database
+`web/dist/` is generated at build time and excluded from Git, so build the web
+assets once before compiling the Rust binary from source. Open
+`http://127.0.0.1:9090/admin/` and add an upstream node. An empty database
 is valid, but readiness remains `503` until at least one node is routable.
 
 Build versions are resolved automatically. A commit tagged with the matching
-package version (for example, `v0.3.3`) reports `0.3.3`; other commits report
+package version (for example, `v0.4.0`) reports `0.4.0`; other commits report
 the package version plus a 12-character Git hash, such as
-`0.3.3+bbf691e19ba2`. The CLI, management application, and deployment release
-directories use the same version. The Docker build wrapper passes this version
-into the image automatically. See [deployment](deploy/README.md) for builds
-without Git metadata.
+`0.4.0+bbf691e19ba2`. The CLI and management application use the same version.
+The Docker build wrapper passes this version into the image automatically. See
+[deployment](deploy/README.md) for builds without Git metadata.
 
 ## Configure A Node
 
@@ -166,7 +167,7 @@ tools, and web search are rejected rather than silently changed. See the
   Protect the database, WAL files, snapshots, and backups.
 - SQLite must be on a local filesystem. Do not place it on NFS.
 - Node concurrency, queues, health, circuits, and prefix state are process-local.
-  The built-in deployment layer keeps one active worker in steady state.
+  Run Estuary behind a load balancer or container orchestrator for rolling updates.
 - A retry can repeat upstream generation or billing. The default is one attempt.
 
 ## Documentation
@@ -183,9 +184,6 @@ The [documentation index](docs/README.md) links the maintained guides:
 ## Development
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets
 cd web
 bun install --frozen-lockfile
 bun run contract:check
@@ -193,6 +191,10 @@ bun run check
 bun run deadcode
 bun run build
 bun run test
+cd ..
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets
 ```
 
 Browser tests additionally require Playwright Chromium:

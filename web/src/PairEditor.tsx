@@ -1,9 +1,8 @@
 import { Button, Select, Switch, TextInput } from "@mantine/core";
 import { Plus, Trash2 } from "lucide-react";
 import { useRef } from "react";
-import { useTranslation } from "react-i18next";
-import { configDefaults as defaults } from "./config-contract";
-import type { TranslationKey } from "./i18n";
+import { configDefaults as defaults } from "./generated/config";
+import { useTranslation } from "./i18n";
 import type { ModelCapabilityConfig, Pair } from "./types";
 
 export function PairEditor({
@@ -139,7 +138,7 @@ export function PairEditor({
       ))}
       {error && (
         <span className="form-error" role="alert">
-          {t(error as TranslationKey)}
+          {t(error)}
         </span>
       )}
       <Button

@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -5,8 +7,9 @@ use std::{
     time::Duration,
 };
 
+use common::{healthy_node_for_model, strict_health};
 use estuary::{
-    config::{HealthConfig, NodeConfig, PrefixConfig, ProviderConfig, ProviderKind, RoutingConfig},
+    config::{NodeConfig, PrefixConfig, ProviderConfig, ProviderKind, RoutingConfig},
     error::GatewayError,
     node::{HealthState, Node},
     prefix,
@@ -16,31 +19,8 @@ use futures_util::poll;
 use serde_json::Value;
 use tokio::sync::Notify;
 
-fn strict_health() -> HealthConfig {
-    HealthConfig {
-        healthy_threshold: 1,
-        unhealthy_threshold: 1,
-        passive_failure_threshold: 1,
-        ..HealthConfig::default()
-    }
-}
-
 fn healthy_node(id: &str, max_concurrency: usize) -> Arc<Node> {
     healthy_node_for_model(id, "model", max_concurrency)
-}
-
-fn healthy_node_for_model(id: &str, model: &str, max_concurrency: usize) -> Arc<Node> {
-    let node = Node::from_config(&NodeConfig {
-        id: id.to_owned(),
-        base_url: format!("http://{id}.invalid/v1"),
-        models: HashMap::from([(model.to_owned(), model.to_owned())]),
-        max_concurrency,
-        ..NodeConfig::default()
-    })
-    .expect("valid node configuration");
-    node.record_probe_success(&strict_health());
-    assert_eq!(node.health(), HealthState::Healthy);
-    node
 }
 
 fn healthy_vllm_node(id: &str, max_concurrency: usize, waiting_threshold: usize) -> Arc<Node> {
@@ -779,6 +759,6 @@ fn routing_text_is_canonical_across_object_key_order() {
     directory.record("node", &first);
     let matched = directory.best_match(&second);
 
-    assert_eq!(matched.node_ids, ["node"]);
+    assert_eq!(matched.best_nodes(), ["node"]);
     assert_eq!(matched.matched_chars, matched.input_chars);
 }

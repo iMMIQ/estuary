@@ -1,12 +1,10 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+mod common;
 
+use std::time::Duration;
+
+use common::{acquire_model, healthy_node_for_model};
 use estuary::{
-    config::{NodeConfig, PrefixConfig, RoutingConfig},
-    node::Node,
+    config::{PrefixConfig, RoutingConfig},
     prefix::{self, PrefixInput},
     scheduler::Scheduler,
 };
@@ -18,17 +16,8 @@ const REQUEST_LATENCY: Duration = Duration::from_millis(100);
 
 fn scheduler() -> Scheduler {
     let nodes = (0..NODE_COUNT)
-        .map(|index| {
-            Node::from_config(&NodeConfig {
-                id: format!("node-{index}"),
-                base_url: format!("http://node-{index}.invalid/v1"),
-                models: HashMap::from([("model".to_owned(), "model".to_owned())]),
-                max_concurrency: NODE_CAPACITY,
-                ..NodeConfig::default()
-            })
-            .unwrap()
-        })
-        .collect::<Vec<Arc<Node>>>();
+        .map(|index| healthy_node_for_model(&format!("node-{index}"), "model", NODE_CAPACITY))
+        .collect::<Vec<_>>();
     for node in &nodes {
         node.record_request_success(REQUEST_LATENCY);
     }
@@ -36,10 +25,7 @@ fn scheduler() -> Scheduler {
 }
 
 async fn select(scheduler: &Scheduler, prefix_input: PrefixInput) -> estuary::scheduler::Selection {
-    scheduler
-        .acquire(Some("model"), prefix_input, &HashSet::new(), 128)
-        .await
-        .unwrap()
+    acquire_model(scheduler, Some("model"), prefix_input).await
 }
 
 fn cached_prefix(scheduler: &Scheduler, node_id: &str) -> PrefixInput {

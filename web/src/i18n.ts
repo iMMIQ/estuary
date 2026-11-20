@@ -1,9 +1,16 @@
-import i18n from "i18next";
-import { initReactI18next } from "react-i18next";
+import {
+  createContext,
+  createElement,
+  type ReactNode,
+  useCallback,
+  useContext,
+  useMemo,
+  useState,
+} from "react";
 import { metricsChinese, metricsEnglish } from "./metrics-i18n";
 
 export type Locale = "en" | "zh-CN";
-export const localeStorageKey = "estuary.locale";
+const localeStorageKey = "estuary.locale";
 
 const en = {
   ...metricsEnglish,
@@ -64,7 +71,6 @@ const en = {
   "nav.overview": "Overview",
   "nav.upstreams": "Upstreams",
   "nav.add": "Add",
-  "controlPlane.label": "Control plane",
   "controlPlane.connected": "Connected",
   "controlPlane.disconnected": "Disconnected",
   "controlPlane.unavailable": "Control plane unavailable",
@@ -90,7 +96,6 @@ const en = {
   "sync.now": "Synced just now",
   "sync.seconds": "Synced {{count}}s ago",
   "sync.minutes": "Synced {{count}}m ago",
-  "overview.subtitle": "Gateway health, capacity, and admission pressure",
   "overview.gateway": "Gateway",
   "overview.fleetSummary": "Fleet Summary",
   "overview.totalNodes": "Total Nodes",
@@ -103,7 +108,6 @@ const en = {
   "overview.availableCapacity": "Available capacity",
   "overview.publicConnections": "Public connections",
   "overview.ipConnections": "Connections by IP",
-  "overview.currentConnections": "Top 3 active TCP connections",
   "overview.noConnections": "No active public connections",
   "overview.ipAddress": "IP address",
   "overview.connectionLimit": "Connection limit",
@@ -120,7 +124,6 @@ const en = {
   "overview.waitingMemory": "Waiting for memory",
   "overview.attention": "Attention Required",
   "overview.nominal": "All systems nominal",
-  "overview.noAttention": "No nodes currently require operator attention.",
   "overview.active": "{{count}} active",
   "overview.routingSignals": "Routing Signals",
   "overview.exactDirectories": "Exact KV directories",
@@ -129,14 +132,9 @@ const en = {
   "overview.preemptions": "Preemptions since restart",
   "overview.addUpstream": "Add Upstream Node",
   "overview.viewAll": "View All Nodes",
-  "vllm.runtime": "vLLM Runtime",
-  "vllm.reporting": "{{fresh}} / {{total}} nodes reporting fresh telemetry",
   "vllm.promptThroughput": "Prompt throughput",
   "vllm.generationThroughput": "Generation throughput",
   "vllm.completedRequests": "Completed requests",
-  "vllm.engineDemand": "Engine demand",
-  "vllm.peakKv": "Peak GPU KV usage",
-  "vllm.prefixHit": "Prefix cache hit",
   "upstreams.summary": "{{count}} nodes · {{sync}}",
   "upstreams.addNode": "Add Node",
   "upstreams.searchPlaceholder": "Search by Node ID, URL, public model, or upstream model...",
@@ -154,12 +152,10 @@ const en = {
   "upstreams.statusAdmission": "Status / Admission",
   "upstreams.providerTelemetry": "Provider / Telemetry",
   "upstreams.engine": "Engine",
-  "upstreams.tokenRate": "Token Rate",
   "upstreams.activeLimit": "Active / Limit",
   "upstreams.kvCache": "KV Cache",
   "upstreams.output": "Output · tok/s",
   "upstreams.ttft": "TTFT P95",
-  "upstreams.latency": "Latency",
   "upstreams.node": "Node",
   "upstreams.admission": "Admission",
   "upstreams.provider": "Provider",
@@ -172,13 +168,10 @@ const en = {
   "upstreams.telemetryStale": "Telemetry stale",
   "upstreams.genericProvider": "Generic provider",
   "upstreams.runningWaiting": "Running / Waiting",
-  "upstreams.promptGeneration": "Prompt / Generation tok/s",
-  "upstreams.used": "{{value}} used",
   "upstreams.kvDetail": "{{hit}} hit · {{blocks}} blocks {{mode}}",
   "upstreams.synced": "synced",
   "upstreams.fallback": "fallback",
   "upstreams.noTelemetry": "No vLLM telemetry",
-  "upstreams.headerEwma": "Header EWMA",
   "upstreams.actionsFor": "Actions for {{id}}",
   "upstreams.viewDetails": "View Details",
   "upstreams.drain": "Drain",
@@ -239,13 +232,9 @@ const en = {
   "editor.addTitle": "Add Upstream Node",
   "editor.editTitle": "Edit {{id}}",
   "editor.stepBasic": "Basic",
-  "editor.stepBasicDescription": "Connection and routing",
   "editor.stepAdvanced": "Advanced",
-  "editor.stepAdvancedDescription": "Health and telemetry",
   "editor.stepReview": "Review",
-  "editor.stepReviewDescription": "Verify configuration",
   "editor.basicInformation": "Basic Information",
-  "editor.basicDescription": "Connection identity and provider settings.",
   "editor.nodeId": "Node ID",
   "editor.nodeIdDescription": "Unique identifier for this upstream node.",
   "editor.baseUrl": "Base URL",
@@ -262,7 +251,6 @@ const en = {
   "editor.removeMapping": "Remove mapping {{count}}",
   "editor.addMapping": "Add mapping",
   "editor.healthTelemetry": "Health and Telemetry",
-  "editor.healthTelemetryDescription": "Runtime probing and admission signals.",
   "editor.healthPath": "Health path",
   "editor.versionPath": "Version path",
   "editor.metricsPath": "Metrics path",
@@ -295,13 +283,9 @@ const en = {
   "editor.startDrainingDescription": "Persist without assigning new requests.",
   "editor.startDrainingLabel": "Start node draining",
   "editor.reviewConfiguration": "Review Configuration",
-  "editor.reviewDescription": "Confirm the node before applying it to the runtime registry.",
   "editor.lifecycle": "Lifecycle",
   "editor.serving": "Serving",
   "editor.bearerCredential": "Bearer credential",
-  "editor.connectionRecommended": "Connection verification recommended",
-  "editor.connectionRecommendation":
-    "Run Test Connection before applying this configuration to verify compatibility and health.",
   "editor.connectionVerified": "Connection verified",
   "editor.connectionFailed": "Connection failed",
   "editor.connectionPassed":
@@ -339,7 +323,6 @@ const en = {
   "validation.modelRequired": "Add at least one complete model mapping",
   "validation.modelIncomplete": "Complete or remove every model mapping row",
   "validation.modelUnique": "Public model names must be unique",
-  "validation.headerIncomplete": "Complete or remove every header row",
   "validation.pathSlash":
     "Use a path starting with / on the upstream origin, without query or fragment",
   "validation.min100ms": "Must be a valid whole number of at least 100 ms",
@@ -399,19 +382,11 @@ const en = {
   "data.loading": "Waiting for control-plane data",
   "data.stale": "Showing previously fetched data",
   "data.partial": "Some metrics are unavailable or stale",
-  "vllm.showRuntime": "Show runtime metrics",
 } as const;
 
-export type TranslationKey = keyof typeof en;
+type TranslationKey = keyof typeof en;
 
-declare module "i18next" {
-  interface CustomTypeOptions {
-    defaultNS: "translation";
-    resources: { translation: typeof en };
-  }
-}
-
-const zhCN: Record<keyof typeof en, string> = {
+const zhCN: Record<TranslationKey, string> = {
   ...metricsChinese,
   "nav.logs": "会话日志",
   "logs.title": "会话日志",
@@ -468,7 +443,6 @@ const zhCN: Record<keyof typeof en, string> = {
   "nav.overview": "总览",
   "nav.upstreams": "上游节点",
   "nav.add": "添加",
-  "controlPlane.label": "控制平面",
   "controlPlane.connected": "已连接",
   "controlPlane.disconnected": "连接已断开",
   "controlPlane.unavailable": "控制平面不可用",
@@ -494,7 +468,6 @@ const zhCN: Record<keyof typeof en, string> = {
   "sync.now": "刚刚同步",
   "sync.seconds": "{{count}} 秒前同步",
   "sync.minutes": "{{count}} 分钟前同步",
-  "overview.subtitle": "网关健康、容量与准入压力",
   "overview.gateway": "网关",
   "overview.fleetSummary": "节点概览",
   "overview.totalNodes": "节点总数",
@@ -507,7 +480,6 @@ const zhCN: Record<keyof typeof en, string> = {
   "overview.availableCapacity": "可用容量",
   "overview.publicConnections": "公共连接",
   "overview.ipConnections": "按 IP 查看连接",
-  "overview.currentConnections": "当前 TCP 连接 Top 3",
   "overview.noConnections": "当前没有公共连接",
   "overview.ipAddress": "IP 地址",
   "overview.connectionLimit": "连接上限",
@@ -524,7 +496,6 @@ const zhCN: Record<keyof typeof en, string> = {
   "overview.waitingMemory": "等待内存",
   "overview.attention": "需要关注",
   "overview.nominal": "所有系统正常",
-  "overview.noAttention": "当前没有需要操作员关注的节点。",
   "overview.active": "{{count}} 个活跃请求",
   "overview.routingSignals": "路由信号",
   "overview.exactDirectories": "精确 KV 目录",
@@ -533,14 +504,9 @@ const zhCN: Record<keyof typeof en, string> = {
   "overview.preemptions": "重启后的抢占次数",
   "overview.addUpstream": "添加上游节点",
   "overview.viewAll": "查看全部节点",
-  "vllm.runtime": "vLLM 运行状态",
-  "vllm.reporting": "遥测数据新鲜：{{fresh}} / {{total}} 个节点",
   "vllm.promptThroughput": "提示词吞吐量",
   "vllm.generationThroughput": "生成吞吐量",
   "vllm.completedRequests": "已完成请求",
-  "vllm.engineDemand": "引擎负载",
-  "vllm.peakKv": "GPU KV 使用峰值",
-  "vllm.prefixHit": "前缀缓存命中率",
   "upstreams.summary": "{{count}} 个节点 · {{sync}}",
   "upstreams.addNode": "添加节点",
   "upstreams.searchPlaceholder": "按节点 ID、URL、公共模型或上游模型搜索...",
@@ -558,12 +524,10 @@ const zhCN: Record<keyof typeof en, string> = {
   "upstreams.statusAdmission": "状态 / 准入",
   "upstreams.providerTelemetry": "提供方 / 遥测",
   "upstreams.engine": "引擎",
-  "upstreams.tokenRate": "Token 速率",
   "upstreams.activeLimit": "活跃 / 上限",
   "upstreams.kvCache": "KV 缓存",
   "upstreams.output": "输出 · tok/s",
   "upstreams.ttft": "首输出 P95",
-  "upstreams.latency": "延迟",
   "upstreams.node": "节点",
   "upstreams.admission": "准入",
   "upstreams.provider": "提供方",
@@ -576,13 +540,10 @@ const zhCN: Record<keyof typeof en, string> = {
   "upstreams.telemetryStale": "遥测数据过期",
   "upstreams.genericProvider": "通用提供方",
   "upstreams.runningWaiting": "运行中 / 等待中",
-  "upstreams.promptGeneration": "提示 / 生成 tok/s",
-  "upstreams.used": "已使用 {{value}}",
   "upstreams.kvDetail": "命中 {{hit}} · {{blocks}} 个块 · {{mode}}",
   "upstreams.synced": "已同步",
   "upstreams.fallback": "回退模式",
   "upstreams.noTelemetry": "无 vLLM 遥测",
-  "upstreams.headerEwma": "响应头 EWMA",
   "upstreams.actionsFor": "{{id}} 的操作",
   "upstreams.viewDetails": "查看详情",
   "upstreams.drain": "排空",
@@ -643,13 +604,9 @@ const zhCN: Record<keyof typeof en, string> = {
   "editor.addTitle": "添加上游节点",
   "editor.editTitle": "编辑 {{id}}",
   "editor.stepBasic": "基础",
-  "editor.stepBasicDescription": "连接与路由",
   "editor.stepAdvanced": "高级",
-  "editor.stepAdvancedDescription": "健康与遥测",
   "editor.stepReview": "检查",
-  "editor.stepReviewDescription": "核对配置",
   "editor.basicInformation": "基本信息",
-  "editor.basicDescription": "连接标识和提供方设置。",
   "editor.nodeId": "节点 ID",
   "editor.nodeIdDescription": "该上游节点的唯一标识。",
   "editor.baseUrl": "基础 URL",
@@ -666,7 +623,6 @@ const zhCN: Record<keyof typeof en, string> = {
   "editor.removeMapping": "删除第 {{count}} 项映射",
   "editor.addMapping": "添加映射",
   "editor.healthTelemetry": "健康与遥测",
-  "editor.healthTelemetryDescription": "运行时探测和准入信号。",
   "editor.healthPath": "健康检查路径",
   "editor.versionPath": "版本路径",
   "editor.metricsPath": "指标路径",
@@ -699,12 +655,9 @@ const zhCN: Record<keyof typeof en, string> = {
   "editor.startDrainingDescription": "保存节点但不为其分配新请求。",
   "editor.startDrainingLabel": "节点初始设为排空",
   "editor.reviewConfiguration": "检查配置",
-  "editor.reviewDescription": "应用到运行时注册表之前核对节点配置。",
   "editor.lifecycle": "生命周期",
   "editor.serving": "服务中",
   "editor.bearerCredential": "Bearer 凭证",
-  "editor.connectionRecommended": "建议验证连接",
-  "editor.connectionRecommendation": "应用配置前请运行连接测试，以验证兼容性和健康状态。",
   "editor.connectionVerified": "连接验证通过",
   "editor.connectionFailed": "连接失败",
   "editor.connectionPassed":
@@ -740,7 +693,6 @@ const zhCN: Record<keyof typeof en, string> = {
   "validation.modelRequired": "请至少添加一项完整的模型映射",
   "validation.modelIncomplete": "请补全或删除每项模型映射",
   "validation.modelUnique": "公共模型名称必须唯一",
-  "validation.headerIncomplete": "请补全或删除每项请求头",
   "validation.pathSlash": "路径须以 / 开头、保持上游同源且不含查询或片段",
   "validation.min100ms": "请输入有效整数，且不小于 100 毫秒",
   "validation.min1ms": "请输入有效整数，且不小于 1 毫秒",
@@ -797,30 +749,68 @@ const zhCN: Record<keyof typeof en, string> = {
   "data.loading": "正在获取管理数据",
   "data.stale": "正在显示上次获取的数据",
   "data.partial": "部分指标不可用或已过期",
-  "vllm.showRuntime": "展开运行指标",
 };
+
+export const translationResources = { en, "zh-CN": zhCN } as const;
+
+export type TranslateParams = Record<string, string | number | null | undefined>;
+export type TranslateFn = (
+  key: TranslationKey | (string & {}),
+  params?: TranslateParams & { defaultValue?: string },
+) => string;
 
 export function resolveLocale(stored: string | null, languages: readonly string[]): Locale {
   if (stored === "en" || stored === "zh-CN") return stored;
   return languages[0]?.toLowerCase().startsWith("zh") ? "zh-CN" : "en";
 }
 
-const initialLocale = resolveLocale(
-  typeof window === "undefined" ? null : window.localStorage.getItem(localeStorageKey),
-  typeof navigator === "undefined"
-    ? ["en"]
-    : navigator.languages?.length
-      ? navigator.languages
-      : [navigator.language || "en"],
-);
+export function translate(
+  locale: Locale,
+  key: string,
+  params?: TranslateParams & { defaultValue?: string },
+): string {
+  const table = translationResources[locale] as Record<string, string>;
+  const fallback = translationResources.en as Record<string, string>;
+  const template = table[key] ?? fallback[key] ?? params?.defaultValue ?? key;
+  if (!params) return template;
+  return template.replace(/\{\{(\w+)\}\}/g, (match, name: string) =>
+    name in params && params[name] != null ? String(params[name]) : match,
+  );
+}
 
-void i18n.use(initReactI18next).init({
-  resources: { en: { translation: en }, "zh-CN": { translation: zhCN } },
-  lng: initialLocale,
-  fallbackLng: "en",
-  supportedLngs: ["en", "zh-CN"],
-  interpolation: { escapeValue: false },
-  returnNull: false,
+interface I18nValue {
+  locale: Locale;
+  setLocale: (next: Locale) => void;
+  t: TranslateFn;
+}
+
+const initialLocale = (): Locale =>
+  resolveLocale(
+    typeof window === "undefined" ? null : window.localStorage.getItem(localeStorageKey),
+    typeof navigator === "undefined"
+      ? ["en"]
+      : navigator.languages?.length
+        ? navigator.languages
+        : [navigator.language || "en"],
+  );
+
+const I18nContext = createContext<I18nValue>({
+  locale: "en",
+  setLocale: () => {},
+  t: (key, params) => translate("en", key, params),
 });
 
-export const translationResources = { en, "zh-CN": zhCN } as const;
+export function I18nProvider({ children }: { children: ReactNode }) {
+  const [locale, setLocaleState] = useState<Locale>(initialLocale);
+  const setLocale = useCallback((next: Locale) => {
+    window.localStorage.setItem(localeStorageKey, next);
+    setLocaleState(next);
+  }, []);
+  const t = useCallback<TranslateFn>((key, params) => translate(locale, key, params), [locale]);
+  const value = useMemo(() => ({ locale, setLocale, t }), [locale, setLocale, t]);
+  return createElement(I18nContext.Provider, { value }, children);
+}
+
+export function useTranslation(): I18nValue {
+  return useContext(I18nContext);
+}

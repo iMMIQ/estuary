@@ -1,39 +1,92 @@
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
+use clap::{ArgAction, Args};
 use serde::{Deserialize, Serialize};
 
 pub mod contract;
 mod validation;
 
-pub use validation::validate_node_config;
+pub use contract::validate_node as validate_node_config;
 
 pub const MAX_TOKENIZE_CACHE_ENTRIES: usize = 65_536;
 
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Args)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
+    #[command(flatten)]
     pub server: ServerConfig,
+    #[command(flatten)]
     pub routing: RoutingConfig,
+    #[command(flatten)]
     pub health: HealthConfig,
+    #[command(flatten)]
     pub circuit_breaker: CircuitBreakerConfig,
+    #[command(flatten)]
     pub retry: RetryConfig,
-    #[serde(skip_serializing_if = "SessionLogConfig::is_disabled")]
+    #[command(flatten)]
     pub session_log: SessionLogConfig,
+    #[arg(skip)]
     pub nodes: Vec<NodeConfig>,
 }
 
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Args)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionLogConfig {
+    #[arg(
+        id = "session-log-database",
+        long = "session-log-database",
+        env = "ESTUARY_SESSION_LOG_DATABASE"
+    )]
     pub database: Option<PathBuf>,
+    #[arg(
+        id = "session-log-capture-content",
+        long = "session-log-capture-content",
+        env = "ESTUARY_SESSION_LOG_CAPTURE_CONTENT",
+        action = ArgAction::Set,
+        default_value_t = true
+    )]
     pub capture_content: bool,
+    #[arg(
+        id = "session-log-queue-capacity",
+        long = "session-log-queue-capacity",
+        env = "ESTUARY_SESSION_LOG_QUEUE_CAPACITY",
+        default_value_t = 4096
+    )]
     pub queue_capacity: usize,
+    #[arg(
+        id = "session-log-max-content-bytes",
+        long = "session-log-max-content-bytes",
+        env = "ESTUARY_SESSION_LOG_MAX_CONTENT_BYTES",
+        default_value_t = 64 * 1024 * 1024
+    )]
     pub max_content_bytes: usize,
+    #[arg(
+        id = "session-log-max-payload-bytes",
+        long = "session-log-max-payload-bytes",
+        env = "ESTUARY_SESSION_LOG_MAX_PAYLOAD_BYTES",
+        default_value_t = 2 * 1024 * 1024
+    )]
     pub max_payload_bytes: usize,
+    #[arg(
+        id = "session-log-retention-days",
+        long = "session-log-retention-days",
+        env = "ESTUARY_SESSION_LOG_RETENTION_DAYS",
+        default_value_t = 30
+    )]
     pub retention_days: u32,
+    #[arg(
+        id = "session-log-content-retention-days",
+        long = "session-log-content-retention-days",
+        env = "ESTUARY_SESSION_LOG_CONTENT_RETENTION_DAYS",
+        default_value_t = 7
+    )]
     pub content_retention_days: u32,
+    #[arg(
+        id = "session-log-flush-interval-ms",
+        long = "session-log-flush-interval-ms",
+        env = "ESTUARY_SESSION_LOG_FLUSH_INTERVAL_MS",
+        default_value_t = 100
+    )]
     pub flush_interval_ms: u64,
 }
 
@@ -52,45 +105,115 @@ impl Default for SessionLogConfig {
     }
 }
 
-impl SessionLogConfig {
-    fn is_disabled(&self) -> bool {
-        self.database.is_none()
-    }
-}
-
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Args)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
+    #[arg(long, env = "ESTUARY_LISTEN", default_value = "0.0.0.0:8080")]
     pub listen: String,
+    #[arg(long, env = "ESTUARY_ADMIN_LISTEN", default_value = "127.0.0.1:9090")]
     pub admin_listen: String,
+    #[arg(long, env = "ESTUARY_ADMIN_TOKEN")]
     pub admin_token: Option<String>,
-    pub admin_freeze_file: Option<PathBuf>,
+    #[arg(long, env = "ESTUARY_CONNECT_TIMEOUT_MS", default_value_t = 5_000)]
     pub connect_timeout_ms: u64,
+    #[arg(
+        long,
+        env = "ESTUARY_REQUEST_BODY_IDLE_TIMEOUT_MS",
+        default_value_t = 30_000
+    )]
     pub request_body_idle_timeout_ms: u64,
+    #[arg(
+        long,
+        env = "ESTUARY_REQUEST_BODY_TIMEOUT_MS",
+        default_value_t = 300_000
+    )]
     pub request_body_timeout_ms: u64,
+    #[arg(
+        long,
+        env = "ESTUARY_UPSTREAM_HEADER_TIMEOUT_MS",
+        default_value_t = 120_000
+    )]
     pub upstream_header_timeout_ms: u64,
+    #[arg(
+        long,
+        env = "ESTUARY_STREAM_IDLE_TIMEOUT_MS",
+        default_value_t = 300_000
+    )]
     pub stream_idle_timeout_ms: u64,
+    #[arg(
+        long,
+        env = "ESTUARY_UPSTREAM_BODY_TIMEOUT_MS",
+        default_value_t = 3_600_000
+    )]
     pub upstream_body_timeout_ms: u64,
+    #[arg(
+        long,
+        env = "ESTUARY_DOWNSTREAM_STALL_TIMEOUT_MS",
+        default_value_t = 30_000
+    )]
     pub downstream_stall_timeout_ms: u64,
+    #[arg(long, env = "ESTUARY_CONTROL_SYNC_INTERVAL_MS", default_value_t = 500)]
     pub control_sync_interval_ms: u64,
+    #[arg(
+        long,
+        env = "ESTUARY_NODE_MUTATION_TIMEOUT_MS",
+        default_value_t = 30_000
+    )]
     pub node_mutation_timeout_ms: u64,
+    #[arg(long, env = "ESTUARY_WITHDRAWAL_DELAY_MS", default_value_t = 10_000)]
     pub withdrawal_delay_ms: u64,
+    #[arg(long, env = "ESTUARY_SHUTDOWN_GRACE_MS", default_value_t = 3_660_000)]
     pub shutdown_grace_ms: u64,
+    #[arg(
+        long,
+        env = "ESTUARY_MAX_REQUEST_BODY_BYTES",
+        default_value_t = 16 * 1024 * 1024
+    )]
     pub max_request_body_bytes: usize,
+    #[arg(long, env = "ESTUARY_MAX_CONNECTIONS", default_value_t = 2_048)]
     pub max_connections: usize,
+    #[arg(long, env = "ESTUARY_MAX_ADMIN_CONNECTIONS", default_value_t = 128)]
     pub max_admin_connections: usize,
+    #[arg(
+        long,
+        env = "ESTUARY_MAX_NON_STREAMING_RESPONSE_BYTES",
+        default_value_t = 64 * 1024 * 1024
+    )]
     pub max_non_streaming_response_bytes: usize,
+    #[arg(
+        long,
+        env = "ESTUARY_MAX_BUFFERED_RESPONSE_BYTES",
+        default_value_t = 256 * 1024 * 1024
+    )]
     pub max_buffered_response_bytes: usize,
+    #[arg(
+        long,
+        env = "ESTUARY_EXPOSE_NODE_HEADER",
+        action = ArgAction::Set,
+        default_value_t = false
+    )]
     pub expose_node_header: bool,
+    #[arg(
+        long,
+        env = "ESTUARY_LOG_JSON",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = ArgAction::Set,
+        default_value_t = false
+    )]
     pub log_json: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[arg(long, env = "ESTUARY_PUBLIC_API_KEYS", value_delimiter = ',')]
     pub public_api_keys: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, env = "ESTUARY_PUBLIC_RPM_LIMIT")]
     pub public_rpm_limit: Option<u32>,
-    #[serde(skip_serializing_if = "is_false")]
+    #[arg(
+        long,
+        env = "ESTUARY_TRUST_PROXY_HEADERS",
+        action = ArgAction::Set,
+        default_value_t = false
+    )]
     pub trust_proxy_headers: bool,
-    #[serde(skip_serializing_if = "is_default_observability_max_scopes")]
+    #[arg(long, env = "ESTUARY_OBSERVABILITY_MAX_SCOPES", default_value_t = 32)]
     pub observability_max_scopes: usize,
 }
 
@@ -100,7 +223,6 @@ impl Default for ServerConfig {
             listen: "0.0.0.0:8080".to_owned(),
             admin_listen: "127.0.0.1:9090".to_owned(),
             admin_token: None,
-            admin_freeze_file: None,
             connect_timeout_ms: 5_000,
             request_body_idle_timeout_ms: 30_000,
             request_body_timeout_ms: 300_000,
@@ -127,35 +249,36 @@ impl Default for ServerConfig {
     }
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_default_observability_max_scopes(value: &usize) -> bool {
-    *value == ServerConfig::default().observability_max_scopes
-}
-
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Args)]
 #[serde(default, deny_unknown_fields)]
 pub struct RoutingConfig {
+    #[arg(long, env = "ESTUARY_QUEUE_MAX_REQUESTS", default_value_t = 512)]
     pub queue_max_requests: usize,
+    #[arg(
+        long,
+        env = "ESTUARY_QUEUE_MAX_BYTES",
+        default_value_t = 256 * 1024 * 1024
+    )]
     pub queue_max_bytes: usize,
+    #[arg(long, env = "ESTUARY_LOAD_WEIGHT", default_value_t = 1.0)]
     pub load_weight: f64,
+    #[arg(long, env = "ESTUARY_LATENCY_WEIGHT", default_value_t = 0.20)]
     pub latency_weight: f64,
+    #[arg(long, env = "ESTUARY_ERROR_WEIGHT", default_value_t = 1.0)]
     pub error_weight: f64,
-    #[serde(skip_serializing_if = "is_default_prefill_weight")]
+    #[arg(long, env = "ESTUARY_PREFILL_WEIGHT", default_value_t = 1.0)]
     pub prefill_weight: f64,
-    #[serde(skip_serializing_if = "is_default_decode_weight")]
+    #[arg(long, env = "ESTUARY_DECODE_WEIGHT", default_value_t = 0.25)]
     pub decode_weight: f64,
-    #[serde(skip_serializing_if = "is_default_prefill_scale")]
+    #[arg(long, env = "ESTUARY_PREFILL_TOKEN_SCALE", default_value_t = 4_096)]
     pub prefill_token_scale: usize,
-    #[serde(skip_serializing_if = "is_default_decode_scale")]
+    #[arg(long, env = "ESTUARY_DECODE_TOKEN_SCALE", default_value_t = 1_024)]
     pub decode_token_scale: usize,
+    #[arg(long, env = "ESTUARY_TARGET_LATENCY_MS", default_value_t = 1_000.0)]
     pub target_latency_ms: f64,
+    #[arg(long, env = "ESTUARY_REQUEST_STATS_STALE_MS", default_value_t = 60_000)]
     pub request_stats_stale_ms: u64,
+    #[command(flatten)]
     pub prefix: PrefixConfig,
 }
 
@@ -178,19 +301,63 @@ impl Default for RoutingConfig {
     }
 }
 
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Args)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrefixConfig {
+    #[arg(
+        long = "prefix-enabled",
+        env = "ESTUARY_PREFIX_ENABLED",
+        action = ArgAction::Set,
+        default_value_t = true
+    )]
     pub enabled: bool,
+    #[arg(
+        long = "prefix-cache-threshold",
+        env = "ESTUARY_PREFIX_CACHE_THRESHOLD",
+        default_value_t = 0.5
+    )]
     pub cache_threshold: f64,
-    #[serde(skip_serializing_if = "is_default_approximate_half_life")]
+    #[arg(
+        long = "prefix-approximate-half-life-ms",
+        env = "ESTUARY_PREFIX_APPROXIMATE_HALF_LIFE_MS",
+        default_value_t = 300_000
+    )]
     pub approximate_half_life_ms: u64,
+    #[arg(
+        long = "prefix-balance-abs-threshold",
+        env = "ESTUARY_PREFIX_BALANCE_ABS_THRESHOLD",
+        default_value_t = 2
+    )]
     pub balance_abs_threshold: usize,
+    #[arg(
+        long = "prefix-balance-rel-threshold",
+        env = "ESTUARY_PREFIX_BALANCE_REL_THRESHOLD",
+        default_value_t = 1.1
+    )]
     pub balance_rel_threshold: f64,
+    #[arg(
+        long = "prefix-max-request-chars",
+        env = "ESTUARY_PREFIX_MAX_REQUEST_CHARS",
+        default_value_t = 128 * 1024
+    )]
     pub max_request_chars: usize,
+    #[arg(
+        long = "prefix-max-tree-chars-per-node",
+        env = "ESTUARY_PREFIX_MAX_TREE_CHARS_PER_NODE",
+        default_value_t = 1_000_000
+    )]
     pub max_tree_chars_per_node: usize,
+    #[arg(
+        long = "prefix-max-trees",
+        env = "ESTUARY_PREFIX_MAX_TREES",
+        default_value_t = 256
+    )]
     pub max_trees: usize,
+    #[arg(
+        long = "prefix-max-directory-chars",
+        env = "ESTUARY_PREFIX_MAX_DIRECTORY_CHARS",
+        default_value_t = 16_000_000
+    )]
     pub max_directory_chars: usize,
 }
 
@@ -210,39 +377,51 @@ impl Default for PrefixConfig {
     }
 }
 
-// Keep default supervisor settings readable by workers predating workload routing.
-// Serde serialization predicates require references to the fields.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_default_prefill_weight(value: &f64) -> bool {
-    value.to_bits() == RoutingConfig::default().prefill_weight.to_bits()
-}
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_default_decode_weight(value: &f64) -> bool {
-    value.to_bits() == RoutingConfig::default().decode_weight.to_bits()
-}
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_default_prefill_scale(value: &usize) -> bool {
-    *value == RoutingConfig::default().prefill_token_scale
-}
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_default_decode_scale(value: &usize) -> bool {
-    *value == RoutingConfig::default().decode_token_scale
-}
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_default_approximate_half_life(value: &u64) -> bool {
-    *value == PrefixConfig::default().approximate_half_life_ms
-}
-
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Args)]
 #[serde(default, deny_unknown_fields)]
 pub struct HealthConfig {
+    #[arg(
+        long = "health-interval-ms",
+        env = "ESTUARY_HEALTH_INTERVAL_MS",
+        default_value_t = 5_000
+    )]
     pub interval_ms: u64,
+    #[arg(
+        long = "health-timeout-ms",
+        env = "ESTUARY_HEALTH_TIMEOUT_MS",
+        default_value_t = 2_000
+    )]
     pub timeout_ms: u64,
+    #[arg(
+        long = "health-unhealthy-threshold",
+        env = "ESTUARY_HEALTH_UNHEALTHY_THRESHOLD",
+        default_value_t = 3
+    )]
     pub unhealthy_threshold: u32,
+    #[arg(
+        long = "health-healthy-threshold",
+        env = "ESTUARY_HEALTH_HEALTHY_THRESHOLD",
+        default_value_t = 2
+    )]
     pub healthy_threshold: u32,
+    #[arg(
+        long = "health-passive-failure-threshold",
+        env = "ESTUARY_HEALTH_PASSIVE_FAILURE_THRESHOLD",
+        default_value_t = 3
+    )]
     pub passive_failure_threshold: u32,
+    #[arg(
+        long = "health-route-while-starting",
+        env = "ESTUARY_HEALTH_ROUTE_WHILE_STARTING",
+        action = ArgAction::Set,
+        default_value_t = false
+    )]
     pub route_while_starting: bool,
+    #[arg(
+        long = "health-jitter-percent",
+        env = "ESTUARY_HEALTH_JITTER_PERCENT",
+        default_value_t = 20
+    )]
     pub jitter_percent: u8,
 }
 
@@ -270,13 +449,32 @@ impl HealthConfig {
     }
 }
 
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Args)]
 #[serde(default, deny_unknown_fields)]
 pub struct CircuitBreakerConfig {
+    #[arg(
+        long = "circuit-failure-threshold",
+        env = "ESTUARY_CIRCUIT_FAILURE_THRESHOLD",
+        default_value_t = 5
+    )]
     pub failure_threshold: u32,
+    #[arg(
+        long = "circuit-open-ms",
+        env = "ESTUARY_CIRCUIT_OPEN_MS",
+        default_value_t = 10_000
+    )]
     pub open_ms: u64,
+    #[arg(
+        long = "circuit-half-open-max-requests",
+        env = "ESTUARY_CIRCUIT_HALF_OPEN_MAX_REQUESTS",
+        default_value_t = 1
+    )]
     pub half_open_max_requests: usize,
+    #[arg(
+        long = "circuit-half-open-success-threshold",
+        env = "ESTUARY_CIRCUIT_HALF_OPEN_SUCCESS_THRESHOLD",
+        default_value_t = 2
+    )]
     pub half_open_success_threshold: u32,
 }
 
@@ -297,11 +495,21 @@ impl CircuitBreakerConfig {
     }
 }
 
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Args)]
 #[serde(default, deny_unknown_fields)]
 pub struct RetryConfig {
+    #[arg(
+        long = "retry-max-attempts",
+        env = "ESTUARY_RETRY_MAX_ATTEMPTS",
+        default_value_t = 1
+    )]
     pub max_attempts: usize,
+    #[arg(
+        long = "retry-statuses",
+        env = "ESTUARY_RETRY_STATUSES",
+        value_delimiter = ',',
+        default_values_t = [429_u16, 502, 503, 504]
+    )]
     pub statuses: Vec<u16>,
 }
 

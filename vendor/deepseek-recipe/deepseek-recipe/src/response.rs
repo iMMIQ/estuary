@@ -4,10 +4,8 @@ use serde::Serialize;
 
 use crate::stream::ChunkGenerator;
 
-/// A protocol response that can accumulate the chunks of its chunk generator.
-pub trait ProtocolResponse:
-    'static + Send + Serialize + Accumulate<<Self::ChunkGenerator as ChunkGenerator>::Chunk>
-{
+/// A protocol response associated with a chunk generator.
+pub trait ProtocolResponse: 'static + Send + Serialize {
     /// Generator for this protocol's response chunks.
     type ChunkGenerator: ChunkGenerator;
 

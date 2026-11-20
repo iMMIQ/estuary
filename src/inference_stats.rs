@@ -68,38 +68,50 @@ impl Usage {
         .into_iter()
         .flatten()
         {
-            merge(
-                &mut self.input_tokens,
-                count(usage, "prompt_tokens").or_else(|| count(usage, "input_tokens")),
-            );
-            merge(
-                &mut self.output_tokens,
-                count(usage, "completion_tokens").or_else(|| count(usage, "output_tokens")),
-            );
-            merge(
-                &mut self.cache_write_tokens,
-                cache_write_tokens(usage).and_then(|n| usize::try_from(n).ok()),
-            );
-            merge(
-                &mut self.reasoning_tokens,
-                usage
-                    .pointer("/completion_tokens_details/reasoning_tokens")
-                    .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
-                    .and_then(Value::as_u64)
-                    .and_then(|n| usize::try_from(n).ok()),
-            );
-            merge(
-                &mut self.cached_tokens,
-                usage
-                    .pointer("/prompt_tokens_details/cached_tokens")
-                    .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
-                    .or_else(|| usage.get("cache_read_input_tokens"))
-                    .or_else(|| usage.get("prompt_cache_hit_tokens"))
-                    .and_then(Value::as_u64)
-                    .and_then(|n| usize::try_from(n).ok()),
-            );
+            self.observe_usage_object(usage);
         }
     }
+    pub(crate) fn observe_usage_object(&mut self, usage: &Value) {
+        merge(
+            &mut self.input_tokens,
+            count(usage, "prompt_tokens").or_else(|| count(usage, "input_tokens")),
+        );
+        merge(
+            &mut self.output_tokens,
+            count(usage, "completion_tokens").or_else(|| count(usage, "output_tokens")),
+        );
+        merge(
+            &mut self.cache_write_tokens,
+            cache_write_tokens(usage).and_then(|n| usize::try_from(n).ok()),
+        );
+        merge(
+            &mut self.reasoning_tokens,
+            usage
+                .pointer("/completion_tokens_details/reasoning_tokens")
+                .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok()),
+        );
+        merge(
+            &mut self.cached_tokens,
+            usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+                .or_else(|| usage.get("cache_read_input_tokens"))
+                .or_else(|| usage.get("prompt_cache_hit_tokens"))
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok()),
+        );
+    }
+}
+
+/// Observe usage and engine timings from an already-parsed response JSON object.
+pub(crate) fn observe_response_value(value: &Value) -> (Usage, ProviderTimings) {
+    let mut usage = Usage::default();
+    let mut timings = ProviderTimings::default();
+    usage.observe(value);
+    timings.observe(value);
+    (usage, timings)
 }
 
 /// Parse a buffered body once for both usage and engine timings, ignoring
@@ -206,28 +218,24 @@ impl ProviderTimings {
         if raw.get().len() <= MAX_OBSERVATION_BYTES
             && let Ok(reported) = serde_json::from_str::<ReportedTimings>(raw.get())
         {
-            // Field order matches PROVIDER_TIMING_FIELDS.
-            let milliseconds = [
+            self.record_ms([
                 reported.time_to_first_token_ms,
                 reported.generation_time_ms,
                 reported.queue_time_ms,
                 reported.mean_itl_ms,
-            ];
-            for (slot, milliseconds) in self.values.iter_mut().zip(milliseconds) {
-                if let Some(micros) = milliseconds.and_then(micros_from_ms) {
-                    *slot = Some(micros);
-                }
-            }
+            ]);
         }
     }
 
     fn observe_metrics(&mut self, metrics: &Value) {
-        for (slot, (source, _)) in self.values.iter_mut().zip(PROVIDER_TIMING_FIELDS) {
-            if let Some(micros) = metrics
-                .get(source)
-                .and_then(Value::as_f64)
-                .and_then(micros_from_ms)
-            {
+        self.record_ms(
+            PROVIDER_TIMING_FIELDS.map(|(source, _)| metrics.get(source).and_then(Value::as_f64)),
+        );
+    }
+
+    fn record_ms(&mut self, milliseconds: [Option<f64>; 4]) {
+        for (slot, ms) in self.values.iter_mut().zip(milliseconds) {
+            if let Some(micros) = ms.and_then(micros_from_ms) {
                 *slot = Some(micros);
             }
         }
@@ -251,20 +259,20 @@ struct ReportedTimings {
     mean_itl_ms: Option<f64>,
 }
 
-/// Milliseconds as `timings_us` microseconds, sharing the session-log
-/// conversion; invalid durations are ignored.
+/// Milliseconds as `timings_us` microseconds; invalid durations are ignored.
 fn micros_from_ms(milliseconds: f64) -> Option<u64> {
     Duration::try_from_secs_f64(milliseconds / 1000.0)
         .ok()
-        .map(crate::session_log::micros)
+        .map(crate::time::micros)
 }
 
 /// Cache-write token aliases across providers, in priority order: the
-/// Anthropic top-level field, Responses `cache_write_tokens`, then the legacy
-/// Chat/Responses `created_cache_tokens` details.
+/// Anthropic top-level field, Chat/Responses `cache_write_tokens`, then legacy
+/// `created_cache_tokens` details.
 pub(crate) fn cache_write_tokens(usage: &Value) -> Option<u64> {
     usage
         .get("cache_creation_input_tokens")
+        .or_else(|| usage.pointer("/prompt_tokens_details/cache_write_tokens"))
         .or_else(|| usage.pointer("/input_tokens_details/cache_write_tokens"))
         .or_else(|| usage.pointer("/prompt_tokens_details/created_cache_tokens"))
         .or_else(|| usage.pointer("/input_tokens_details/created_cache_tokens"))
@@ -286,13 +294,10 @@ fn merge(target: &mut Option<usize>, value: Option<usize>) {
 
 // These independent observations are not mutually exclusive lifecycle states.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct StreamObservation {
     pub generation_events: u64,
-    line: Vec<u8>,
-    data: Vec<u8>,
-    oversized: bool,
-    previous_cr: bool,
+    parser: crate::sse::SseParser,
     pub has_output: bool,
     pub terminal_marker_seen: bool,
     pub incomplete: bool,
@@ -302,13 +307,52 @@ pub(crate) struct StreamObservation {
     pub provider_timings: ProviderTimings,
 }
 
+impl Default for StreamObservation {
+    fn default() -> Self {
+        Self {
+            generation_events: 0,
+            parser: crate::sse::SseParser::new(MAX_OBSERVATION_BYTES),
+            has_output: false,
+            terminal_marker_seen: false,
+            incomplete: false,
+            error_seen: false,
+            has_visible_text: false,
+            usage: Usage::default(),
+            provider_timings: ProviderTimings::default(),
+        }
+    }
+}
+
 impl StreamObservation {
+    pub fn observe_done(&mut self) {
+        self.terminal_marker_seen = true;
+    }
+
+    pub fn observe_value(&mut self, value: &Value) {
+        self.terminal_marker_seen |= matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("message_stop" | "response.completed")
+        );
+        self.error_seen |= value.get("error").is_some_and(|error| !error.is_null())
+            || matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("error" | "response.failed" | "response.incomplete")
+            );
+        self.has_visible_text |= visible_text(value);
+        self.usage.observe(value);
+        self.provider_timings.observe(value);
+        if has_generation(value) {
+            self.has_output = true;
+            self.generation_events = self.generation_events.saturating_add(1);
+        }
+    }
+
     pub fn observe_json(&mut self, data: &[u8]) {
         if data.iter().all(u8::is_ascii_whitespace) {
             return;
         }
         if data == b"[DONE]" {
-            self.terminal_marker_seen = true;
+            self.observe_done();
             return;
         }
         if data.len() > MAX_OBSERVATION_BYTES {
@@ -316,74 +360,19 @@ impl StreamObservation {
             return;
         }
         if let Ok(value) = serde_json::from_slice::<Value>(data) {
-            self.terminal_marker_seen |= matches!(
-                value.get("type").and_then(Value::as_str),
-                Some("message_stop" | "response.completed")
-            );
-            self.error_seen |= value.get("error").is_some_and(|error| !error.is_null())
-                || matches!(
-                    value.get("type").and_then(Value::as_str),
-                    Some("error" | "response.failed" | "response.incomplete")
-                );
-            self.has_visible_text |= visible_text(&value);
-            self.usage.observe(&value);
-            self.provider_timings.observe(&value);
-            if has_generation(&value) {
-                self.has_output = true;
-                self.generation_events = self.generation_events.saturating_add(1);
-            }
+            self.observe_value(&value);
         } else {
             self.incomplete = true;
         }
     }
 
     pub fn observe_bytes(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            if byte == b'\r' {
-                self.finish_line();
-                self.previous_cr = true;
-            } else if byte == b'\n' {
-                if !self.previous_cr {
-                    self.finish_line();
-                }
-                self.previous_cr = false;
-            } else if !self.oversized && self.line.len() + self.data.len() < MAX_OBSERVATION_BYTES {
-                self.previous_cr = false;
-                self.line.push(byte);
-            } else {
-                self.previous_cr = false;
-                self.oversized = true;
-                self.incomplete = true;
-                // Retain only whether this line is blank so we can recover at the next event.
-                if self.line.is_empty() {
-                    self.line.push(b'x');
-                }
-            }
-        }
-    }
-
-    fn finish_line(&mut self) {
-        if self.line.last() == Some(&b'\r') {
-            self.line.pop();
-        }
-        if self.line.is_empty() {
-            if !self.oversized {
-                let data = std::mem::take(&mut self.data);
-                self.observe_json(&data);
-                self.data = data;
-            }
-            self.data.clear();
-            self.oversized = false;
-        } else if !self.oversized
-            && let Some(data) = self.line.strip_prefix(b"data:")
-        {
-            if !self.data.is_empty() {
-                self.data.push(b'\n');
-            }
-            self.data
-                .extend_from_slice(data.strip_prefix(b" ").unwrap_or(data));
-        }
-        self.line.clear();
+        let mut parser = std::mem::replace(&mut self.parser, crate::sse::SseParser::new(0));
+        parser.push(bytes, |event| match event {
+            Ok(data) => self.observe_json(data),
+            Err(()) => self.incomplete = true,
+        });
+        self.parser = parser;
     }
 }
 
@@ -507,7 +496,7 @@ mod tests {
         let mut observation = StreamObservation::default();
         observation.observe_bytes(b"data: ");
         observation.observe_bytes(&vec![b'x'; MAX_OBSERVATION_BYTES * 2]);
-        assert!(observation.line.len() + observation.data.len() <= MAX_OBSERVATION_BYTES);
+        assert!(observation.parser.buffered_bytes() <= MAX_OBSERVATION_BYTES);
         observation
             .observe_bytes(b"\n\ndata: invalid\n\ndata: {\"choices\":[{\"text\":\"ok\"}]}\n\n");
         assert!(observation.has_output);

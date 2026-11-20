@@ -11,32 +11,41 @@ mod writer;
 
 use crate::config::SessionLogConfig;
 use anyhow::{Context, Result};
-pub(crate) use capture::AttemptGuard;
-pub(crate) use capture::DeliveryGuard;
 pub use capture::Observation;
+pub(crate) use capture::{AttemptGuard, DeliveryGuard};
 
 pub use model::{
     AttemptRecord, LogEvent, LogStatus, PayloadDetail, RequestDetail, RequestPage, RequestRecord,
     SessionSummary,
 };
+use parking_lot::{Condvar, Mutex};
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 pub struct LogSink {
     config: SessionLogConfig,
-    sender: Option<mpsc::Sender<Command>>,
+    queue: Option<Arc<LogQueue>>,
     stats: Arc<Stats>,
     content_bytes: Arc<AtomicUsize>,
     boot_id: String,
     process_token: Option<String>,
     query_slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl Drop for LogSink {
+    fn drop(&mut self) {
+        if let Some(queue) = &self.queue {
+            queue.close();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -56,21 +65,124 @@ enum Command {
     Flush(oneshot::Sender<bool>),
 }
 
+struct QueueState {
+    items: VecDeque<Command>,
+    reserved: usize,
+    closed: bool,
+}
+
+struct LogQueue {
+    capacity: usize,
+    state: Mutex<QueueState>,
+    wake: Condvar,
+}
+
+struct QueuePermit {
+    queue: Arc<LogQueue>,
+    consumed: bool,
+}
+
+impl QueuePermit {
+    fn send(mut self, command: Command) {
+        self.consumed = true;
+        let mut state = self.queue.state.lock();
+        state.reserved = state.reserved.saturating_sub(1);
+        state.items.push_back(command);
+        self.queue.wake.notify_one();
+    }
+}
+
+impl Drop for QueuePermit {
+    fn drop(&mut self) {
+        if !self.consumed {
+            let mut state = self.queue.state.lock();
+            state.reserved = state.reserved.saturating_sub(1);
+        }
+    }
+}
+
+impl LogQueue {
+    fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            capacity,
+            state: Mutex::new(QueueState {
+                items: VecDeque::new(),
+                reserved: 0,
+                closed: false,
+            }),
+            wake: Condvar::new(),
+        })
+    }
+
+    fn try_start(self: &Arc<Self>, command: Command) -> Option<QueuePermit> {
+        let mut state = self.state.lock();
+        if state.closed || state.items.len() + state.reserved + 2 > self.capacity {
+            return None;
+        }
+        state.reserved += 1;
+        state.items.push_back(command);
+        self.wake.notify_one();
+        Some(QueuePermit {
+            queue: Arc::clone(self),
+            consumed: false,
+        })
+    }
+
+    fn push_flush(&self, reply: oneshot::Sender<bool>) -> bool {
+        let mut state = self.state.lock();
+        if state.closed {
+            return false;
+        }
+        state.items.push_back(Command::Flush(reply));
+        self.wake.notify_one();
+        true
+    }
+
+    fn close(&self) {
+        self.state.lock().closed = true;
+        self.wake.notify_all();
+    }
+
+    fn recv_until(&self, deadline: Instant) -> RecvStatus {
+        let mut state = self.state.lock();
+        loop {
+            if let Some(command) = state.items.pop_front() {
+                return RecvStatus::Item(command);
+            }
+            if state.closed {
+                return RecvStatus::Closed;
+            }
+            if self.wake.wait_until(&mut state, deadline).timed_out() {
+                return RecvStatus::Timeout;
+            }
+        }
+    }
+}
+
+enum RecvStatus {
+    Item(Command),
+    Timeout,
+    Closed,
+}
+
 impl LogSink {
     pub(crate) fn new(config: SessionLogConfig) -> Arc<Self> {
         let stats = Arc::new(Stats::default());
         let boot_id = uuid::Uuid::now_v7().to_string();
-        let sender = if config.database.is_some() {
-            let (sender, receiver) = mpsc::channel(config.queue_capacity);
+        let queue = if config.database.is_some() {
+            let queue = LogQueue::new(config.queue_capacity);
+            let worker_queue = Arc::clone(&queue);
             let worker_config = config.clone();
             let worker_stats = Arc::clone(&stats);
             let worker_boot = boot_id.clone();
             if std::thread::Builder::new()
                 .name("session-log".to_owned())
-                .spawn(move || writer::run(receiver, &worker_config, &worker_stats, &worker_boot))
+                .spawn(move || {
+                    writer::run(&worker_queue, &worker_config, &worker_stats, &worker_boot);
+                })
                 .is_ok()
             {
-                Some(sender)
+                Some(queue)
             } else {
                 None
             }
@@ -79,7 +191,7 @@ impl LogSink {
         };
         Arc::new(Self {
             config,
-            sender,
+            queue,
             stats,
             content_bytes: Arc::new(AtomicUsize::new(0)),
             boot_id,
@@ -112,59 +224,38 @@ impl LogSink {
         }
     }
 
-    pub(crate) fn encode_metrics(&self, mut body: String) -> String {
-        use std::fmt::Write;
-        // Keep the OpenMetrics terminator last. No request/session IDs are labels.
-        if body.ends_with("# EOF\n") {
-            body.truncate(body.len() - 6);
-        }
-        let status = self.status();
-        for (name, value) in [
-            ("enabled", u64::from(status.enabled)),
-            ("available", u64::from(status.available)),
-            ("queued", status.queued as u64),
-            ("content_bytes", status.content_bytes as u64),
-            ("dropped_total", status.dropped),
-            ("truncated_total", status.truncated),
-            ("write_errors_total", status.write_errors),
-            ("committed_total", status.committed),
-            ("last_commit_timestamp_ms", status.last_commit_at_ms),
-        ] {
-            let kind = if name.ends_with("_total") {
-                "counter"
-            } else {
-                "gauge"
-            };
-            let family = name.strip_suffix("_total").unwrap_or(name);
-            let _ = writeln!(
-                body,
-                "# TYPE estuary_session_log_{family} {kind}\nestuary_session_log_{name} {value}"
-            );
-        }
-        body.push_str("# EOF\n");
-        body
-    }
-
     pub async fn flush(&self, timeout: Duration) -> bool {
-        let Some(sender) = &self.sender else {
+        let Some(queue) = &self.queue else {
             return true;
         };
         let (send, receive) = oneshot::channel();
-        tokio::time::timeout(timeout, async {
-            sender.send(Command::Flush(send)).await.ok()?;
-            receive.await.ok()
-        })
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(false)
+        if !queue.push_flush(send) {
+            return false;
+        }
+        tokio::time::timeout(timeout, receive)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false)
     }
 
-    fn path(&self) -> Result<PathBuf> {
-        self.config
+    async fn run_query<T: Send + 'static>(
+        &self,
+        query: impl FnOnce(&Path) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let path = self
+            .config
             .database
             .clone()
-            .context("session logging is disabled")
+            .context("session logging is disabled")?;
+        let permit = Arc::clone(&self.query_slots)
+            .try_acquire_owned()
+            .context("too many session log queries")?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            query(&path)
+        })
+        .await?
     }
 
     pub async fn list(
@@ -174,48 +265,26 @@ impl LogSink {
         since: u64,
         limit: usize,
     ) -> Result<RequestPage> {
-        let path = self.path()?;
-        let permit = Arc::clone(&self.query_slots)
-            .try_acquire_owned()
-            .context("too many session log queries")?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+        self.run_query(move |path| {
             store::list(
-                &path,
+                path,
                 session.as_deref(),
                 cursor.as_deref(),
                 since,
                 limit.clamp(1, 100),
             )
         })
-        .await?
+        .await
     }
-    pub async fn detail(&self, id: String) -> Result<Option<RequestDetail>> {
-        let path = self.path()?;
-        let permit = Arc::clone(&self.query_slots)
-            .try_acquire_owned()
-            .context("too many session log queries")?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            store::detail(&path, &id)
-        })
-        .await?
-    }
-    pub async fn sessions(&self, since: u64) -> Result<Vec<SessionSummary>> {
-        let path = self.path()?;
-        let permit = Arc::clone(&self.query_slots)
-            .try_acquire_owned()
-            .context("too many session log queries")?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            store::sessions(&path, since)
-        })
-        .await?
-    }
-}
 
-pub(crate) fn micros(duration: Duration) -> u64 {
-    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+    pub async fn detail(&self, id: String) -> Result<Option<RequestDetail>> {
+        self.run_query(move |path| store::detail(path, &id)).await
+    }
+
+    pub async fn sessions(&self, since: u64) -> Result<Vec<SessionSummary>> {
+        self.run_query(move |path| store::sessions(path, since))
+            .await
+    }
 }
 
 pub(crate) fn separate_database(log: &SessionLogConfig, control: &Path) -> Result<()> {

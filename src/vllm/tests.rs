@@ -1,7 +1,10 @@
 use super::kv_events::*;
 use super::monitor::*;
 use super::tokenization::*;
-use crate::kv_cache::{BlockHash, CacheMutation};
+use crate::{
+    kv_cache::{BlockHash, CacheMutation, ExactCacheDirectory},
+    prefix::PrefixDirectory,
+};
 use rmpv::Value;
 use std::{
     collections::HashMap,
@@ -195,12 +198,48 @@ vllm:num_preemptions_total{model_name="a"} 2
     assert_eq!(telemetry.running, 2);
     assert_eq!(telemetry.waiting, 3);
     assert_eq!(telemetry.kv_cache_usage, Some(0.75));
-    assert_eq!(telemetry.prompt_tokens_total, Some(1500.0));
-    assert_eq!(telemetry.generation_tokens_total, Some(450.0));
-    assert_eq!(telemetry.requests_total, Some(10.0));
-    assert_eq!(telemetry.prefix_cache_queries_total, Some(1000.0));
-    assert_eq!(telemetry.prefix_cache_hits_total, Some(625.0));
-    assert_eq!(telemetry.preemptions_total, Some(2.0));
+    assert_eq!(
+        crate::node::sum_counter_kind(
+            &telemetry.counter_series,
+            crate::node::CounterKind::PromptTokens
+        ),
+        Some(1500.0)
+    );
+    assert_eq!(
+        crate::node::sum_counter_kind(
+            &telemetry.counter_series,
+            crate::node::CounterKind::GenerationTokens
+        ),
+        Some(450.0)
+    );
+    assert_eq!(
+        crate::node::sum_counter_kind(
+            &telemetry.counter_series,
+            crate::node::CounterKind::Requests
+        ),
+        Some(10.0)
+    );
+    assert_eq!(
+        crate::node::sum_counter_kind(
+            &telemetry.counter_series,
+            crate::node::CounterKind::PrefixQueries
+        ),
+        Some(1000.0)
+    );
+    assert_eq!(
+        crate::node::sum_counter_kind(
+            &telemetry.counter_series,
+            crate::node::CounterKind::PrefixHits
+        ),
+        Some(625.0)
+    );
+    assert_eq!(
+        crate::node::sum_counter_kind(
+            &telemetry.counter_series,
+            crate::node::CounterKind::Preemptions
+        ),
+        Some(2.0)
+    );
 }
 
 #[test]
@@ -402,15 +441,16 @@ async fn unhealthy_upstream_invalidates_a_silent_subscriber_session() {
     let task_exact = Arc::clone(&exact);
     let task_prefix = Arc::clone(&prefix);
     let task = tokio::spawn(async move {
-        let mut last_seq = Some(0);
-        let mut synchronized = true;
+        let mut sync = KvSyncState {
+            last_seq: Some(0),
+            synchronized: true,
+        };
         run_event_session(
             &task_node,
             &task_exact,
             &task_prefix,
             &config,
-            &mut last_seq,
-            &mut synchronized,
+            &mut sync,
             &mut receiver,
         )
         .await
@@ -453,16 +493,14 @@ async fn consumes_the_vllm_pub_sub_frame_layout() {
     let task_prefix = Arc::clone(&prefix);
     let task_config = config.clone();
     let task = tokio::spawn(async move {
-        let mut last_seq = None;
-        let mut synchronized = false;
+        let mut sync = KvSyncState::default();
         let mut receiver = receiver;
         run_event_session(
             &task_node,
             &task_exact,
             &task_prefix,
             &task_config,
-            &mut last_seq,
-            &mut synchronized,
+            &mut sync,
             &mut receiver,
         )
         .await

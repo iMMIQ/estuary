@@ -1,5 +1,11 @@
-import type { Observability } from "./observability-types";
-import type { GatewayStatus, NodeConfig, NodeRecord, PreflightResponse } from "./types";
+import type { LogStatus, RequestDetail, RequestPage, SessionSummary } from "./generated/config";
+import type {
+  GatewayStatus,
+  NodeConfig,
+  NodeRecord,
+  Observability,
+  PreflightResponse,
+} from "./types";
 
 interface NodeListResponse {
   nodes: NodeRecord[];
@@ -112,9 +118,7 @@ export function setDraining(id: string, draining: boolean): Promise<unknown> {
   });
 }
 
-export function getLogStatus(
-  signal?: AbortSignal,
-): Promise<import("./session-log-types").LogStatus> {
+export function getLogStatus(signal?: AbortSignal): Promise<LogStatus> {
   return request("/admin/api/logs/status", readOptions(signal));
 }
 
@@ -123,7 +127,7 @@ export function listLogRequests(
   cursor: string | null,
   since: number,
   signal?: AbortSignal,
-): Promise<import("./session-log-types").LogPage> {
+): Promise<RequestPage> {
   const query = new URLSearchParams({ since: String(since) });
   if (session) query.set("session", session);
   if (cursor) query.set("cursor", cursor);
@@ -133,18 +137,15 @@ export function listLogRequests(
 export async function listLogSessions(
   since: number,
   signal?: AbortSignal,
-): Promise<import("./session-log-types").LogSession[]> {
+): Promise<SessionSummary[]> {
   return (
-    await request<{ sessions: import("./session-log-types").LogSession[] }>(
+    await request<{ sessions: SessionSummary[] }>(
       `/admin/api/logs/sessions?since=${since}`,
       readOptions(signal),
     )
   ).sessions;
 }
 
-export function getLogRequest(
-  id: string,
-  signal?: AbortSignal,
-): Promise<import("./session-log-types").LogDetail> {
+export function getLogRequest(id: string, signal?: AbortSignal): Promise<RequestDetail> {
   return request(`/admin/api/logs/requests/${encodeURIComponent(id)}`, readOptions(signal));
 }

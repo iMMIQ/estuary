@@ -13,11 +13,12 @@ shared prompt types; Estuary does not render model prompts.
 Local changes:
 - Reduce workspace members to the three included crates and remove dependencies
   belonging to excluded encoders, image processing, Python bindings and servers.
-- Make the Hugging Face tokenizer dependency and its StreamTokenizer implementation
-  optional behind the `huggingface-tokenizer` feature (disabled by default).
-  Estuary sends Chat requests to vLLM, which renders and tokenizes them.
-- Gate the upstream stream processor tests behind the same feature; they require
-  the excluded tokenizer assets. Other upstream unit tests remain available.
+- Prune whole unused modules not used by Estuary's Chat bridge:
+  - `protocol/openai/chat_completion/` (Estuary forwards Chat Completions directly)
+  - `stream/{processor,decoder,output_parser}.rs` (Estuary receives structured Chat deltas from vLLM instead of parsing raw token streams; drops `async-stream`, `tokio-stream`, and optional `tokenizers`)
+  - `error_response.rs`
+  - `protocol/openai/responses/response/accumulator.rs` (`ResponsesChunkGenerator` already emits the complete `ResponsesResponse` on terminal events)
+  - `deepseek-recipe-core/src/multimodal/token_spec.rs` (DeepSeek V4.1 image tile resizing/counting)
 - Replace the full-workspace README with a description of the vendored subset.
 - Keep upstream JSON Schema tool validation enabled.
 - Retain Estuary's refreshed versions of existing workspace dependencies. Keep the

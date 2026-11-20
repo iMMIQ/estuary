@@ -13,11 +13,10 @@ import json
 import re
 import subprocess
 import sys
-import threading
 import uuid
 from pathlib import Path
 
-from claude_mock_e2e import MockLlm, image_summary, tool_reply
+from e2e_helpers import MockLlm, image_summary, tool_reply
 from image_fixtures import IMAGES
 
 
@@ -78,83 +77,65 @@ def main():
     args = parser.parse_args()
     output = args.output.resolve() / str(uuid.uuid4())
     output.mkdir(parents=True)
-    server = MockLlm(output, model="mock-codex", reply=mock_reply)
-    worker = threading.Thread(target=server.serve_forever, daemon=True)
-    worker.start()
-    report = {"mock_url": f"http://127.0.0.1:{server.server_port}/v1"}
+    report = {}
     try:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(Path(__file__).with_name("codex_cpu_e2e.py")),
-                "--upstream",
-                report["mock_url"],
-                "--model",
-                "mock-codex",
-                "--binary",
-                str(args.binary.resolve()),
-                "--timeout",
-                str(args.timeout),
-                "--images",
-                "--output",
-                str(output / "codex"),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        (output / "codex.stdout").write_text(completed.stdout)
-        (output / "codex.stderr").write_text(completed.stderr)
-        child_path = next((output / "codex").glob("*/report.json"), None)
-        child = json.loads(child_path.read_text()) if child_path else {}
-        report.update(
-            exit_code=completed.returncode,
-            report=str(child_path),
-            codex_version=child.get("codex_version"),
-        )
-        report["checks"] = [
-            {k: check[k] for k in ["name", "passed"]}
-            | ({"error": check["error"]} if "error" in check else {})
-            for check in child.get("checks", [])
-        ]
-        details = [
-            check["details"]
-            for check in child.get("checks", [])
-            if check["passed"] and "usage" in check.get("details", {})
-        ]
-        report["usage_verified"] = len(details) == 6 and all(
-            usage.get("input_tokens") == 1000
-            and usage.get("cache_read_tokens") == 880
-            and usage.get("output_tokens") == 16
-            for detail in details
-            for usage in detail["usage"]
-        )
-        report["client_usage"] = [detail["client_usage"] for detail in details]
-        report["client_usage_verified"] = len(details) == 6 and all(
-            detail["client_usage"]["input_tokens"] == 1000 * detail["requests"]
-            and detail["client_usage"]["cached_input_tokens"]
-            == 880 * detail["requests"]
-            and detail["client_usage"]["output_tokens"] == 16 * detail["requests"]
-            for detail in details
-        )
-        with server.lock:
-            records = list(server.requests)
-        actions = [record.get("action") for record in records]
-        report["mock"] = {
-            "requests": len(records),
-            "actions": actions,
-            "errors": [r["error"] for r in records if "error" in r],
-            "only_chat_endpoints": bool(records)
-            and all(r["path"].startswith("/v1/chat/completions") for r in records),
-            "credentials_stripped": all(
-                not r["client_credentials_forwarded"] for r in records
-            ),
-            "image_checks": [
-                {"action": r["action"], "images": r["images"]}
-                for r in records
-                if r.get("action", "").startswith("images_")
-            ],
-        }
+        with MockLlm(output, model="mock-codex", reply=mock_reply) as server:
+            report["mock_url"] = server.url
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("codex_cpu_e2e.py")),
+                    "--upstream",
+                    server.url,
+                    "--model",
+                    "mock-codex",
+                    "--binary",
+                    str(args.binary.resolve()),
+                    "--timeout",
+                    str(args.timeout),
+                    "--images",
+                    "--output",
+                    str(output / "codex"),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            (output / "codex.stdout").write_text(completed.stdout)
+            (output / "codex.stderr").write_text(completed.stderr)
+            child_path = next((output / "codex").glob("*/report.json"), None)
+            child = json.loads(child_path.read_text()) if child_path else {}
+            report.update(
+                exit_code=completed.returncode,
+                report=str(child_path),
+                codex_version=child.get("codex_version"),
+            )
+            report["checks"] = [
+                {k: check[k] for k in ["name", "passed"]}
+                | ({"error": check["error"]} if "error" in check else {})
+                for check in child.get("checks", [])
+            ]
+            details = [
+                check["details"]
+                for check in child.get("checks", [])
+                if check["passed"] and "usage" in check.get("details", {})
+            ]
+            report["usage_verified"] = len(details) == 6 and all(
+                usage.get("input_tokens") == 1000
+                and usage.get("cache_read_tokens") == 880
+                and usage.get("output_tokens") == 16
+                for detail in details
+                for usage in detail["usage"]
+            )
+            report["client_usage"] = [detail["client_usage"] for detail in details]
+            report["client_usage_verified"] = len(details) == 6 and all(
+                detail["client_usage"]["input_tokens"] == 1000 * detail["requests"]
+                and detail["client_usage"]["cached_input_tokens"]
+                == 880 * detail["requests"]
+                and detail["client_usage"]["output_tokens"] == 16 * detail["requests"]
+                for detail in details
+            )
+            _, actions, report["mock"] = server.summary()
         report["passed"] = (
             completed.returncode == 0
             and len(report["checks"]) == 8
@@ -192,9 +173,6 @@ def main():
         )
         return 0 if report["passed"] else 1
     finally:
-        server.shutdown()
-        server.server_close()
-        worker.join(timeout=5)
         (output / "report.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False)
         )

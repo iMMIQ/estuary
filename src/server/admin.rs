@@ -34,6 +34,81 @@ use crate::{
 
 use super::AppState;
 
+pub(super) struct AdminError {
+    status: StatusCode,
+    error_type: &'static str,
+    code: &'static str,
+    message: String,
+}
+
+impl AdminError {
+    pub(super) fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            error_type: "admin_error",
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub(super) fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, code, message)
+    }
+
+    pub(super) fn not_found(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, code, message)
+    }
+
+    pub(super) fn node_not_found(node_id: &str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            error_type: "invalid_request_error",
+            code: "node_not_found",
+            message: format!("node {node_id:?} does not exist"),
+        }
+    }
+
+    pub(super) fn validation(error: &anyhow::Error) -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "node_validation_failed",
+            error.to_string(),
+        )
+    }
+
+    pub(super) fn conflict(code: &'static str, message: &'static str) -> Self {
+        Self::new(StatusCode::CONFLICT, code, message)
+    }
+
+    pub(super) fn internal_message(message: &'static str) -> Self {
+        error!(message, "admin runtime consistency error");
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+    }
+
+    pub(super) fn internal(message: &'static str, error: &dyn std::fmt::Display) -> Self {
+        error!(error = %error, message, "admin operation failed");
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+    }
+}
+
+impl IntoResponse for AdminError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(json!({
+                "error": {
+                    "message": self.message,
+                    "type": self.error_type,
+                    "code": self.code,
+                }
+            })),
+        )
+            .into_response()
+    }
+}
+
+type AdminResult<T = Response> = std::result::Result<T, AdminError>;
+
 pub(super) async fn live() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
 }
@@ -54,13 +129,14 @@ pub(super) async fn ready(State(state): State<Arc<AppState>>) -> Response {
 }
 
 pub(super) async fn process_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let (requests, bytes) = state.scheduler.queue_snapshot();
     let response_buffer = state.response_buffer.snapshot();
     Json(json!({
         "process": state.process.snapshot(),
         "runtime_ready": state.scheduler.ready(),
         "queue": {
-            "requests": state.scheduler.queue_snapshot().0,
-            "bytes": state.scheduler.queue_snapshot().1,
+            "requests": requests,
+            "bytes": bytes,
         },
         "response_buffer": {
             "used_bytes": response_buffer.used_bytes,
@@ -68,19 +144,6 @@ pub(super) async fn process_status(State(state): State<Arc<AppState>>) -> Json<s
             "waiting_responses": response_buffer.waiting_responses,
         },
     }))
-}
-
-pub(super) async fn activate_process(State(state): State<Arc<AppState>>) -> Response {
-    let activated = state.process.activate();
-    (
-        StatusCode::OK,
-        Json(json!({
-            "activated": activated,
-            "process": state.process.snapshot(),
-            "runtime_ready": state.scheduler.ready(),
-        })),
-    )
-        .into_response()
 }
 
 pub(super) async fn drain_process(State(state): State<Arc<AppState>>) -> Response {
@@ -96,15 +159,17 @@ pub(super) async fn drain_process(State(state): State<Arc<AppState>>) -> Respons
 }
 
 pub(super) async fn metrics(State(state): State<Arc<AppState>>) -> Response {
-    match state.metrics.encode(&state.scheduler) {
+    match state.metrics.encode(
+        &state.scheduler,
+        Some(&state.telemetry),
+        Some(&state.session_log),
+    ) {
         Ok(body) => (
             [(
                 "content-type",
                 "application/openmetrics-text; version=1.0.0; charset=utf-8",
             )],
-            state
-                .session_log
-                .encode_metrics(state.telemetry.encode_metrics(body)),
+            body,
         )
             .into_response(),
         Err(error) => {
@@ -117,7 +182,7 @@ pub(super) async fn metrics(State(state): State<Arc<AppState>>) -> Response {
 pub(super) async fn admin_nodes(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> Response {
+) -> AdminResult {
     let revision = state
         .store
         .revision_async()
@@ -133,27 +198,27 @@ pub(super) async fn admin_nodes(
         if let Ok(value) = HeaderValue::from_str(&etag) {
             response.headers_mut().insert(ETAG, value);
         }
-        return response;
+        return Ok(response);
     }
-    match state.store.list_async().await {
-        Ok(nodes) => {
-            let mut response = Json(json!({
-                "nodes": nodes
-                    .into_iter()
-                    .filter_map(|stored| {
-                        let node = state.scheduler.node(&stored.config.id)?;
-                        Some(admin_node_payload(&state, &stored, &node))
-                    })
-                    .collect::<Vec<_>>()
-            }))
-            .into_response();
-            if let Ok(value) = HeaderValue::from_str(&etag) {
-                response.headers_mut().insert(ETAG, value);
-            }
-            response
-        }
-        Err(error) => admin_internal_error("could not load node configurations", &error),
+    let nodes = state
+        .store
+        .list_async()
+        .await
+        .map_err(|error| AdminError::internal("could not load node configurations", &error))?;
+    let mut response = Json(json!({
+        "nodes": nodes
+            .into_iter()
+            .filter_map(|stored| {
+                let node = state.scheduler.node(&stored.config.id)?;
+                Some(admin_node_payload(&state, &stored, &node))
+            })
+            .collect::<Vec<_>>()
+    }))
+    .into_response();
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(ETAG, value);
     }
+    Ok(response)
 }
 
 pub(super) async fn admin_events(
@@ -188,10 +253,11 @@ pub(super) struct ObservabilityQuery {
     id: String,
     window: Option<u64>,
 }
+
 pub(super) async fn observability(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ObservabilityQuery>,
-) -> Response {
+) -> AdminResult<Json<crate::observability::Snapshot>> {
     let seconds = query.window.unwrap_or(300);
     let scope = if query.scope.is_empty() {
         "fleet"
@@ -203,9 +269,12 @@ pub(super) async fn observability(
         || query.id.len() > 1024
         || (scope != "fleet" && query.id.is_empty())
     {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"invalid_observability_query","message":"Use scope fleet/node/model and window 60/300/900 seconds"}}))).into_response();
+        return Err(AdminError::bad_request(
+            "invalid_observability_query",
+            "Use scope fleet/node/model and window 60/300/900 seconds",
+        ));
     }
-    Json(state.telemetry.snapshot(scope, &query.id, seconds)).into_response()
+    Ok(Json(state.telemetry.snapshot(scope, &query.id, seconds)))
 }
 
 #[derive(Debug, Serialize)]
@@ -347,60 +416,71 @@ pub(super) async fn set_ip_limit(
     State(state): State<Arc<AppState>>,
     Path(ip): Path<String>,
     Json(input): Json<IpLimitInput>,
-) -> Response {
-    let Ok(ip) = ip.parse::<IpAddr>() else {
-        return admin_message(StatusCode::BAD_REQUEST, "invalid_ip", "invalid IP address");
-    };
+) -> AdminResult<Json<serde_json::Value>> {
+    let ip = ip
+        .parse::<IpAddr>()
+        .map_err(|_| AdminError::bad_request("invalid_ip", "invalid IP address"))?;
     if input.limit == 0 || input.limit > state.settings.server.max_connections {
-        return admin_message(
-            StatusCode::BAD_REQUEST,
+        return Err(AdminError::bad_request(
             "invalid_limit",
             "limit must be between 1 and the public connection limit",
-        );
+        ));
     }
     let _mutation = state.admin_mutation.lock().await;
-    if let Err(error) = state.store.set_ip_limit_async(ip, input.limit).await {
-        return admin_internal_error("could not persist IP connection limit", &error);
-    }
+    state
+        .store
+        .set_ip_limit_async(ip, input.limit)
+        .await
+        .map_err(|error| AdminError::internal("could not persist IP connection limit", &error))?;
     state.connections.set_limit(ip, input.limit);
     publish_control_revision(&state).await;
-    Json(json!({"ip": ip, "limit": input.limit})).into_response()
+    Ok(Json(json!({"ip": ip, "limit": input.limit})))
 }
 
 pub(super) async fn delete_ip_limit(
     State(state): State<Arc<AppState>>,
     Path(ip): Path<String>,
-) -> Response {
-    let Ok(ip) = ip.parse::<IpAddr>() else {
-        return admin_message(StatusCode::BAD_REQUEST, "invalid_ip", "invalid IP address");
-    };
+) -> AdminResult<Json<serde_json::Value>> {
+    let ip = ip
+        .parse::<IpAddr>()
+        .map_err(|_| AdminError::bad_request("invalid_ip", "invalid IP address"))?;
     let _mutation = state.admin_mutation.lock().await;
-    let deleted = match state.store.delete_ip_limit_async(ip).await {
-        Ok(deleted) => deleted,
-        Err(error) => {
-            return admin_internal_error("could not delete persisted IP connection limit", &error);
-        }
-    };
+    let deleted = state
+        .store
+        .delete_ip_limit_async(ip)
+        .await
+        .map_err(|error| {
+            AdminError::internal("could not delete persisted IP connection limit", &error)
+        })?;
     let removed_live = state.connections.remove_limit(ip);
     if deleted {
         publish_control_revision(&state).await;
     }
-    Json(json!({"deleted": deleted || removed_live})).into_response()
+    Ok(Json(json!({"deleted": deleted || removed_live})))
+}
+
+async fn load_stored_and_runtime(
+    state: &AppState,
+    node_id: &str,
+) -> AdminResult<(StoredNode, Arc<Node>)> {
+    let stored = state
+        .store
+        .get_async(node_id)
+        .await
+        .map_err(|error| AdminError::internal("could not load node configuration", &error))?
+        .ok_or_else(|| AdminError::node_not_found(node_id))?;
+    let node = state.scheduler.node(node_id).ok_or_else(|| {
+        AdminError::internal_message("node is persisted but missing from the runtime registry")
+    })?;
+    Ok((stored, node))
 }
 
 pub(super) async fn admin_node(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
-) -> Response {
-    let stored = match state.store.get_async(&node_id).await {
-        Ok(Some(stored)) => stored,
-        Ok(None) => return admin_node_not_found(&node_id),
-        Err(error) => return admin_internal_error("could not load node configuration", &error),
-    };
-    let Some(node) = state.scheduler.node(&node_id) else {
-        return admin_internal_message("node is persisted but missing from the runtime registry");
-    };
-    Json(admin_node_payload(&state, &stored, &node)).into_response()
+) -> AdminResult<Json<serde_json::Value>> {
+    let (stored, node) = load_stored_and_runtime(&state, &node_id).await?;
+    Ok(Json(admin_node_payload(&state, &stored, &node)))
 }
 
 pub(super) fn admin_node_payload(
@@ -466,35 +546,35 @@ pub(super) async fn preflight_node(
     State(state): State<Arc<AppState>>,
     Query(query): Query<CredentialMutationQuery>,
     Json(mut config): Json<NodeConfig>,
-) -> Response {
+) -> AdminResult<Json<serde_json::Value>> {
     let preserve_api_key = config.api_key.is_none() && !query.clear_api_key;
     let preserve_headers = config.headers.is_empty() && !query.clear_headers;
     if preserve_api_key || preserve_headers {
-        match state.store.get_async(&config.id).await {
-            Ok(Some(stored)) => preserve_stored_credentials(
+        let stored = state.store.get_async(&config.id).await.map_err(|error| {
+            AdminError::internal(
+                if preserve_api_key {
+                    "could not load stored credentials"
+                } else {
+                    "could not load stored headers"
+                },
+                &error,
+            )
+        })?;
+        if let Some(stored) = stored {
+            preserve_stored_credentials(
                 &mut config,
                 &stored.config,
                 query.clear_api_key,
                 query.clear_headers,
-            ),
-            Ok(None) => {}
-            Err(error) => {
-                let message = if preserve_api_key {
-                    "could not load stored credentials"
-                } else {
-                    "could not load stored headers"
-                };
-                return admin_internal_error(message, &error);
-            }
+            );
         }
     }
-    let node = match prepare_node(&state, &config).await {
-        Ok(node) => node,
-        Err(error) => return admin_validation_error(&error),
-    };
+    let node = prepare_node_candidate(&state, &config, None)
+        .await
+        .map_err(|error| AdminError::validation(&error))?;
     let snapshot = node.snapshot();
     let admission = admin_admission_snapshot(&node, &snapshot);
-    Json(json!({
+    Ok(Json(json!({
         "ok": true,
         "runtime": snapshot,
         "admission": admission,
@@ -503,46 +583,53 @@ pub(super) async fn preflight_node(
             "provider": "passed",
             "health": "passed",
         }
-    }))
-    .into_response()
+    })))
 }
 
 pub(super) async fn create_node(
     State(state): State<Arc<AppState>>,
     Json(config): Json<NodeConfig>,
-) -> Response {
+) -> AdminResult<(StatusCode, Json<serde_json::Value>)> {
     let _mutation = state.admin_mutation.lock().await;
     if state.scheduler.node(&config.id).is_some() {
-        return admin_conflict("node_already_exists", "a node with this id already exists");
+        return Err(AdminError::conflict(
+            "node_already_exists",
+            "a node with this id already exists",
+        ));
     }
-    let node = match prepare_node(&state, &config).await {
-        Ok(node) => node,
-        Err(error) => return admin_validation_error(&error),
-    };
+    let node = prepare_node_candidate(&state, &config, None)
+        .await
+        .map_err(|error| AdminError::validation(&error))?;
     if matches!(state.store.get_async(&config.id).await, Ok(Some(_))) {
-        return admin_conflict("node_already_exists", "a node with this id already exists");
+        return Err(AdminError::conflict(
+            "node_already_exists",
+            "a node with this id already exists",
+        ));
     }
-    let stored = match state.store.insert_async(&config).await {
-        Ok(stored) => stored,
-        Err(error) => return admin_internal_error("could not persist node", &error),
-    };
+    let stored = state
+        .store
+        .insert_async(&config)
+        .await
+        .map_err(|error| AdminError::internal("could not persist node", &error))?;
     if let Err(error) = state.scheduler.add_node(Arc::clone(&node)) {
         let _ = state
             .store
             .delete_async(&config.id, Some(stored.revision))
             .await;
-        return admin_internal_error("could not add node to runtime registry", &error);
+        return Err(AdminError::internal(
+            "could not add node to runtime registry",
+            &error,
+        ));
     }
     state
         .runtime_revisions
         .write()
         .insert(config.id.clone(), stored.revision);
     publish_control_revision(&state).await;
-    (
+    Ok((
         StatusCode::CREATED,
         Json(admin_node_payload(&state, &stored, &node)),
-    )
-        .into_response()
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -566,31 +653,23 @@ pub(super) struct MutationQuery {
 pub(super) async fn update_node(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
-    Query(_query): Query<MutationQuery>,
     Json(request): Json<UpdateNodeRequest>,
-) -> Response {
+) -> AdminResult<Json<serde_json::Value>> {
     let _mutation = state.admin_mutation.lock().await;
     if request.config.id != node_id {
-        return admin_message(
+        return Err(AdminError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "node_id_mismatch",
             "the request path and config node id must match",
-        );
+        ));
     }
-    let stored = match state.store.get_async(&node_id).await {
-        Ok(Some(stored)) => stored,
-        Ok(None) => return admin_node_not_found(&node_id),
-        Err(error) => return admin_internal_error("could not load node configuration", &error),
-    };
+    let (stored, previous) = load_stored_and_runtime(&state, &node_id).await?;
     if stored.revision != request.revision {
-        return admin_conflict(
+        return Err(AdminError::conflict(
             "revision_conflict",
             "the node changed after this editor loaded it; refresh and retry",
-        );
+        ));
     }
-    let Some(previous) = state.scheduler.node(&node_id) else {
-        return admin_internal_message("node is persisted but missing from the runtime registry");
-    };
     let mut requested_config = request.config;
     preserve_stored_credentials(
         &mut requested_config,
@@ -598,62 +677,49 @@ pub(super) async fn update_node(
         request.clear_api_key,
         request.clear_headers,
     );
-    let replacement = match prepare_node_update(&state, &requested_config, &previous).await {
-        Ok(node) => node,
-        Err(error) => return admin_validation_error(&error),
-    };
-    let updated = match state
+    let replacement = prepare_node_candidate(&state, &requested_config, Some(&previous))
+        .await
+        .map_err(|error| AdminError::validation(&error))?;
+    let updated = state
         .store
         .update_async(&node_id, request.revision, &requested_config)
         .await
-    {
-        Ok(Some(updated)) => updated,
-        Ok(None) => {
-            return admin_conflict(
+        .map_err(|error| AdminError::internal("could not persist node update", &error))?
+        .ok_or_else(|| {
+            AdminError::conflict(
                 "revision_conflict",
                 "the node changed while the update was being applied",
-            );
-        }
-        Err(error) => {
-            return admin_internal_error("could not persist node update", &error);
-        }
-    };
-    let replacement = match state.scheduler.replace_node(&replacement) {
-        Ok(node) => node,
-        Err(error) => return admin_internal_error("could not replace runtime node", &error),
-    };
+            )
+        })?;
+    let replacement = state
+        .scheduler
+        .replace_node(&replacement)
+        .map_err(|error| AdminError::internal("could not replace runtime node", &error))?;
     state
         .runtime_revisions
         .write()
         .insert(node_id, updated.revision);
     publish_control_revision(&state).await;
-    Json(admin_node_payload(&state, &updated, &replacement)).into_response()
+    Ok(Json(admin_node_payload(&state, &updated, &replacement)))
 }
 
 pub(super) async fn delete_node(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
     Query(query): Query<MutationQuery>,
-) -> Response {
+) -> AdminResult<Json<serde_json::Value>> {
     let _mutation = state.admin_mutation.lock().await;
-    let stored = match state.store.get_async(&node_id).await {
-        Ok(Some(stored)) => stored,
-        Ok(None) => return admin_node_not_found(&node_id),
-        Err(error) => return admin_internal_error("could not load node configuration", &error),
-    };
+    let (stored, node) = load_stored_and_runtime(&state, &node_id).await?;
     if query
         .revision
         .is_some_and(|revision| revision != stored.revision)
     {
-        return admin_conflict(
+        return Err(AdminError::conflict(
             "revision_conflict",
             "the node changed after this editor loaded it; refresh and retry",
-        );
+        ));
     }
-    let Some(node) = state.scheduler.node(&node_id) else {
-        return admin_internal_message("node is persisted but missing from the runtime registry");
-    };
-    let was_draining = node.lifecycle() == crate::node::LifecycleState::Draining;
+    let was_draining = node.lifecycle() == LifecycleState::Draining;
     node.set_draining(true);
     state.scheduler.notify_state_change();
     if !state
@@ -661,10 +727,10 @@ pub(super) async fn delete_node(
         .wait_for_node_idle(&node, mutation_timeout(&state, query.timeout_ms))
         .await
     {
-        return admin_conflict(
+        return Err(AdminError::conflict(
             "node_still_active",
             "the node is draining but still has active requests; retry deletion later",
-        );
+        ));
     }
     match state
         .store
@@ -674,36 +740,27 @@ pub(super) async fn delete_node(
         Ok(true) => {}
         Ok(false) => {
             node.set_draining(was_draining);
-            return admin_conflict(
+            return Err(AdminError::conflict(
                 "revision_conflict",
                 "the node changed while deletion was being applied",
-            );
+            ));
         }
         Err(error) => {
             node.set_draining(was_draining);
-            return admin_internal_error("could not delete persisted node", &error);
+            return Err(AdminError::internal(
+                "could not delete persisted node",
+                &error,
+            ));
         }
     }
     state.scheduler.remove_node(&node_id);
     state.metrics.remove_node(&node_id);
     state.runtime_revisions.write().remove(&node_id);
     publish_control_revision(&state).await;
-    Json(json!({"deleted": true, "node": node_id})).into_response()
+    Ok(Json(json!({"deleted": true, "node": node_id})))
 }
 
-pub(super) async fn prepare_node(state: &AppState, config: &NodeConfig) -> Result<Arc<Node>> {
-    prepare_node_candidate(state, config, None).await
-}
-
-pub(super) async fn prepare_node_update(
-    state: &AppState,
-    config: &NodeConfig,
-    previous: &Node,
-) -> Result<Arc<Node>> {
-    prepare_node_candidate(state, config, Some(previous)).await
-}
-
-async fn prepare_node_candidate(
+pub(super) async fn prepare_node_candidate(
     state: &AppState,
     config: &NodeConfig,
     previous: Option<&Node>,
@@ -721,7 +778,7 @@ async fn prepare_node_candidate(
     Ok(node)
 }
 
-pub(super) fn mutation_timeout(state: &AppState, timeout_ms: Option<u64>) -> Duration {
+fn mutation_timeout(state: &AppState, timeout_ms: Option<u64>) -> Duration {
     Duration::from_millis(
         timeout_ms
             .unwrap_or(state.settings.server.node_mutation_timeout_ms)
@@ -740,12 +797,9 @@ pub(super) async fn drain_node(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
     Query(query): Query<DrainQuery>,
-) -> Response {
+) -> AdminResult<(StatusCode, Json<serde_json::Value>)> {
     let _mutation = state.admin_mutation.lock().await;
-    let (node, revision) = match persist_node_draining(&state, &node_id, true).await {
-        Ok(result) => result,
-        Err(response) => return *response,
-    };
+    let (node, revision) = persist_node_draining(&state, &node_id, true).await?;
     let drained = if query.wait {
         state
             .scheduler
@@ -759,7 +813,7 @@ pub(super) async fn drain_node(
     } else {
         StatusCode::ACCEPTED
     };
-    (
+    Ok((
         status,
         Json(json!({
             "node": node.id(),
@@ -768,44 +822,29 @@ pub(super) async fn drain_node(
             "drained": drained,
             "revision": revision,
         })),
-    )
-        .into_response()
+    ))
 }
 
 pub(super) async fn resume_node(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
-) -> Response {
+) -> AdminResult<Json<serde_json::Value>> {
     let _mutation = state.admin_mutation.lock().await;
-    let (node, revision) = match persist_node_draining(&state, &node_id, false).await {
-        Ok(result) => result,
-        Err(response) => return *response,
-    };
-    Json(json!({
+    let (node, revision) = persist_node_draining(&state, &node_id, false).await?;
+    Ok(Json(json!({
         "node": node.id(),
         "lifecycle": node.lifecycle(),
         "routable": node.is_routable(),
         "revision": revision,
-    }))
-    .into_response()
+    })))
 }
 
 async fn persist_node_draining(
     state: &AppState,
     node_id: &str,
     draining: bool,
-) -> Result<(Arc<Node>, u64), Box<Response>> {
-    let mut stored = state
-        .store
-        .get_async(node_id)
-        .await
-        .map_err(|error| {
-            Box::new(admin_internal_error(
-                "could not load node configuration",
-                &error,
-            ))
-        })?
-        .ok_or_else(|| Box::new(admin_node_not_found(node_id)))?;
+) -> AdminResult<(Arc<Node>, u64)> {
+    let (mut stored, _) = load_stored_and_runtime(state, node_id).await?;
     stored.config.draining = draining;
     let (conflict_message, persist_message) = if draining {
         (
@@ -822,15 +861,13 @@ async fn persist_node_draining(
         .store
         .update_async(node_id, stored.revision, &stored.config)
         .await
-        .map_err(|error| Box::new(admin_internal_error(persist_message, &error)))?
-        .ok_or_else(|| Box::new(admin_conflict("revision_conflict", conflict_message)))?;
+        .map_err(|error| AdminError::internal(persist_message, &error))?
+        .ok_or_else(|| AdminError::conflict("revision_conflict", conflict_message))?;
     let node = state
         .scheduler
         .set_node_draining(node_id, draining)
         .ok_or_else(|| {
-            Box::new(admin_internal_message(
-                "node is persisted but missing from the runtime registry",
-            ))
+            AdminError::internal_message("node is persisted but missing from the runtime registry")
         })?;
     state
         .runtime_revisions
@@ -838,57 +875,4 @@ async fn persist_node_draining(
         .insert(node_id.to_owned(), stored.revision);
     publish_control_revision(state).await;
     Ok((node, stored.revision))
-}
-
-pub(super) fn admin_node_not_found(node_id: &str) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({
-            "error": {
-                "message": format!("node {node_id:?} does not exist"),
-                "type": "invalid_request_error",
-                "code": "node_not_found"
-            }
-        })),
-    )
-        .into_response()
-}
-
-pub(super) fn admin_validation_error(error: &anyhow::Error) -> Response {
-    admin_message(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "node_validation_failed",
-        &error.to_string(),
-    )
-}
-
-pub(super) fn admin_conflict(code: &'static str, message: &'static str) -> Response {
-    admin_message(StatusCode::CONFLICT, code, message)
-}
-
-pub(super) fn admin_internal_message(message: &'static str) -> Response {
-    error!(message, "admin runtime consistency error");
-    admin_message(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
-}
-
-pub(super) fn admin_internal_error(
-    message: &'static str,
-    error: &dyn std::fmt::Display,
-) -> Response {
-    error!(error = %error, message, "admin operation failed");
-    admin_message(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
-}
-
-pub(super) fn admin_message(status: StatusCode, code: &'static str, message: &str) -> Response {
-    (
-        status,
-        Json(json!({
-            "error": {
-                "message": message,
-                "type": "admin_error",
-                "code": code,
-            }
-        })),
-    )
-        .into_response()
 }

@@ -7,7 +7,6 @@ use std::{
 };
 
 use axum::{
-    Json,
     body::{Body, HttpBody as _},
     extract::{Request, State},
     http::{
@@ -21,13 +20,13 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use futures_util::Stream;
 use parking_lot::Mutex;
-use serde_json::json;
 use subtle::ConstantTimeEq;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::{
     anthropic, error::GatewayError, lifecycle::ResponseGuard, scheduler::IngressAdmission,
+    time::micros,
 };
 
 use super::{AppState, RequestId};
@@ -83,28 +82,28 @@ struct ResponseHooks {
 struct ResponseHooksState {
     telemetry: Option<TelemetryHook>,
     session_log: Option<SessionLogHook>,
+    remaining: Option<u64>,
 }
 
 struct TelemetryHook {
     observation: Arc<crate::observability::Observation>,
     delivery: crate::observability::Delivery,
-    remaining: Option<u64>,
 }
 
 struct SessionLogHook {
     observation: Arc<crate::session_log::Observation>,
     guard: crate::session_log::DeliveryGuard,
     streaming: bool,
-    remaining: Option<u64>,
 }
 
-/// Single custom `Stream` adapter replacing three nested `async_stream::stream!`
+/// Single custom `Stream` adapter replacing nested `async_stream::stream!`
 /// wrappers on the public inference path.
 struct ObservedStream {
     inner: axum::body::BodyDataStream,
     _response_guard: ResponseGuard,
     telemetry: Option<TelemetryHook>,
     session_log: Option<SessionLogHook>,
+    remaining: Option<u64>,
     finished: bool,
 }
 
@@ -115,6 +114,7 @@ impl ObservedStream {
             _response_guard: response_guard,
             telemetry: hooks.telemetry,
             session_log: hooks.session_log,
+            remaining: hooks.remaining,
             finished: false,
         })
     }
@@ -145,18 +145,17 @@ impl Stream for ObservedStream {
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Ok(bytes))) => {
-                let len = bytes.len() as u64;
-                if let Some(telemetry) = &mut this.telemetry
-                    && let Some(left) = &mut telemetry.remaining
-                {
-                    *left = left.saturating_sub(len);
-                    telemetry.delivery.complete = *left == 0;
-                }
-                if let Some(log) = &mut this.session_log {
+                if let Some(log) = &this.session_log {
                     log.observation.downstream_bytes(&bytes, log.streaming);
-                    if let Some(left) = &mut log.remaining {
-                        *left = left.saturating_sub(len);
-                        log.guard.1 = *left == 0;
+                }
+                if let Some(left) = &mut this.remaining {
+                    *left = left.saturating_sub(bytes.len() as u64);
+                    let done = *left == 0;
+                    if let Some(telemetry) = &mut this.telemetry {
+                        telemetry.delivery.complete = done;
+                    }
+                    if let Some(log) = &mut this.session_log {
+                        log.guard.1 = done;
                     }
                 }
                 Poll::Ready(Some(Ok(bytes)))
@@ -190,15 +189,13 @@ impl PublicRateLimiter {
         let mut buckets = self.buckets.lock();
         if buckets.len() >= Self::MAX_KEYS && !buckets.contains_key(key) {
             buckets.retain(|_, (started, _)| now.duration_since(*started) < Self::WINDOW);
-            if buckets.len() >= Self::MAX_KEYS {
-                // Evict one arbitrary stale/oldest bucket to keep memory strictly bounded.
-                if let Some(oldest) = buckets
+            if buckets.len() >= Self::MAX_KEYS
+                && let Some(oldest) = buckets
                     .iter()
                     .min_by_key(|(_, (started, _))| *started)
                     .map(|(k, _)| k.clone())
-                {
-                    buckets.remove(&oldest);
-                }
+            {
+                buckets.remove(&oldest);
             }
         }
         let entry = buckets.entry(key.to_owned()).or_insert((now, 0));
@@ -216,21 +213,34 @@ impl PublicRateLimiter {
     }
 }
 
+fn authorization_token(value: &str, allow_basic: bool) -> Option<String> {
+    let (scheme, credentials) = value.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("bearer") {
+        return Some(credentials.trim().to_owned());
+    }
+    if !allow_basic || !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let decoded = BASE64_STANDARD.decode(credentials).ok()?;
+    let decoded = std::str::from_utf8(&decoded).ok()?;
+    decoded
+        .split_once(':')
+        .map(|(_, password)| password.to_owned())
+}
+
 fn extract_public_api_key(request: &Request) -> Option<String> {
-    if let Some(value) = request
+    request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        && let Some((scheme, token)) = value.split_once(' ')
-        && scheme.eq_ignore_ascii_case("bearer")
-    {
-        return Some(token.trim().to_owned());
-    }
-    request
-        .headers()
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().to_owned())
+        .and_then(|v| authorization_token(v, false))
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.trim().to_owned())
+        })
 }
 
 fn client_rate_limit_key(request: &Request, api_key: Option<&str>, trust_proxy: bool) -> String {
@@ -251,6 +261,14 @@ fn client_rate_limit_key(request: &Request, api_key: Option<&str>, trust_proxy: 
     "ip:default".to_owned()
 }
 
+fn gateway_error_response(error: GatewayError, is_anthropic: bool, request_id: &str) -> Response {
+    if is_anthropic {
+        anthropic::error_response(&error, request_id)
+    } else {
+        error.into_response()
+    }
+}
+
 pub(super) async fn authorize_and_rate_limit_public(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -262,8 +280,7 @@ pub(super) async fn authorize_and_rate_limit_public(
         return next.run(request).await;
     }
 
-    let path = request.uri().path();
-    let is_anthropic = path.starts_with("/v1/messages");
+    let is_anthropic = request.uri().path().starts_with("/v1/messages");
     let request_id = request
         .extensions()
         .get::<RequestId>()
@@ -277,32 +294,7 @@ pub(super) async fn authorize_and_rate_limit_public(
                 .any(|expected| bool::from(provided.as_bytes().ct_eq(expected.as_bytes())))
         });
         if !authorized {
-            return if is_anthropic {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({
-                        "type": "error",
-                        "request_id": request_id,
-                        "error": {
-                            "type": "authentication_error",
-                            "message": "invalid or missing API key"
-                        }
-                    })),
-                )
-                    .into_response()
-            } else {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({
-                        "error": {
-                            "message": "invalid or missing API key",
-                            "type": "authentication_error",
-                            "code": "invalid_api_key"
-                        }
-                    })),
-                )
-                    .into_response()
-            };
+            return gateway_error_response(GatewayError::Unauthorized, is_anthropic, &request_id);
         }
     }
 
@@ -313,105 +305,15 @@ pub(super) async fn authorize_and_rate_limit_public(
             state.settings.server.trust_proxy_headers,
         );
         if let Err(retry_after) = state.rate_limiter.check(&bucket_key, limit) {
-            let mut response = if is_anthropic {
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(json!({
-                        "type": "error",
-                        "request_id": request_id,
-                        "error": {
-                            "type": "rate_limit_error",
-                            "message": "rate limit exceeded"
-                        }
-                    })),
-                )
-                    .into_response()
-            } else {
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(json!({
-                        "error": {
-                            "message": "rate limit exceeded",
-                            "type": "rate_limit_error",
-                            "code": "rate_limit_exceeded"
-                        }
-                    })),
-                )
-                    .into_response()
-            };
-            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
-                response.headers_mut().insert("retry-after", value);
-            }
-            return response;
+            return gateway_error_response(
+                GatewayError::RateLimited { retry_after },
+                is_anthropic,
+                &request_id,
+            );
         }
     }
 
     next.run(request).await
-}
-
-pub(super) async fn log_public_request(
-    State(state): State<Arc<AppState>>,
-    mut request: Request,
-    next: Next,
-) -> Response {
-    if request.method() != Method::POST || !request.uri().path().starts_with("/v1/") {
-        return next.run(request).await;
-    }
-    let id = request
-        .extensions()
-        .get::<RequestId>()
-        .map(|id| id.0.as_str())
-        .unwrap_or_default();
-    let Some(observation) = state
-        .session_log
-        .begin(request.uri().path(), request.headers(), id)
-    else {
-        return next.run(request).await;
-    };
-    let hooks = request.extensions().get::<ResponseHooks>().cloned();
-    let mut guard = crate::session_log::DeliveryGuard(Arc::clone(&observation), false);
-    request.extensions_mut().insert(Arc::clone(&observation));
-    let response = next.run(request).await;
-    let streaming = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("text/event-stream"));
-    observation.headers(response.status().as_u16(), streaming);
-    let length = response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    let forbids_body = matches!(
-        response.status(),
-        StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
-    );
-    guard.1 = forbids_body || length == Some(0) || response.body().is_end_stream();
-    if let Some(hooks) = hooks {
-        hooks.inner.lock().session_log = Some(SessionLogHook {
-            observation,
-            guard,
-            streaming,
-            remaining: length,
-        });
-        return response;
-    }
-    let (parts, body) = response.into_parts();
-    let wrapped = ObservedStream::into_body(
-        body,
-        state.process.track_response(),
-        ResponseHooksState {
-            telemetry: None,
-            session_log: Some(SessionLogHook {
-                observation,
-                guard,
-                streaming,
-                remaining: length,
-            }),
-        },
-    );
-    Response::from_parts(parts, wrapped)
 }
 
 pub(super) async fn admit_public_request(
@@ -434,7 +336,7 @@ pub(super) async fn admit_public_request(
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
 
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     if let Some(telemetry) = request
         .extensions()
         .get::<Arc<crate::observability::Observation>>()
@@ -455,10 +357,7 @@ pub(super) async fn admit_public_request(
         .extensions()
         .get::<Arc<crate::session_log::Observation>>()
     {
-        log.timing(
-            "ingress_wait",
-            crate::session_log::micros(started.elapsed()),
-        );
+        log.timing("ingress_wait", micros(started.elapsed()));
     }
     next.run(request).await
 }
@@ -473,7 +372,7 @@ pub(super) async fn authorize_admin(
             .headers()
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .and_then(admin_authorization_token);
+            .and_then(|value| authorization_token(value, true));
         if !candidate
             .is_some_and(|candidate| bool::from(candidate.as_bytes().ct_eq(expected.as_bytes())))
         {
@@ -488,48 +387,7 @@ pub(super) async fn authorize_admin(
         }
     }
 
-    let is_process_control = request.uri().path().starts_with("/admin/api/process/");
-    let mutating = matches!(
-        *request.method(),
-        Method::POST | Method::PUT | Method::DELETE | Method::PATCH
-    );
-    if mutating
-        && !is_process_control
-        && state
-            .settings
-            .server
-            .admin_freeze_file
-            .as_ref()
-            .is_some_and(|path| path.exists())
-    {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": {
-                    "code": "rollout_in_progress",
-                    "message": "Management writes are frozen while a binary rollout is in progress"
-                }
-            })),
-        )
-            .into_response();
-    }
-
     next.run(request).await
-}
-
-pub(super) fn admin_authorization_token(value: &str) -> Option<String> {
-    let (scheme, credentials) = value.split_once(' ')?;
-    if scheme.eq_ignore_ascii_case("bearer") {
-        return Some(credentials.to_owned());
-    }
-    if !scheme.eq_ignore_ascii_case("basic") {
-        return None;
-    }
-    let decoded = BASE64_STANDARD.decode(credentials).ok()?;
-    let decoded = std::str::from_utf8(&decoded).ok()?;
-    decoded
-        .split_once(':')
-        .map(|(_, password)| password.to_owned())
 }
 
 pub(super) async fn assign_request_id(mut request: Request, next: Next) -> Response {
@@ -565,16 +423,35 @@ pub(super) async fn track_public_response(
     Response::from_parts(parts, ObservedStream::into_body(body, guard, collected))
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn observe_request(
     State(state): State<Arc<AppState>>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     let endpoint = metric_endpoint(&path);
     let hooks = request.extensions().get::<ResponseHooks>().cloned();
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .map(|id| id.0.clone())
+        .unwrap_or_default();
+
+    let session_log = (method == Method::POST && path.starts_with("/v1/"))
+        .then(|| {
+            state
+                .session_log
+                .begin(&path, request.headers(), &request_id)
+        })
+        .flatten();
+    let session_guard = session_log.as_ref().map(|observation| {
+        request.extensions_mut().insert(Arc::clone(observation));
+        crate::session_log::DeliveryGuard(Arc::clone(observation), false)
+    });
+
     let telemetry = (method == Method::POST
         && matches!(
             path.as_str(),
@@ -591,15 +468,11 @@ pub(super) async fn observe_request(
         }
         observation
     });
-    let mut delivery = telemetry.as_ref().map(|observation| {
+    let telemetry_delivery = telemetry.as_ref().map(|observation| {
         request.extensions_mut().insert(Arc::clone(observation));
         crate::observability::Delivery::new(Arc::clone(observation))
     });
-    let request_id = request
-        .extensions()
-        .get::<RequestId>()
-        .map(|id| id.0.clone())
-        .unwrap_or_default();
+
     let mut response = next.run(request).await;
     if response.status() == StatusCode::PAYLOAD_TOO_LARGE
         && !response
@@ -608,11 +481,11 @@ pub(super) async fn observe_request(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("application/json"))
     {
-        response = if path.starts_with("/v1/messages") {
-            anthropic::error_response(&GatewayError::PayloadTooLarge, &request_id)
-        } else {
-            GatewayError::PayloadTooLarge.into_response()
-        };
+        response = gateway_error_response(
+            GatewayError::PayloadTooLarge,
+            path.starts_with("/v1/messages"),
+            &request_id,
+        );
     }
     let elapsed = started.elapsed();
     state.metrics.request(endpoint, response.status().as_u16());
@@ -627,43 +500,62 @@ pub(super) async fn observe_request(
         elapsed_ms = elapsed.as_millis(),
         "response created"
     );
-    if let (Some(telemetry), Some(mut delivery)) = (telemetry, delivery.take()) {
-        let streaming = response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("text/event-stream"));
-        telemetry.headers(response.status().as_u16(), streaming);
-        let length = response
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok());
-        delivery.complete = length == Some(0) || response.body().is_end_stream();
-        if let Some(hooks) = hooks {
-            hooks.inner.lock().telemetry = Some(TelemetryHook {
-                observation: telemetry,
-                delivery,
-                remaining: length,
-            });
-            return response;
-        }
-        let (parts, body) = response.into_parts();
-        let wrapped = ObservedStream::into_body(
-            body,
-            state.process.track_response(),
-            ResponseHooksState {
-                telemetry: Some(TelemetryHook {
-                    observation: telemetry,
-                    delivery,
-                    remaining: length,
-                }),
-                session_log: None,
-            },
-        );
-        return Response::from_parts(parts, wrapped);
+
+    if telemetry.is_none() && session_log.is_none() {
+        return response;
     }
-    response
+
+    let streaming = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    let length = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let empty_body = length == Some(0) || response.body().is_end_stream();
+    let forbids_body = matches!(
+        response.status(),
+        StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+    );
+
+    let telemetry_hook = telemetry
+        .zip(telemetry_delivery)
+        .map(|(observation, mut delivery)| {
+            observation.headers(response.status().as_u16(), streaming);
+            delivery.complete = empty_body;
+            TelemetryHook {
+                observation,
+                delivery,
+            }
+        });
+    let session_log_hook = session_log
+        .zip(session_guard)
+        .map(|(observation, mut guard)| {
+            observation.headers(response.status().as_u16(), streaming);
+            guard.1 = forbids_body || empty_body;
+            SessionLogHook {
+                observation,
+                guard,
+                streaming,
+            }
+        });
+    let collected = ResponseHooksState {
+        telemetry: telemetry_hook,
+        session_log: session_log_hook,
+        remaining: length,
+    };
+    if let Some(hooks) = hooks {
+        *hooks.inner.lock() = collected;
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        ObservedStream::into_body(body, state.process.track_response(), collected),
+    )
 }
 
 pub(super) fn metric_endpoint(path: &str) -> &'static str {

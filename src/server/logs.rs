@@ -1,5 +1,5 @@
-use super::AppState;
-use crate::time::unix_millis;
+use std::sync::Arc;
+
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -7,7 +7,10 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::sync::Arc;
+
+use crate::time::unix_millis;
+
+use super::{AppState, admin::AdminError};
 
 #[derive(Default, Deserialize)]
 pub(super) struct Filter {
@@ -22,13 +25,13 @@ fn since(filter: &Filter) -> u64 {
         .since
         .unwrap_or_else(|| unix_millis().saturating_sub(7 * 86_400_000))
 }
-fn failure(error: &anyhow::Error) -> (StatusCode, Json<Value>) {
-    tracing::warn!(error=%error,"session log query failed");
-    (
+
+fn unavailable(error: &anyhow::Error) -> AdminError {
+    tracing::warn!(error = %error, "session log query failed");
+    AdminError::new(
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(
-            json!({"error":{"code":"logs_unavailable","message":"Session logs are unavailable or the query exceeded its limits"}}),
-        ),
+        "logs_unavailable",
+        "Session logs are unavailable or the query exceeded its limits",
     )
 }
 
@@ -41,7 +44,7 @@ pub(super) async fn status(
 pub(super) async fn requests(
     State(state): State<Arc<AppState>>,
     Query(filter): Query<Filter>,
-) -> Result<Json<crate::session_log::RequestPage>, (StatusCode, Json<Value>)> {
+) -> Result<Json<crate::session_log::RequestPage>, AdminError> {
     if filter.cursor.as_ref().is_some_and(|s| {
         s.len() > 180
             || !s.split_once(':').is_some_and(|(time, id)| {
@@ -49,9 +52,9 @@ pub(super) async fn requests(
             })
     }) || filter.session.as_ref().is_some_and(|s| s.len() > 128)
     {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":{"code":"invalid_filter","message":"Invalid log filter"}})),
+        return Err(AdminError::bad_request(
+            "invalid_filter",
+            "Invalid log filter",
         ));
     }
     let from = since(&filter);
@@ -65,41 +68,33 @@ pub(super) async fn requests(
         )
         .await
         .map(Json)
-        .map_err(|e| failure(&e))
+        .map_err(|error| unavailable(&error))
 }
 
 pub(super) async fn request(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<crate::session_log::RequestDetail>, (StatusCode, Json<Value>)> {
+) -> Result<Json<crate::session_log::RequestDetail>, AdminError> {
     if uuid::Uuid::parse_str(&id).is_err() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":{"code":"invalid_id","message":"Invalid request ID"}})),
-        ));
+        return Err(AdminError::bad_request("invalid_id", "Invalid request ID"));
     }
     state
         .session_log
         .detail(id)
         .await
-        .map_err(|e| failure(&e))?
+        .map_err(|error| unavailable(&error))?
         .map(Json)
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error":{"code":"log_not_found","message":"Request log not found"}})),
-            )
-        })
+        .ok_or_else(|| AdminError::not_found("log_not_found", "Request log not found"))
 }
 
 pub(super) async fn sessions(
     State(state): State<Arc<AppState>>,
     Query(filter): Query<Filter>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, AdminError> {
     state
         .session_log
         .sessions(since(&filter))
         .await
-        .map(|sessions| Json(json!({"sessions":sessions})))
-        .map_err(|e| failure(&e))
+        .map(|sessions| Json(json!({"sessions": sessions})))
+        .map_err(|error| unavailable(&error))
 }

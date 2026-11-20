@@ -1,4 +1,6 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+mod common;
+
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -7,44 +9,21 @@ use axum::{
     response::IntoResponse,
     routing::post,
 };
-use estuary::{Gateway, Settings, config::NodeConfig};
+use common::{TestServer as Server, node_config, test_client_with_timeout, wait_until};
+use estuary::{Gateway, Settings};
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
+use tokio::sync::Notify;
 
-struct Server {
-    url: String,
-    task: JoinHandle<()>,
-}
-impl Server {
-    async fn spawn(router: Router) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        Self { url, task }
-    }
-}
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap()
+    test_client_with_timeout(Duration::from_secs(5))
 }
 async fn gateway(upstream: &Server) -> (Server, Server) {
     let mut settings = Settings {
-        nodes: vec![NodeConfig {
-            id: "node".into(),
-            base_url: format!("{}/v1", upstream.url),
-            models: HashMap::from([("public".into(), "upstream".into())]),
-            ..NodeConfig::default()
-        }],
+        nodes: vec![node_config(
+            "node",
+            &upstream.base_url,
+            [("public", "upstream")],
+        )],
         ..Settings::default()
     };
     settings.health.route_while_starting = true;
@@ -56,7 +35,7 @@ async fn gateway(upstream: &Server) -> (Server, Server) {
 }
 async fn snapshot(admin: &Server) -> Value {
     client()
-        .get(format!("{}/admin/api/observability", admin.url))
+        .get(admin.url("/admin/api/observability"))
         .send()
         .await
         .unwrap()
@@ -65,8 +44,12 @@ async fn snapshot(admin: &Server) -> Value {
         .unwrap()
 }
 async fn send_request(public: &Server, streaming: bool) -> reqwest::Response {
-    client().post(format!("{}/v1/chat/completions", public.url))
-        .json(&json!({"model":"public","stream":streaming,"messages":[{"role":"user","content":"hi"}]})).send().await.unwrap()
+    client()
+        .post(public.url("/v1/chat/completions"))
+        .json(&json!({"model":"public","stream":streaming,"messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -88,10 +71,7 @@ async fn buffered_usage_model_filters_and_metrics_work_with_logging_disabled() {
     assert_eq!(all["fleet"]["latency"]["duration"]["samples"], 1);
     assert_eq!(all["fleet"]["window"]["tpot_reported"], 1);
     let filtered: Value = client()
-        .get(format!(
-            "{}/admin/api/observability?scope=model&id=public&window=60",
-            admin.url
-        ))
+        .get(admin.url("/admin/api/observability?scope=model&id=public&window=60"))
         .send()
         .await
         .unwrap()
@@ -101,13 +81,13 @@ async fn buffered_usage_model_filters_and_metrics_work_with_logging_disabled() {
     assert_eq!(filtered["selected"]["total"]["success"], 1);
     assert_eq!(filtered["window_seconds"], 60);
     let invalid = client()
-        .get(format!("{}/admin/api/observability?window=42", admin.url))
+        .get(admin.url("/admin/api/observability?window=42"))
         .send()
         .await
         .unwrap();
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     let metrics = client()
-        .get(format!("{}/metrics", admin.url))
+        .get(admin.url("/metrics"))
         .send()
         .await
         .unwrap()
@@ -116,6 +96,11 @@ async fn buffered_usage_model_filters_and_metrics_work_with_logging_disabled() {
         .unwrap();
     assert!(metrics.contains("estuary_gateway_success_total{scope=\"fleet\",name=\"\"} 1"));
     assert_eq!(metrics.matches("# EOF").count(), 1);
+    let mut seen_types = std::collections::HashSet::new();
+    for line in metrics.lines().filter(|line| line.starts_with("# TYPE ")) {
+        let family = line.split_whitespace().nth(2).unwrap();
+        assert!(seen_types.insert(family), "duplicate # TYPE for {family}");
+    }
 }
 
 #[tokio::test]
@@ -168,17 +153,10 @@ async fn active_stream_is_finalized_at_body_end_and_client_cancellation() {
     assert_eq!(active["fleet"]["total"]["success"], 0);
     assert_eq!(active["fleet"]["pressure"]["active"], 1);
     drop(response);
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let data = snapshot(&admin).await;
-            if data["fleet"]["total"]["cancelled"] == 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    wait_until(Duration::from_secs(3), || async {
+        snapshot(&admin).await["fleet"]["total"]["cancelled"] == 1
     })
-    .await
-    .unwrap();
+    .await;
     release.notify_waiters();
 }
 
@@ -219,7 +197,7 @@ async fn observability_requires_the_existing_admin_authentication() {
     let mut settings = Settings::default();
     settings.server.admin_token = Some("test-admin".into());
     let admin = Server::spawn(Gateway::build(settings).unwrap().admin_router()).await;
-    let url = format!("{}/admin/api/observability", admin.url);
+    let url = admin.url("/admin/api/observability");
     assert_eq!(
         client().get(&url).send().await.unwrap().status(),
         StatusCode::UNAUTHORIZED

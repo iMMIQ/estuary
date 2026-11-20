@@ -1,9 +1,9 @@
 import { Alert, Badge, Button, Group, Select, Table } from "@mantine/core";
 import { ArrowLeft, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
-import { useTranslation } from "react-i18next";
 import * as api from "./api";
-import type { LogDetail, LogPage, LogSession, LogStatus } from "./session-log-types";
+import type { LogStatus, RequestDetail, RequestPage, SessionSummary } from "./generated/config";
+import { useTranslation } from "./i18n";
 import { HelpTip } from "./ui";
 
 function tokens(usage: unknown, key: string): string | number {
@@ -33,8 +33,8 @@ function TimingGrid({ timings }: { timings: Record<string, number> }) {
 export function SessionLogs() {
   const { t } = useTranslation();
   const [status, setStatus] = useState<LogStatus | null>(null);
-  const [page, setPage] = useState<LogPage>({ requests: [], next_cursor: null });
-  const [sessions, setSessions] = useState<LogSession[]>([]);
+  const [page, setPage] = useState<RequestPage>({ requests: [], next_cursor: null });
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [session, setSession] = useState<string | null>(null);
   const [cursor, setCursor] = useState<string | null>(null);
   const [days, setDays] = useState("7");
@@ -44,7 +44,7 @@ export function SessionLogs() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
-  const [detail, setDetail] = useState<LogDetail | null>(null);
+  const [detail, setDetail] = useState<RequestDetail | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
 
   useEffect(() => {

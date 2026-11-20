@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -7,6 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[derive(Debug)]
 pub(super) struct Capacity {
     semaphore: Arc<Semaphore>,
+    limit: AtomicUsize,
     state: Mutex<State>,
 }
 
@@ -21,12 +25,13 @@ impl Capacity {
     pub(super) fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self {
             semaphore: Arc::new(Semaphore::new(limit)),
+            limit: AtomicUsize::new(limit),
             state: Mutex::new(State { limit, debt: 0 }),
         })
     }
 
     pub(super) fn limit(&self) -> usize {
-        self.state.lock().limit
+        self.limit.load(Ordering::Acquire)
     }
 
     pub(super) fn available(&self) -> usize {
@@ -46,6 +51,7 @@ impl Capacity {
             state.debt += decrease - removed;
         }
         state.limit = limit;
+        self.limit.store(limit, Ordering::Release);
     }
 
     pub(super) fn try_acquire(self: &Arc<Self>) -> Option<CapacityPermit> {

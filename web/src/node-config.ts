@@ -1,5 +1,5 @@
-import { configDefaults as defaults } from "./config-contract";
 import { validateNodeConfig } from "./config-validation";
+import { configDefaults as defaults } from "./generated/config";
 import type {
   ModelCapabilityConfig,
   NodeConfig,
@@ -17,11 +17,6 @@ export function pairsToRecord(pairs: Pair[]): Record<string, string> {
       .map(({ key, value }) => [key.trim(), value.trim()])
       .filter(([key, value]) => key.length > 0 && value.length > 0),
   );
-}
-
-export function recordToPairs(record: Record<string, string>): Pair[] {
-  const pairs = Object.entries(record).map(([key, value]) => ({ key, value }));
-  return pairs.length > 0 ? pairs : [{ key: "", value: "" }];
 }
 
 export function effectiveCapability(config: NodeConfig, model: string): ModelCapabilityConfig {
@@ -65,7 +60,6 @@ export function createDraft(kind: ProviderKind = "vllm"): NodeDraft {
     api_key: "",
     preserve_api_key: false,
     models: [{ key: "", value: "" }],
-    headers_from_env: [{ key: "", value: "" }],
     provider: { ...structuredClone(defaults.editor.provider), type: kind },
   };
 }
@@ -88,7 +82,6 @@ export function recordToDraft(node: NodeRecord): NodeDraft {
         ),
       ),
     ),
-    headers_from_env: recordToPairs(node.config.headers_from_env),
   };
 }
 
@@ -123,7 +116,6 @@ export function draftToConfig(draft: NodeDraft): NodeConfig {
           .filter(([key]) => key.length > 0),
       ),
     },
-    headers_from_env: pairsToRecord(draft.headers_from_env),
     provider: {
       ...draft.provider,
       kv_events: draft.provider.type === "vllm" ? draft.provider.kv_events : null,
@@ -154,10 +146,6 @@ export function validateDraft(draft: NodeDraft): DraftErrors {
   }
   const modelKeys = completeModels.map((row) => row.key.trim());
   if (new Set(modelKeys).size !== modelKeys.length) errors.models = "validation.modelUnique";
-
-  if (draft.headers_from_env.some((row) => Boolean(row.key.trim()) !== Boolean(row.value.trim()))) {
-    errors.headers_from_env = "validation.headerIncomplete";
-  }
 
   return errors;
 }

@@ -1,9 +1,13 @@
-import type { TFunction } from "i18next";
-import { useTranslation } from "react-i18next";
+import { type TranslateFn, useTranslation } from "./i18n";
 import { metricNumber } from "./metric-series";
 import type { NodeRecord } from "./types";
 
-export function relativeSync(value: number | null, t: TFunction): string {
+export const isDraining = (node: NodeRecord) => node.runtime.lifecycle === "draining";
+export const isNotReady = (node: NodeRecord) => !node.admission.routable && !isDraining(node);
+export const needsAttention = (node: NodeRecord) =>
+  !node.admission.accepting_assignments && node.admission.state !== "at_capacity";
+
+export function relativeSync(value: number | null, t: TranslateFn): string {
   if (!value) return t("sync.never");
   const seconds = Math.max(0, Math.floor((Date.now() - value) / 1000));
   if (seconds < 5) return t("sync.now");
@@ -50,6 +54,10 @@ export function summarizeVllm(nodes: NodeRecord[]) {
   };
 }
 
+function ratioPercent(value: number | null, total: number | null): number {
+  return total !== null && value !== null && total > 0 ? Math.min(100, (value / total) * 100) : 0;
+}
+
 export function UsageRow({
   label,
   value,
@@ -65,10 +73,8 @@ export function UsageRow({
   totalDisplay?: string;
   tone?: "blue" | "green" | "amber";
 }) {
-  const { i18n } = useTranslation();
-  const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
-  const percent =
-    total !== null && value !== null && total > 0 ? Math.min(100, (value / total) * 100) : 0;
+  const { locale } = useTranslation();
+  const percent = ratioPercent(value, total);
   return (
     <div className="usage-row">
       <div>
@@ -95,15 +101,14 @@ export function ProgressValue({
   total: number;
   tone?: "green" | "amber" | "blue";
 }) {
-  const { i18n } = useTranslation();
-  const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
-  const percent = total > 0 ? Math.min(100, (value / total) * 100) : 0;
+  const { locale } = useTranslation();
+  const percent = ratioPercent(value, total);
   return (
     <div className="progress-value">
       <span>
         <strong>{value.toLocaleString(locale)}</strong> / {total.toLocaleString(locale)}
       </span>
-      <div>
+      <div className="usage-track">
         <i className={tone} style={{ width: `${percent}%` }} />
       </div>
       <small>{Math.round(percent)}%</small>

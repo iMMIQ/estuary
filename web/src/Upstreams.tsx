@@ -13,11 +13,17 @@ import {
   Trash2,
 } from "lucide-react";
 import { type ReactNode, useMemo, useState } from "react";
-import { useTranslation } from "react-i18next";
-import { formatRate, ProgressValue, relativeSync } from "./admin-metrics";
-import type { ScopeMetrics } from "./observability-types";
-import type { NodeRecord } from "./types";
-import { formatCompactNumber, formatPercent, StatusBadge } from "./ui";
+import {
+  formatRate,
+  isDraining,
+  isNotReady,
+  needsAttention,
+  ProgressValue,
+  relativeSync,
+} from "./admin-metrics";
+import { useTranslation } from "./i18n";
+import type { NodeRecord, ScopeMetrics } from "./types";
+import { formatCompactNumber, formatMs, formatPercent, StatusBadge } from "./ui";
 export type NodeFilter = "all" | "accepting" | "attention" | "draining" | "not_ready";
 
 export function Upstreams({
@@ -57,8 +63,7 @@ export function Upstreams({
   onDelete: (node: NodeRecord) => void;
   onAdd: () => void;
 }) {
-  const { t, i18n } = useTranslation();
-  const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
+  const { t, locale } = useTranslation();
   const [page, setPage] = useState(1);
   const pageSize = 8;
   const filtered = useMemo(() => {
@@ -76,13 +81,9 @@ export function Upstreams({
         const filterMatch =
           filter === "all" ||
           (filter === "accepting" && node.admission.accepting_assignments) ||
-          (filter === "attention" &&
-            !node.admission.accepting_assignments &&
-            node.admission.state !== "at_capacity") ||
-          (filter === "draining" && node.runtime.lifecycle === "draining") ||
-          (filter === "not_ready" &&
-            !node.admission.routable &&
-            node.runtime.lifecycle !== "draining");
+          (filter === "attention" && needsAttention(node)) ||
+          (filter === "draining" && isDraining(node)) ||
+          (filter === "not_ready" && isNotReady(node));
         return textMatch && filterMatch;
       })
       .sort((left, right) => left.config.id.localeCompare(right.config.id));
@@ -93,13 +94,9 @@ export function Upstreams({
   const counts = {
     all: nodes.length,
     accepting: nodes.filter((node) => node.admission.accepting_assignments).length,
-    attention: nodes.filter(
-      (node) => !node.admission.accepting_assignments && node.admission.state !== "at_capacity",
-    ).length,
-    draining: nodes.filter((node) => node.runtime.lifecycle === "draining").length,
-    not_ready: nodes.filter(
-      (node) => !node.admission.routable && node.runtime.lifecycle !== "draining",
-    ).length,
+    attention: nodes.filter(needsAttention).length,
+    draining: nodes.filter(isDraining).length,
+    not_ready: nodes.filter(isNotReady).length,
   };
 
   const changeFilter = (value: NodeFilter) => {
@@ -295,9 +292,11 @@ export function Upstreams({
                       </td>
                       <td data-label={t("upstreams.ttft")} title={t("metrics.nodeTtft")}>
                         <strong>
-                          {measured?.latency.ttft.p95 == null
-                            ? "—"
-                            : `${Math.round(measured.latency.ttft.p95 * 1000)} ms`}
+                          {formatMs(
+                            measured?.latency.ttft.p95 == null
+                              ? null
+                              : measured.latency.ttft.p95 * 1000,
+                          )}
                         </strong>
                       </td>
                       <td

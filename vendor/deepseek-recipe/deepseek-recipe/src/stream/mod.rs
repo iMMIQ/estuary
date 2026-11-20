@@ -1,67 +1,51 @@
-//! Parse model output and turn it into protocol response chunks.
+//! Parsed model output chunks and protocol response chunk generators.
 
 use std::sync::Arc;
 
-pub use decoder::StreamTokenizer;
+use deepseek_recipe_core::special_tokens::{SpecialTokens, default_special_tokens};
+
 pub use inference::{
     CompletionUsage, FinishReason, InferenceChunk, InferenceFinishReason, PromptUsage,
 };
 pub use logprobs::{InferenceTokenLogprob, TokenLogprob, TopLogprob};
-pub use output_parser::{ParsingOptions, ThinkingInitialStage};
-pub use processor::StreamProcessor;
 
-mod decoder;
 mod inference;
 mod logprobs;
-mod output_parser;
-mod processor;
 
-/// An error that ends stream processing before normal completion.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StreamError {
-    /// A `Token` or `Tokens` chunk arrived without an attached tokenizer.
-    MissingTokenizer,
-    /// The tokenizer failed to decode buffered token IDs.
-    Decode {
-        /// The tokenizer's failure message.
-        detail: String,
-    },
-    /// A `Tokens` chunk carried a log probability count that differs from its
-    /// token ID count.
-    LogprobCountMismatch {
-        /// Both counts.
-        detail: String,
-    },
+/// The stage where parsing begins in thinking mode.
+#[derive(Debug, Clone, Copy)]
+pub enum ThinkingInitialStage {
+    ReasoningStart,
+    ReasoningContinuation,
+    ContentContinuation,
 }
 
-impl std::fmt::Display for StreamError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingTokenizer => {
-                formatter.write_str("token chunk received without a tokenizer")
-            }
-            Self::Decode { detail } => write!(formatter, "failed to decode token IDs: {detail}"),
-            Self::LogprobCountMismatch { detail } => {
-                write!(formatter, "invalid log probabilities: {detail}")
-            }
+/// Settings for parsing inference output derived during request conversion.
+#[derive(Debug, Clone)]
+pub struct ParsingOptions {
+    pub parse_tool_calls: bool,
+    pub starts_in_tool_calls: bool,
+    pub parse_json_output: bool,
+    pub thinking_initial_stage: Option<ThinkingInitialStage>,
+    pub stop_sequences: Vec<String>,
+    pub special_tokens: Arc<dyn SpecialTokens>,
+}
+
+impl Default for ParsingOptions {
+    fn default() -> Self {
+        Self {
+            parse_tool_calls: true,
+            starts_in_tool_calls: false,
+            parse_json_output: false,
+            thinking_initial_stage: None,
+            stop_sequences: Vec::new(),
+            special_tokens: default_special_tokens(),
         }
     }
 }
 
-impl std::error::Error for StreamError {}
-
 /// A parsed piece of model output, before conversion into protocol response
 /// chunks.
-///
-/// Unless the stream ends with a [`StreamError`], [`StreamProcessor`] produces
-/// `Start` first and `Finish` last, each exactly once. A tool call produces
-/// `ToolCallBegin`, then `ToolCallNamed`, then zero or more
-/// `ToolCallArgumentsDelta` chunks; output truncated inside a tool call ends
-/// that sequence early.
-///
-/// `logprobs` holds the log probabilities of the tokens of the decoded text the
-/// content comes from. Content split from one decoded text carries the log
-/// probabilities of the whole text.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputChunk {
     /// Output begins.
@@ -96,9 +80,6 @@ pub enum OutputChunk {
 }
 
 /// Convert parsed output chunks into a protocol's response chunks.
-///
-/// An implementation can rely on the chunk order that [`OutputChunk`]
-/// describes.
 pub trait ChunkGenerator: Send + 'static {
     /// The protocol's response chunk, such as an SSE event.
     type Chunk;

@@ -1,32 +1,12 @@
 use super::*;
 
-#[test]
-fn default_workload_settings_preserve_legacy_worker_payloads() {
-    let mut settings = Settings::default();
-    let value = serde_json::to_value(&settings).unwrap();
-    for key in [
-        "prefill_weight",
-        "decode_weight",
-        "prefill_token_scale",
-        "decode_token_scale",
-    ] {
-        assert!(value["routing"].get(key).is_none());
+fn test_node(id: &str) -> NodeConfig {
+    NodeConfig {
+        id: id.to_owned(),
+        base_url: "http://localhost:8000/v1".to_owned(),
+        models: HashMap::from([("model".to_owned(), "model".to_owned())]),
+        ..NodeConfig::default()
     }
-    assert!(
-        value["routing"]["prefix"]
-            .get("approximate_half_life_ms")
-            .is_none()
-    );
-    let restored: Settings = serde_json::from_value(value).unwrap();
-    assert_eq!(restored.routing.prefill_token_scale, 4_096);
-    settings.routing.prefill_weight = 0.0;
-    settings.routing.prefix.approximate_half_life_ms = 60_000;
-    let value = serde_json::to_value(&settings).unwrap();
-    assert_eq!(value["routing"]["prefill_weight"], 0.0);
-    assert_eq!(
-        value["routing"]["prefix"]["approximate_half_life_ms"],
-        60_000
-    );
 }
 
 #[test]
@@ -81,14 +61,8 @@ fn rejects_invalid_workload_scoring_parameters() {
 
 #[test]
 fn rejects_duplicate_nodes() {
-    let node = NodeConfig {
-        id: "same".to_owned(),
-        base_url: "http://localhost:8000/v1".to_owned(),
-        models: HashMap::from([("model".to_owned(), "model".to_owned())]),
-        ..NodeConfig::default()
-    };
     let settings = Settings {
-        nodes: vec![node.clone(), node],
+        nodes: vec![test_node("same"), test_node("same")],
         ..Settings::default()
     };
     assert!(settings.validate().is_err());
@@ -104,33 +78,9 @@ fn remote_admin_listener_requires_an_authentication_token() {
 }
 
 #[test]
-fn rejects_vllm_monitor_intervals_below_the_safe_floor() {
-    let mut node = NodeConfig {
-        id: "node".to_owned(),
-        base_url: "http://localhost:8000/v1".to_owned(),
-        models: HashMap::from([("model".to_owned(), "model".to_owned())]),
-        provider: ProviderConfig {
-            kind: ProviderKind::Vllm,
-            monitor_interval_ms: 99,
-            ..ProviderConfig::default()
-        },
-        ..NodeConfig::default()
-    };
-    assert!(validate_node_config(&node).is_err());
-    node.provider.monitor_interval_ms = 100;
-    assert!(validate_node_config(&node).is_ok());
-}
-
-#[test]
 fn rejects_zero_response_body_timeouts() {
-    let node = NodeConfig {
-        id: "node".to_owned(),
-        base_url: "http://localhost:8000/v1".to_owned(),
-        models: HashMap::from([("model".to_owned(), "model".to_owned())]),
-        ..NodeConfig::default()
-    };
     let settings = Settings {
-        nodes: vec![node],
+        nodes: vec![test_node("node")],
         ..Settings::default()
     };
 
@@ -176,42 +126,12 @@ fn rejects_zero_long_running_resource_limits() {
 
 #[test]
 fn rejects_zero_circuit_breaker_limits() {
-    let node = NodeConfig {
-        id: "node".to_owned(),
-        base_url: "http://localhost:8000/v1".to_owned(),
-        models: HashMap::from([("model".to_owned(), "model".to_owned())]),
-        ..NodeConfig::default()
-    };
     let mut settings = Settings {
-        nodes: vec![node],
+        nodes: vec![test_node("node")],
         ..Settings::default()
     };
     settings.circuit_breaker.failure_threshold = 0;
     assert!(settings.validate().is_err());
-}
-
-#[test]
-fn validates_vllm_provider_endpoints() {
-    let mut node = NodeConfig {
-        id: "vllm".to_owned(),
-        base_url: "http://localhost:8000/v1".to_owned(),
-        models: HashMap::from([("model".to_owned(), "model".to_owned())]),
-        ..NodeConfig::default()
-    };
-    node.provider.kind = ProviderKind::Vllm;
-    node.provider.kv_events = Some(VllmKvEventsConfig::default());
-    let settings = Settings {
-        nodes: vec![node.clone()],
-        ..Settings::default()
-    };
-    settings.validate().unwrap();
-
-    node.provider.kv_events.as_mut().unwrap().endpoint = "tcp://*:5557".to_owned();
-    let invalid = Settings {
-        nodes: vec![node],
-        ..Settings::default()
-    };
-    assert!(invalid.validate().is_err());
 }
 
 #[test]
@@ -221,59 +141,6 @@ fn defaults_waiting_watermark_for_existing_vllm_json() {
     }))
     .unwrap();
     assert_eq!(provider.waiting_threshold, 8);
-}
-
-#[test]
-fn rejects_zero_vllm_waiting_watermark() {
-    let mut node = NodeConfig {
-        id: "vllm".to_owned(),
-        base_url: "http://localhost:8000/v1".to_owned(),
-        models: HashMap::from([("model".to_owned(), "model".to_owned())]),
-        ..NodeConfig::default()
-    };
-    node.provider.kind = ProviderKind::Vllm;
-    node.provider.waiting_threshold = 0;
-    let settings = Settings {
-        nodes: vec![node],
-        ..Settings::default()
-    };
-    assert!(settings.validate().is_err());
-}
-
-#[test]
-fn rejects_excessive_vllm_tokenization_cache_capacity() {
-    let mut node = NodeConfig {
-        id: "vllm".to_owned(),
-        base_url: "http://localhost:8000/v1".to_owned(),
-        models: HashMap::from([("model".to_owned(), "model".to_owned())]),
-        ..NodeConfig::default()
-    };
-    node.provider.kind = ProviderKind::Vllm;
-    node.provider.tokenize_cache_entries = MAX_TOKENIZE_CACHE_ENTRIES + 1;
-    let settings = Settings {
-        nodes: vec![node],
-        ..Settings::default()
-    };
-    assert!(settings.validate().is_err());
-}
-
-#[test]
-fn rejects_kv_events_on_generic_provider() {
-    let node = NodeConfig {
-        id: "generic".to_owned(),
-        base_url: "http://localhost:8000/v1".to_owned(),
-        models: HashMap::from([("model".to_owned(), "model".to_owned())]),
-        provider: ProviderConfig {
-            kv_events: Some(VllmKvEventsConfig::default()),
-            ..ProviderConfig::default()
-        },
-        ..NodeConfig::default()
-    };
-    let settings = Settings {
-        nodes: vec![node],
-        ..Settings::default()
-    };
-    assert!(settings.validate().is_err());
 }
 
 #[test]

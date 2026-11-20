@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useTranslation } from "react-i18next";
 import * as api from "./api";
-import type { Observability } from "./observability-types";
-import type { GatewayStatus, NodeRecord } from "./types";
+import { useTranslation } from "./i18n";
+import type { GatewayStatus, NodeRecord, Observability } from "./types";
 
 export function useControlPlane(metricsQuery = "scope=fleet&window=300") {
   const { t } = useTranslation();

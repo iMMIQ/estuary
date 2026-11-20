@@ -1,179 +1,93 @@
 use std::{
-    fmt, io,
-    pin::Pin,
+    io,
     sync::Arc,
-    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use axum::{
     body::Body,
-    http::{
-        HeaderName, HeaderValue,
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
-    },
     response::{IntoResponse, Response, Sse},
 };
 use bytes::Bytes;
-use eventsource_stream::Eventsource;
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::{
-    anthropic, chat_bridge,
-    error::GatewayError,
-    metrics::Metrics,
-    node::{Node, NodeLease},
-    prefix::PrefixInput,
-    sse,
+    anthropic, chat_bridge, error::GatewayError, metrics::Metrics, node::NodeLease,
+    observability::Outcome, prefix::PrefixInput, server::AppState, sse, time::micros,
 };
 
-use super::headers::copy_response_headers;
+use super::headers::apply_upstream_response_headers;
 use super::{MAX_SSE_EVENT_BYTES, UpstreamResponseMode};
 
-pub(super) enum StreamingInput {
-    Raw(Bytes),
-    Event(sse::Event),
-}
-
-pub(super) enum StreamingOutput {
+enum StreamingOutput {
     Raw(Bytes),
     Events(Vec<sse::Event>),
 }
 
-pub(super) struct LimitedSseInput<S> {
-    pub(super) inner: Pin<Box<S>>,
-    pub(super) event_bytes: usize,
-    pub(super) line_has_data: bool,
-    pub(super) after_cr: bool,
-    pub(super) max_event_bytes: usize,
+pub(super) struct StreamingContext {
+    pub(super) state: Arc<AppState>,
+    pub(super) lease: NodeLease,
+    pub(super) prefix_input: PrefixInput,
+    pub(super) header_latency: Duration,
+    pub(super) upstream_started: Instant,
+    pub(super) response_mode: UpstreamResponseMode,
+    pub(super) public_model: String,
+    pub(super) record_prefix: bool,
+    pub(super) log_attempt: Option<crate::session_log::AttemptGuard>,
 }
 
-impl<S> LimitedSseInput<S> {
-    pub(super) fn new(inner: S, max_event_bytes: usize) -> Self {
-        Self {
-            inner: Box::pin(inner),
-            event_bytes: 0,
-            line_has_data: false,
-            after_cr: false,
-            max_event_bytes,
-        }
-    }
-
-    fn inspect(&mut self, bytes: &[u8]) -> bool {
-        for byte in bytes {
-            self.event_bytes = self.event_bytes.saturating_add(1);
-            if self.event_bytes > self.max_event_bytes {
-                return false;
-            }
-            match *byte {
-                b'\r' => {
-                    if !self.line_has_data {
-                        self.event_bytes = 0;
-                    }
-                    self.line_has_data = false;
-                    self.after_cr = true;
-                }
-                b'\n' if self.after_cr => {
-                    self.after_cr = false;
-                }
-                b'\n' => {
-                    if !self.line_has_data {
-                        self.event_bytes = 0;
-                    }
-                    self.line_has_data = false;
-                }
-                _ => {
-                    self.line_has_data = true;
-                    self.after_cr = false;
-                }
-            }
-        }
-        true
-    }
+enum BridgeChunk {
+    Done,
+    Json(Value),
 }
 
-#[derive(Debug)]
-pub(super) enum SseInputError<E> {
-    Transport(E),
-    EventTooLarge,
-}
-
-impl<E: fmt::Display> fmt::Display for SseInputError<E> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Transport(error) => error.fmt(formatter),
-            Self::EventTooLarge => formatter.write_str("upstream SSE event exceeded 16 MiB"),
-        }
-    }
-}
-
-impl<S, B, E> Stream for LimitedSseInput<S>
-where
-    S: Stream<Item = Result<B, E>>,
-    B: AsRef<[u8]>,
-{
-    type Item = Result<B, SseInputError<E>>;
-
-    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        match this.inner.as_mut().poll_next(context) {
-            Poll::Ready(Some(Ok(bytes))) if this.inspect(bytes.as_ref()) => {
-                Poll::Ready(Some(Ok(bytes)))
-            }
-            Poll::Ready(Some(Ok(_))) => Poll::Ready(Some(Err(SseInputError::EventTooLarge))),
-            Poll::Ready(Some(Err(error))) => {
-                Poll::Ready(Some(Err(SseInputError::Transport(error))))
-            }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(super) fn streaming_response(
-    upstream: reqwest::Response,
-    lease: NodeLease,
-    node: &Node,
-    metrics: Arc<Metrics>,
-    prefix_directory: Arc<crate::prefix::PrefixDirectory>,
-    prefix_input: PrefixInput,
-    health_config: crate::config::HealthConfig,
-    header_latency: Duration,
-    upstream_started: Instant,
-    stream_idle_timeout: Duration,
-    upstream_body_timeout: Duration,
-    downstream_stall_timeout: Duration,
-    expose_node_header: bool,
-    response_mode: UpstreamResponseMode,
-    public_model: String,
-    record_prefix: bool,
-    log_attempt: Option<crate::session_log::AttemptGuard>,
-) -> Response {
+#[allow(clippy::too_many_lines)]
+pub(super) fn streaming_response(upstream: reqwest::Response, ctx: StreamingContext) -> Response {
     let raw_length = upstream.content_length();
     let status = upstream.status();
     let headers = upstream.headers().clone();
-    let upstream_request_id = headers.get("x-request-id").cloned();
-    let node_id = node.id().to_owned();
-    let stream_node_id = node_id.clone();
-    let stream_node = Arc::clone(lease.node());
-    let (sender, mut receiver) = mpsc::channel::<StreamingOutput>(1);
+    let node_id = ctx.lease.node().id().to_owned();
+    let stream_node = Arc::clone(ctx.lease.node());
+    let (sender, receiver) = mpsc::channel::<StreamingOutput>(1);
     let terminal_failure = Arc::new(parking_lot::Mutex::new(None));
     let pump_failure = Arc::clone(&terminal_failure);
-    let is_anthropic = response_mode.is_anthropic();
-    let rewrites_body = response_mode.rewrites_body();
+    let is_anthropic = ctx.response_mode.is_anthropic();
+    let rewrites_body = ctx.response_mode.rewrites_body();
+    let expose_node_header = ctx.state.settings.server.expose_node_header;
+
+    let mut response = Response::new(build_downstream_body(
+        receiver,
+        Arc::clone(&terminal_failure),
+        rewrites_body,
+        is_anthropic,
+    ));
+    apply_upstream_response_headers(
+        &mut response,
+        status,
+        &headers,
+        &node_id,
+        expose_node_header,
+        &ctx.response_mode,
+        true,
+    );
 
     tokio::spawn(async move {
+        let state = ctx.state;
+        let settings = &state.settings;
+        let stream_idle_timeout = Duration::from_millis(settings.server.stream_idle_timeout_ms);
+        let upstream_body_timeout = Duration::from_millis(settings.server.upstream_body_timeout_ms);
+        let downstream_stall_timeout =
+            Duration::from_millis(settings.server.downstream_stall_timeout_ms);
         let mut guard = BodyGuard::new(
-            lease,
-            Arc::clone(&metrics),
-            stream_node_id.clone(),
-            header_latency,
-            upstream_started,
+            ctx.lease,
+            Arc::clone(&state.metrics),
+            node_id,
+            ctx.header_latency,
+            ctx.upstream_started,
+            ctx.log_attempt,
         );
-        guard.log_attempt = log_attempt;
-        let needs_keepalive = is_anthropic;
         let keepalive_period = Duration::from_secs(10);
         let mut keepalive = tokio::time::interval_at(
             tokio::time::Instant::now() + keepalive_period,
@@ -184,33 +98,15 @@ pub(super) fn streaming_response(
         let mut raw_bytes_seen = 0u64;
         let body_deadline = tokio::time::Instant::now() + upstream_body_timeout;
         let mut idle_deadline = tokio::time::Instant::now() + stream_idle_timeout;
-        let mut stream_adapter = match response_mode {
+        let mut bridge = match ctx.response_mode {
             UpstreamResponseMode::Passthrough => None,
-            UpstreamResponseMode::ChatBridge { context } => Some(
-                chat_bridge::StreamConverter::new((*context).clone(), public_model),
-            ),
+            UpstreamResponseMode::ChatBridge { context } => Some((
+                sse::SseParser::new(MAX_SSE_EVENT_BYTES),
+                chat_bridge::StreamConverter::new(*context, ctx.public_model),
+            )),
             UpstreamResponseMode::TokenCount => unreachable!("token counting is buffered"),
         };
-        let raw_body = upstream.bytes_stream();
-        let mut body: Pin<Box<dyn Stream<Item = Result<StreamingInput, String>> + Send>> =
-            if stream_adapter.is_some() {
-                Box::pin(
-                    LimitedSseInput::new(raw_body, MAX_SSE_EVENT_BYTES)
-                        .eventsource()
-                        .map(|result| {
-                            result
-                                .map(sse::Event::from_parsed)
-                                .map(StreamingInput::Event)
-                                .map_err(|error| error.to_string())
-                        }),
-                )
-            } else {
-                Box::pin(raw_body.map(|result| {
-                    result
-                        .map(StreamingInput::Raw)
-                        .map_err(|error| error.to_string())
-                }))
-            };
+        let mut raw_body = upstream.bytes_stream();
 
         loop {
             let downstream_wait_started = Instant::now();
@@ -220,7 +116,7 @@ pub(super) fn streaming_response(
                 () = tokio::time::sleep_until(body_deadline) => {
                     fail_response_stream(
                         &pump_failure,
-                        &health_config,
+                        &settings.health,
                         &mut guard,
                         StreamFailure::timed_out("upstream response body total timeout"),
                     );
@@ -249,8 +145,7 @@ pub(super) fn streaming_response(
                     *attempt
                         .timings_us
                         .entry("downstream_blocked".to_owned())
-                        .or_default() +=
-                        crate::session_log::micros(downstream_wait_started.elapsed());
+                        .or_default() += micros(downstream_wait_started.elapsed());
                 });
             }
             let item = tokio::select! {
@@ -259,63 +154,60 @@ pub(super) fn streaming_response(
                 () = tokio::time::sleep_until(body_deadline) => {
                     fail_response_stream(
                         &pump_failure,
-                        &health_config,
+                        &settings.health,
                         &mut guard,
                         StreamFailure::timed_out("upstream response body total timeout"),
                     );
                     return;
                 }
                 () = tokio::time::sleep_until(idle_deadline) => {
-                        fail_response_stream(
-                            &pump_failure,
-                            &health_config,
-                            &mut guard,
-                            StreamFailure::timed_out(
-                                "upstream response body idle timeout",
-                            ),
-                        );
-                        return;
+                    fail_response_stream(
+                        &pump_failure,
+                        &settings.health,
+                        &mut guard,
+                        StreamFailure::timed_out("upstream response body idle timeout"),
+                    );
+                    return;
                 },
-                _ = keepalive.tick(), if needs_keepalive => {
+                _ = keepalive.tick(), if is_anthropic => {
                     permit.send(StreamingOutput::Events(vec![anthropic::ping_event()]));
                     continue;
                 },
-                item = body.next() => item,
+                item = raw_body.next() => item,
             };
 
             match item {
-                Some(Ok(input)) => {
+                Some(Ok(bytes)) => {
                     idle_deadline = tokio::time::Instant::now() + stream_idle_timeout;
-                    guard.observe(&input);
-                    if let StreamingInput::Raw(bytes) = &input {
+                    guard.capture_raw(&bytes);
+                    let output = if let Some((parser, adapter)) = bridge.as_mut() {
+                        process_bridged_chunk(parser, adapter, &mut guard, &bytes).await
+                    } else {
+                        guard.observe_raw(&bytes);
                         raw_bytes_seen = raw_bytes_seen.saturating_add(bytes.len() as u64);
                         // Hyper may finish a Content-Length response without another
                         // body poll. Classify the last raw chunk before forwarding it.
                         if raw_length == Some(raw_bytes_seen) {
                             guard.completed();
                         }
-                    }
-                    if record_prefix && !indexed && guard.first_token_observed {
-                        prefix_directory.record_for_node(&stream_node, &prefix_input);
+                        Ok(StreamingOutput::Raw(bytes))
+                    };
+                    if ctx.record_prefix && !indexed && guard.first_token_observed {
+                        state
+                            .scheduler
+                            .prefix_directory()
+                            .record_for_node(&stream_node, &ctx.prefix_input);
                         indexed = true;
                     }
-                    let output = match (input, stream_adapter.as_mut()) {
-                        (StreamingInput::Raw(bytes), None) => Ok(StreamingOutput::Raw(bytes)),
-                        (StreamingInput::Event(event), Some(adapter)) => adapter
-                            .push_event(&event)
-                            .await
-                            .map(StreamingOutput::Events),
-                        _ => Err(GatewayError::InvalidUpstreamResponse),
-                    };
                     match output {
                         Ok(StreamingOutput::Events(events)) if events.is_empty() => {}
                         Ok(output) => permit.send(output),
                         Err(error) => {
                             fail_response_stream(
                                 &pump_failure,
-                                &health_config,
+                                &settings.health,
                                 &mut guard,
-                                StreamFailure::upstream(error.to_string()),
+                                StreamFailure::upstream(error),
                             );
                             return;
                         }
@@ -324,14 +216,14 @@ pub(super) fn streaming_response(
                 Some(Err(error)) => {
                     fail_response_stream(
                         &pump_failure,
-                        &health_config,
+                        &settings.health,
                         &mut guard,
-                        StreamFailure::upstream(error),
+                        StreamFailure::upstream(error.to_string()),
                     );
                     return;
                 }
                 None => {
-                    if let Some(adapter) = stream_adapter.as_mut() {
+                    if let Some((_, adapter)) = bridge.as_mut() {
                         match adapter.finish().await {
                             Ok(events) if !events.is_empty() => {
                                 permit.send(StreamingOutput::Events(events));
@@ -340,7 +232,7 @@ pub(super) fn streaming_response(
                             Err(error) => {
                                 fail_response_stream(
                                     &pump_failure,
-                                    &health_config,
+                                    &settings.health,
                                     &mut guard,
                                     StreamFailure::upstream(error.to_string()),
                                 );
@@ -348,8 +240,11 @@ pub(super) fn streaming_response(
                             }
                         }
                     }
-                    if record_prefix && !indexed {
-                        prefix_directory.record_for_node(&stream_node, &prefix_input);
+                    if ctx.record_prefix && !indexed {
+                        state
+                            .scheduler
+                            .prefix_directory()
+                            .record_for_node(&stream_node, &ctx.prefix_input);
                     }
                     guard.completed();
                     return;
@@ -358,7 +253,61 @@ pub(super) fn streaming_response(
         }
     });
 
-    let body = if rewrites_body {
+    response
+}
+
+async fn process_bridged_chunk(
+    parser: &mut sse::SseParser,
+    adapter: &mut chat_bridge::StreamConverter,
+    guard: &mut BodyGuard,
+    bytes: &[u8],
+) -> Result<StreamingOutput, String> {
+    let mut parsed = Vec::new();
+    let mut parse_error: Option<String> = None;
+    parser.push(bytes, |event| {
+        if parse_error.is_some() {
+            return;
+        }
+        match event {
+            Ok(b"[DONE]") => parsed.push(BridgeChunk::Done),
+            Ok(data) => match serde_json::from_slice::<Value>(data) {
+                Ok(value) => parsed.push(BridgeChunk::Json(value)),
+                Err(_) => parse_error = Some(GatewayError::InvalidUpstreamResponse.to_string()),
+            },
+            Err(()) => parse_error = Some("upstream SSE event exceeded 16 MiB".to_owned()),
+        }
+    });
+    if let Some(error) = parse_error {
+        return Err(error);
+    }
+    let mut events = Vec::new();
+    for item in parsed {
+        match item {
+            BridgeChunk::Done => {
+                guard.observe_done();
+                events.extend(adapter.finish().await.map_err(|error| error.to_string())?);
+            }
+            BridgeChunk::Json(value) => {
+                guard.observe_value(&value);
+                events.extend(
+                    adapter
+                        .push_value(&value)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+        }
+    }
+    Ok(StreamingOutput::Events(events))
+}
+
+fn build_downstream_body(
+    mut receiver: mpsc::Receiver<StreamingOutput>,
+    terminal_failure: Arc<parking_lot::Mutex<Option<StreamFailure>>>,
+    rewrites_body: bool,
+    is_anthropic: bool,
+) -> Body {
+    if rewrites_body {
         let stream = async_stream::stream! {
             while let Some(output) = receiver.recv().await {
                 match output {
@@ -398,66 +347,36 @@ pub(super) fn streaming_response(
             }
         };
         Body::from_stream(stream)
-    };
-    let mut response = Response::new(body);
-    *response.status_mut() = status;
-    copy_response_headers(&headers, response.headers_mut());
-    if rewrites_body {
-        response.headers_mut().remove(CONTENT_LENGTH);
     }
-    if is_anthropic {
-        anthropic::set_anthropic_content_type(&mut response, true);
-    }
-    if let Some(value) = upstream_request_id {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static("x-upstream-request-id"), value);
-    }
-    if expose_node_header && let Ok(value) = HeaderValue::from_str(&node_id) {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static("x-gateway-node"), value);
-    }
-    if headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("text/event-stream"))
-    {
-        response.headers_mut().insert(
-            HeaderName::from_static("x-accel-buffering"),
-            HeaderValue::from_static("no"),
-        );
-    }
-    response
 }
 
 #[derive(Debug)]
-pub(super) struct StreamFailure {
-    pub(super) kind: io::ErrorKind,
-    pub(super) message: String,
+struct StreamFailure {
+    kind: io::ErrorKind,
+    message: String,
 }
 
 impl StreamFailure {
-    pub(super) fn timed_out(message: &'static str) -> Self {
+    fn timed_out(message: &'static str) -> Self {
         Self {
             kind: io::ErrorKind::TimedOut,
             message: message.to_owned(),
         }
     }
 
-    pub(super) fn upstream(message: String) -> Self {
+    fn upstream(message: String) -> Self {
         Self {
             kind: io::ErrorKind::Other,
             message,
         }
     }
 
-    pub(super) fn into_io_error(self) -> io::Error {
+    fn into_io_error(self) -> io::Error {
         io::Error::new(self.kind, self.message)
     }
 }
 
-pub(super) fn fail_response_stream(
+fn fail_response_stream(
     terminal_failure: &parking_lot::Mutex<Option<StreamFailure>>,
     health_config: &crate::config::HealthConfig,
     guard: &mut BodyGuard,
@@ -467,25 +386,26 @@ pub(super) fn fail_response_stream(
     *terminal_failure.lock() = Some(failure);
 }
 
-pub(super) struct BodyGuard {
-    pub(super) lease: Option<NodeLease>,
-    pub(super) metrics: Arc<Metrics>,
-    pub(super) node_id: String,
-    pub(super) header_latency: Duration,
-    pub(super) upstream_started: Instant,
-    pub(super) observation: crate::inference_stats::StreamObservation,
-    pub(super) first_token_observed: bool,
-    pub(super) terminal: bool,
-    pub(super) log_attempt: Option<crate::session_log::AttemptGuard>,
+struct BodyGuard {
+    lease: Option<NodeLease>,
+    metrics: Arc<Metrics>,
+    node_id: String,
+    header_latency: Duration,
+    upstream_started: Instant,
+    observation: crate::inference_stats::StreamObservation,
+    first_token_observed: bool,
+    terminal: bool,
+    log_attempt: Option<crate::session_log::AttemptGuard>,
 }
 
 impl BodyGuard {
-    pub(super) fn new(
+    fn new(
         lease: NodeLease,
         metrics: Arc<Metrics>,
         node_id: String,
         header_latency: Duration,
         upstream_started: Instant,
+        log_attempt: Option<crate::session_log::AttemptGuard>,
     ) -> Self {
         Self {
             lease: Some(lease),
@@ -496,11 +416,78 @@ impl BodyGuard {
             observation: crate::inference_stats::StreamObservation::default(),
             first_token_observed: false,
             terminal: false,
-            log_attempt: None,
+            log_attempt,
         }
     }
 
-    pub(super) fn completed(&mut self) {
+    fn report_telemetry(&self, outcome: Outcome) {
+        if let Some(lease) = &self.lease
+            && let Some(telemetry) = &lease.observation
+        {
+            telemetry.upstream(
+                outcome,
+                self.observation.usage,
+                self.observation.provider_timings.mean_itl_seconds(),
+                lease.generations(),
+            );
+        }
+    }
+
+    fn capture_raw(&self, bytes: &[u8]) {
+        if let Some(log) = &self.log_attempt {
+            let elapsed = micros(self.upstream_started.elapsed());
+            log.update(|attempt| {
+                attempt
+                    .timings_us
+                    .entry("first_chunk".to_owned())
+                    .or_insert(elapsed);
+            });
+            log.capture(bytes, true);
+        }
+    }
+
+    fn observe_raw(&mut self, bytes: &[u8]) {
+        let before = self.observation.generation_events;
+        self.observation.observe_bytes(bytes);
+        self.after_observe(before);
+    }
+
+    fn observe_value(&mut self, value: &Value) {
+        let before = self.observation.generation_events;
+        self.observation.observe_value(value);
+        self.after_observe(before);
+    }
+
+    fn observe_done(&mut self) {
+        self.observation.observe_done();
+    }
+
+    fn after_observe(&mut self, previous_generation_events: u64) {
+        if self.observation.generation_events > previous_generation_events
+            && let Some(lease) = &self.lease
+            && let Some(telemetry) = &lease.observation
+        {
+            telemetry.generation(self.upstream_started.elapsed());
+        }
+        if self.observation.has_visible_text
+            && let Some(log) = &self.log_attempt
+        {
+            log.first_visible_text();
+        }
+        if self.observation.has_output && !self.first_token_observed {
+            let elapsed = self.upstream_started.elapsed();
+            if let Some(lease) = &self.lease {
+                lease.record_first_token(elapsed);
+            }
+            self.metrics.observe_first_token(elapsed);
+            if let Some(log) = &self.log_attempt {
+                log.first_output();
+            }
+            self.first_token_observed = true;
+        }
+    }
+
+    fn completed(&mut self) {
         if self.terminal {
             return;
         }
@@ -508,7 +495,7 @@ impl BodyGuard {
             log.update(|attempt| {
                 attempt.timings_us.insert(
                     "upstream_done".to_owned(),
-                    crate::session_log::micros(self.upstream_started.elapsed()),
+                    micros(self.upstream_started.elapsed()),
                 );
                 attempt.usage = self.observation.usage.log_value();
                 self.observation
@@ -540,87 +527,19 @@ impl BodyGuard {
             lease.record_success(self.header_latency);
         }
         self.metrics.observe_usage(self.observation.usage);
-        if let Some(lease) = &self.lease
-            && let Some(telemetry) = &lease.observation
-        {
-            let outcome = if self.observation.error_seen {
-                crate::observability::Outcome::Failed
-            } else if self.observation.incomplete || !self.observation.terminal_marker_seen {
-                crate::observability::Outcome::Unknown
-            } else {
-                crate::observability::Outcome::Success
-            };
-            telemetry.upstream(
-                outcome,
-                self.observation.usage,
-                self.observation.provider_timings.mean_itl_seconds(),
-                lease.generations(),
-            );
-        }
+        let outcome = if self.observation.error_seen {
+            Outcome::Failed
+        } else if self.observation.incomplete || !self.observation.terminal_marker_seen {
+            Outcome::Unknown
+        } else {
+            Outcome::Success
+        };
+        self.report_telemetry(outcome);
         self.terminal = true;
     }
 
-    pub(super) fn observe(&mut self, input: &StreamingInput) {
-        if let Some(log) = &self.log_attempt {
-            let elapsed = crate::session_log::micros(self.upstream_started.elapsed());
-            log.update(|attempt| {
-                attempt
-                    .timings_us
-                    .entry("first_chunk".to_owned())
-                    .or_insert(elapsed);
-            });
-            match input {
-                StreamingInput::Raw(bytes) => log.capture(bytes, true),
-                StreamingInput::Event(event) => {
-                    for line in event.data().split('\n') {
-                        log.capture(b"data: ", true);
-                        log.capture(line.as_bytes(), true);
-                        log.capture(b"\n", true);
-                    }
-                    log.capture(b"\n", true);
-                }
-            }
-        }
-        let generation_events = self.observation.generation_events;
-        match input {
-            StreamingInput::Raw(bytes) => self.observation.observe_bytes(bytes),
-            StreamingInput::Event(event) => self.observation.observe_json(event.data().as_bytes()),
-        }
-        if self.observation.generation_events > generation_events
-            && let Some(lease) = &self.lease
-            && let Some(telemetry) = &lease.observation
-        {
-            telemetry.generation(self.upstream_started.elapsed());
-        }
-        if self.observation.has_visible_text
-            && let Some(log) = &self.log_attempt
-        {
-            log.first_visible_text();
-        }
-        if self.observation.has_output && !self.first_token_observed {
-            let elapsed = self.upstream_started.elapsed();
-            if let Some(lease) = &self.lease {
-                lease.record_first_token(elapsed);
-            }
-            self.metrics.observe_first_token(elapsed);
-            if let Some(log) = &self.log_attempt {
-                log.first_output();
-            }
-            self.first_token_observed = true;
-        }
-    }
-
-    pub(super) fn failed(&mut self, message: String, health_config: &crate::config::HealthConfig) {
-        if let Some(lease) = &self.lease
-            && let Some(telemetry) = &lease.observation
-        {
-            telemetry.upstream(
-                crate::observability::Outcome::Failed,
-                self.observation.usage,
-                self.observation.provider_timings.mean_itl_seconds(),
-                lease.generations(),
-            );
-        }
+    fn failed(&mut self, message: String, health_config: &crate::config::HealthConfig) {
+        self.report_telemetry(Outcome::Failed);
         if let Some(log) = &mut self.log_attempt {
             let class = if message.contains("idle timeout") {
                 "body_idle_timeout"
@@ -643,16 +562,7 @@ impl BodyGuard {
 impl Drop for BodyGuard {
     fn drop(&mut self) {
         if !self.terminal {
-            if let Some(lease) = &self.lease
-                && let Some(telemetry) = &lease.observation
-            {
-                telemetry.upstream(
-                    crate::observability::Outcome::Cancelled,
-                    self.observation.usage,
-                    self.observation.provider_timings.mean_itl_seconds(),
-                    lease.generations(),
-                );
-            }
+            self.report_telemetry(Outcome::Cancelled);
             self.metrics.stream_cancelled(&self.node_id);
         }
     }

@@ -1,65 +1,67 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use axum::{
-    Json,
-    body::Body,
-    http::{HeaderName, HeaderValue, StatusCode, header::CONTENT_LENGTH},
+    body::{Body, HttpBody as _},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 
 use crate::{
     anthropic, chat_bridge,
-    error::GatewayError,
-    metrics::Metrics,
+    error::{GatewayError, openai_error_response},
+    inference_stats::{ProviderTimings, Usage, observe_response, observe_response_value},
     node::{Node, NodeLease},
     prefix::PrefixInput,
     response_buffer::{ResponseBufferBudget, ResponseBufferReservation},
+    server::AppState,
 };
 
-use super::ClientProtocol;
-use super::headers::copy_response_headers;
-use super::{MAX_ERROR_BODY_BYTES, UpstreamResponseMode};
+use super::headers::{apply_upstream_response_headers, copy_response_headers};
+use super::{ClientProtocol, MAX_ERROR_BODY_BYTES, UpstreamResponseMode};
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) struct BufferedContext<'a> {
+    pub(super) state: &'a AppState,
+    pub(super) lease: &'a NodeLease,
+    pub(super) node: &'a Node,
+    pub(super) prefix_input: &'a PrefixInput,
+    pub(super) header_latency: Duration,
+    pub(super) response_mode: &'a UpstreamResponseMode,
+    pub(super) public_model: &'a str,
+    pub(super) record_prefix: bool,
+}
+
 pub(super) async fn buffered_success_response(
     upstream: reqwest::Response,
-    lease: &NodeLease,
-    node: &Node,
-    prefix_directory: &crate::prefix::PrefixDirectory,
-    prefix_input: &PrefixInput,
-    health_config: &crate::config::HealthConfig,
-    header_latency: Duration,
-    stream_idle_timeout: Duration,
-    upstream_body_timeout: Duration,
-    max_body_bytes: usize,
-    response_buffer: Arc<ResponseBufferBudget>,
-    expose_node_header: bool,
-    response_mode: &UpstreamResponseMode,
-    public_model: &str,
-    record_prefix: bool,
-    metrics: &Metrics,
+    ctx: &BufferedContext<'_>,
     mut log_attempt: Option<&mut crate::session_log::AttemptGuard>,
 ) -> Result<Response, GatewayError> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
-    let upstream_request_id = headers.get("x-request-id").cloned();
+    let settings = &ctx.state.settings;
+    let max_body_bytes = settings.server.max_non_streaming_response_bytes;
     let buffered = match read_limited(
         upstream,
         max_body_bytes,
-        response_buffer,
-        stream_idle_timeout,
-        upstream_body_timeout,
+        Arc::clone(&ctx.state.response_buffer),
+        Duration::from_millis(settings.server.stream_idle_timeout_ms),
+        Duration::from_millis(settings.server.upstream_body_timeout_ms),
     )
     .await
     {
         Ok(body) => body,
         Err(error) => {
-            lease.record_failure(
+            ctx.lease.record_failure(
                 format!("non-streaming upstream body failed: {error}"),
-                health_config,
+                &settings.health,
             );
             return Err(error);
         }
@@ -71,56 +73,34 @@ pub(super) async fn buffered_success_response(
     if let Some(log) = &log_attempt {
         log.capture(&upstream_body, false);
     }
-    let body = match response_mode {
-        UpstreamResponseMode::Passthrough => Ok(upstream_body.clone()),
-        UpstreamResponseMode::ChatBridge { context } => {
-            chat_bridge::convert_response(&upstream_body, context, public_model).await
-        }
-        UpstreamResponseMode::TokenCount => (|| {
-            let value: Value = serde_json::from_slice(&upstream_body)
-                .map_err(|_| GatewayError::InvalidUpstreamResponse)?;
-            let tokens = value["token_ids"]
-                .as_array()
-                .or_else(|| value["tokens"].as_array())
-                .ok_or(GatewayError::InvalidUpstreamResponse)?;
-            if tokens.iter().any(|token| token.as_u64().is_none()) {
-                return Err(GatewayError::InvalidUpstreamResponse);
+    let (body, (usage, provider_timings)) =
+        match convert_buffered_body(&upstream_body, ctx.response_mode, ctx.public_model).await {
+            Ok(result) => result,
+            Err(error) => {
+                ctx.lease.record_failure(
+                    "response adapter received an invalid upstream body",
+                    &settings.health,
+                );
+                return Err(error);
             }
-            let count = tokens.len();
-            Ok(Bytes::from(
-                serde_json::to_vec(&json!({"input_tokens":count}))
-                    .map_err(|_| GatewayError::Internal)?,
-            ))
-        })(),
-    };
-    let body = match body {
-        Ok(body) => body,
-        Err(error) => {
-            lease.record_failure(
-                "response adapter received an invalid upstream body",
-                health_config,
-            );
-            return Err(error);
-        }
-    };
+        };
     if body.len() > max_body_bytes {
-        lease.record_failure(
+        ctx.lease.record_failure(
             "response adapter exceeded the configured non-streaming body limit",
-            health_config,
+            &settings.health,
         );
         return Err(GatewayError::InvalidUpstreamResponse);
     }
-    let (usage, provider_timings) = crate::inference_stats::observe_response(&upstream_body);
     if let Some(tokens) = usage.output_tokens {
-        lease.record_output_tokens(tokens);
+        ctx.lease.record_output_tokens(tokens);
     }
-    metrics.observe_usage(usage);
-    if let Some(telemetry) = &lease.observation {
+    ctx.state.metrics.observe_usage(usage);
+    if let Some(telemetry) = &ctx.lease.observation {
         telemetry.upstream(
             crate::observability::Outcome::Success,
             usage,
             provider_timings.mean_itl_seconds(),
-            lease.generations(),
+            ctx.lease.generations(),
         );
     }
     if let Some(log) = log_attempt.as_mut() {
@@ -132,39 +112,68 @@ pub(super) async fn buffered_success_response(
     }
     drop(upstream_body);
     reservation.shrink_to(body.len());
-    lease.record_success(header_latency);
-    if record_prefix {
-        prefix_directory.record_for_node(node, prefix_input);
+    ctx.lease.record_success(ctx.header_latency);
+    if ctx.record_prefix {
+        ctx.state
+            .scheduler
+            .prefix_directory()
+            .record_for_node(ctx.node, ctx.prefix_input);
     }
     let mut response = Response::new(budgeted_body(body, reservation));
-    *response.status_mut() = status;
-    copy_response_headers(&headers, response.headers_mut());
-    if response_mode.rewrites_body() {
-        response.headers_mut().remove(CONTENT_LENGTH);
-    }
-    if response_mode.is_anthropic() {
-        anthropic::set_anthropic_content_type(&mut response, false);
-    }
-    if let Some(value) = upstream_request_id {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static("x-upstream-request-id"), value);
-    }
-    if expose_node_header && let Ok(value) = HeaderValue::from_str(node.id()) {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static("x-gateway-node"), value);
-    }
+    apply_upstream_response_headers(
+        &mut response,
+        status,
+        &headers,
+        ctx.node.id(),
+        settings.server.expose_node_header,
+        ctx.response_mode,
+        false,
+    );
     Ok(response)
 }
 
-#[allow(clippy::too_many_arguments)]
+async fn convert_buffered_body(
+    upstream_body: &Bytes,
+    response_mode: &UpstreamResponseMode,
+    public_model: &str,
+) -> Result<(Bytes, (Usage, ProviderTimings)), GatewayError> {
+    match response_mode {
+        UpstreamResponseMode::Passthrough => {
+            Ok((upstream_body.clone(), observe_response(upstream_body)))
+        }
+        UpstreamResponseMode::ChatBridge { context } => {
+            let value: Value = serde_json::from_slice(upstream_body)
+                .map_err(|_| GatewayError::InvalidUpstreamResponse)?;
+            let observed = observe_response_value(&value);
+            let body = chat_bridge::convert_response_value(&value, context, public_model).await?;
+            Ok((body, observed))
+        }
+        UpstreamResponseMode::TokenCount => Ok((
+            parse_token_count(upstream_body)?,
+            (Usage::default(), ProviderTimings::default()),
+        )),
+    }
+}
+
+fn parse_token_count(body: &[u8]) -> Result<Bytes, GatewayError> {
+    let value: Value =
+        serde_json::from_slice(body).map_err(|_| GatewayError::InvalidUpstreamResponse)?;
+    let tokens = value["token_ids"]
+        .as_array()
+        .or_else(|| value["tokens"].as_array())
+        .ok_or(GatewayError::InvalidUpstreamResponse)?;
+    if tokens.iter().any(|token| token.as_u64().is_none()) {
+        return Err(GatewayError::InvalidUpstreamResponse);
+    }
+    serde_json::to_vec(&json!({"input_tokens": tokens.len()}))
+        .map(Bytes::from)
+        .map_err(|_| GatewayError::Internal)
+}
+
 pub(super) async fn proxy_error_response(
     upstream: reqwest::Response,
     _lease: NodeLease,
-    response_buffer: Arc<ResponseBufferBudget>,
-    stream_idle_timeout: Duration,
-    upstream_body_timeout: Duration,
+    state: &AppState,
     client_protocol: ClientProtocol,
     request_id: &str,
     mut log_attempt: Option<crate::session_log::AttemptGuard>,
@@ -174,68 +183,72 @@ pub(super) async fn proxy_error_response(
     if !status.is_client_error() && !status.is_server_error() {
         return Err(GatewayError::InvalidUpstreamResponse);
     }
-    let buffered = read_limited(
+    let BufferedUpstreamBody {
+        bytes: body,
+        mut reservation,
+    } = read_limited(
         upstream,
         MAX_ERROR_BODY_BYTES,
-        response_buffer,
-        stream_idle_timeout,
-        upstream_body_timeout,
+        Arc::clone(&state.response_buffer),
+        Duration::from_millis(state.settings.server.stream_idle_timeout_ms),
+        Duration::from_millis(state.settings.server.upstream_body_timeout_ms),
     )
     .await?;
-    let body = &buffered.bytes;
     if let Some(log) = &mut log_attempt {
-        log.capture(body, false);
+        log.capture(&body, false);
         log.terminal_error("upstream", "upstream_status");
         log.finish("error", Some("upstream_status"));
     }
-    if client_protocol == ClientProtocol::Anthropic {
-        let mut response = anthropic::convert_error_response(status, body, request_id);
+    let converted = if client_protocol == ClientProtocol::Anthropic {
+        Some(anthropic::convert_error_response(status, &body, request_id))
+    } else {
+        let parsed = serde_json::from_slice::<Value>(&body).ok();
+        let valid_openai_error = parsed
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .is_some_and(Value::is_object);
+        if !valid_openai_error {
+            let mut response = GatewayError::UpstreamStatus(status.as_u16()).into_response();
+            if let Some(value) = headers.get("retry-after") {
+                response.headers_mut().insert("retry-after", value.clone());
+            }
+            return Ok(response);
+        }
+        parsed
+            .filter(|value| value["type"] == "error")
+            .map(|value| {
+                // Anthropic's error object also passes the OpenAI object check above.
+                // Preserve its diagnostic without leaking its client-protocol envelope.
+                let error = &value["error"];
+                let error_type = match status {
+                    StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+                    StatusCode::UNAUTHORIZED => "authentication_error",
+                    StatusCode::FORBIDDEN => "permission_error",
+                    _ if status.is_client_error() => "invalid_request_error",
+                    _ => "api_error",
+                };
+                openai_error_response(
+                    status,
+                    error_type,
+                    error["type"].as_str().unwrap_or("upstream_error"),
+                    error["message"]
+                        .as_str()
+                        .unwrap_or("upstream returned an error")
+                        .to_owned(),
+                )
+            })
+    };
+    if let Some(mut response) = converted {
         if let Some(value) = headers.get("retry-after") {
             response.headers_mut().insert("retry-after", value.clone());
         }
-        return Ok(hold_response_buffer(response, buffered.reservation));
+        let actual =
+            usize::try_from(response.body().size_hint().exact().unwrap_or(0)).unwrap_or(usize::MAX);
+        reservation.shrink_to(actual);
+        return Ok(hold_response_buffer(response, reservation));
     }
-    let parsed_error = serde_json::from_slice::<Value>(body).ok();
-    let valid_openai_error = parsed_error
-        .as_ref()
-        .and_then(|value| value.get("error"))
-        .is_some_and(Value::is_object);
-    if !valid_openai_error {
-        let mut response = GatewayError::UpstreamStatus(status.as_u16()).into_response();
-        if let Some(value) = headers.get("retry-after") {
-            response.headers_mut().insert("retry-after", value.clone());
-        }
-        return Ok(response);
-    }
-    if let Some(value) = parsed_error.filter(|value| value["type"] == "error") {
-        // Anthropic's error object also passes the OpenAI object check above.
-        // Preserve its diagnostic without leaking its client-protocol envelope.
-        let error = &value["error"];
-        let error_type = match status {
-            StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
-            StatusCode::UNAUTHORIZED => "authentication_error",
-            StatusCode::FORBIDDEN => "permission_error",
-            _ if status.is_client_error() => "invalid_request_error",
-            _ => "api_error",
-        };
-        let mut response = (
-            status,
-            Json(json!({"error": {
-                "message": error["message"].as_str().unwrap_or("upstream returned an error"),
-                "type": error_type,
-                "param": null,
-                "code": error["type"].as_str().unwrap_or("upstream_error"),
-            }})),
-        )
-            .into_response();
-        if let Some(value) = headers.get("retry-after") {
-            response.headers_mut().insert("retry-after", value.clone());
-        }
-        return Ok(hold_response_buffer(response, buffered.reservation));
-    }
-    let mut reservation = buffered.reservation;
     reservation.shrink_to(body.len());
-    let mut response = Response::new(budgeted_body(body.clone(), reservation));
+    let mut response = Response::new(budgeted_body(body, reservation));
     *response.status_mut() = status;
     copy_response_headers(&headers, response.headers_mut());
     Ok(response)
@@ -271,7 +284,7 @@ impl BodyBuffer {
             Self::Empty => *self = Self::Single(bytes),
             Self::Single(first) => {
                 // Keep a single chunk without copying. Allocate a contiguous
-                // buffer only when the upstream body actually spans chunks.
+                // buffer only when the body actually spans chunks.
                 let mut output =
                     BytesMut::with_capacity(length_hint.max(first.len() + bytes.len()));
                 output.extend_from_slice(first);
@@ -291,6 +304,46 @@ impl BodyBuffer {
     }
 }
 
+pub(super) struct BodyReadLimits {
+    pub(super) limit: usize,
+    pub(super) length_hint: usize,
+    pub(super) idle_timeout: Duration,
+    pub(super) total_timeout: Duration,
+}
+
+pub(super) async fn read_body_stream<S, E>(
+    mut stream: S,
+    limits: BodyReadLimits,
+    on_timeout: impl Fn() -> GatewayError,
+    on_read_error: impl Fn() -> GatewayError,
+    on_too_large: impl Fn() -> GatewayError,
+) -> Result<Bytes, GatewayError>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    let mut output = BodyBuffer::default();
+    let deadline = tokio::time::Instant::now() + limits.total_timeout;
+    loop {
+        let Ok(Ok(item)) = tokio::time::timeout_at(
+            deadline,
+            tokio::time::timeout(limits.idle_timeout, stream.next()),
+        )
+        .await
+        else {
+            return Err(on_timeout());
+        };
+        let Some(item) = item else {
+            break;
+        };
+        let bytes = item.map_err(|_| on_read_error())?;
+        if output.len().saturating_add(bytes.len()) > limits.limit {
+            return Err(on_too_large());
+        }
+        output.push(bytes, limits.length_hint);
+    }
+    Ok(output.freeze())
+}
+
 pub(super) async fn read_limited(
     response: reqwest::Response,
     limit: usize,
@@ -306,37 +359,39 @@ pub(super) async fn read_limited(
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or_default();
     let reservation = response_buffer.reserve(limit).await;
-    let mut output = BodyBuffer::default();
-    let mut stream = response.bytes_stream();
-    let body_deadline = tokio::time::Instant::now() + upstream_body_timeout;
-    loop {
-        let Ok(Ok(item)) = tokio::time::timeout_at(
-            body_deadline,
-            tokio::time::timeout(stream_idle_timeout, stream.next()),
-        )
-        .await
-        else {
-            return Err(GatewayError::InvalidUpstreamResponse);
-        };
-        let Some(item) = item else {
-            break;
-        };
-        let bytes = item.map_err(|_| GatewayError::InvalidUpstreamResponse)?;
-        if output.len().saturating_add(bytes.len()) > limit {
-            return Err(GatewayError::InvalidUpstreamResponse);
-        }
-        output.push(bytes, length_hint);
+    let bytes = read_body_stream(
+        response.bytes_stream(),
+        BodyReadLimits {
+            limit,
+            length_hint,
+            idle_timeout: stream_idle_timeout,
+            total_timeout: upstream_body_timeout,
+        },
+        || GatewayError::InvalidUpstreamResponse,
+        || GatewayError::InvalidUpstreamResponse,
+        || GatewayError::InvalidUpstreamResponse,
+    )
+    .await?;
+    Ok(BufferedUpstreamBody { bytes, reservation })
+}
+
+struct HeldStream<S> {
+    inner: S,
+    _reservation: ResponseBufferReservation,
+}
+
+impl<S: Stream + Unpin> Stream for HeldStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().inner).poll_next(cx)
     }
-    Ok(BufferedUpstreamBody {
-        bytes: output.freeze(),
-        reservation,
-    })
 }
 
 pub(super) fn budgeted_body(body: Bytes, reservation: ResponseBufferReservation) -> Body {
-    Body::from_stream(async_stream::stream! {
-        let _reservation = reservation;
-        yield Ok::<Bytes, io::Error>(body);
+    Body::from_stream(HeldStream {
+        inner: futures_util::stream::once(std::future::ready(Ok::<Bytes, io::Error>(body))),
+        _reservation: reservation,
     })
 }
 
@@ -345,12 +400,9 @@ pub(super) fn hold_response_buffer(
     reservation: ResponseBufferReservation,
 ) -> Response {
     let body = std::mem::replace(response.body_mut(), Body::empty());
-    let mut stream = body.into_data_stream();
-    *response.body_mut() = Body::from_stream(async_stream::stream! {
-        let _reservation = reservation;
-        while let Some(item) = stream.next().await {
-            yield item;
-        }
+    *response.body_mut() = Body::from_stream(HeldStream {
+        inner: body.into_data_stream(),
+        _reservation: reservation,
     });
     response
 }
@@ -358,6 +410,8 @@ pub(super) fn hold_response_buffer(
 #[cfg(test)]
 mod tests {
     use futures_util::stream;
+
+    use crate::metrics::Metrics;
 
     use super::*;
 

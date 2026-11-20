@@ -1,4 +1,4 @@
-import type { HistoryPoint } from "./observability-types";
+import type { HistoryPoint } from "./types";
 
 export function nearestSample(points: HistoryPoint[], time: number): number {
   let nearest = 0;

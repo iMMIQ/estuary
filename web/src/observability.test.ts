@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { chartPath, finiteMetric, metricNumber, metricPercent } from "./metric-series";
-import type { HistoryPoint } from "./observability-types";
+import type { HistoryPoint } from "./types";
 
 test("metric formatting preserves missing values and genuine zero", () => {
   expect(metricNumber(null, "en")).toBe("—");

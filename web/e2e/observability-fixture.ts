@@ -1,4 +1,4 @@
-import type { Observability, ScopeMetrics } from "../src/observability-types";
+import type { Observability, ScopeMetrics } from "../src/types";
 
 // Deterministic example data for browser tests; never used by the application.
 export function observabilityFixture(

@@ -1,5 +1,4 @@
 //! Bounded in-memory operational statistics, independent of optional session logging.
-mod prometheus;
 mod request;
 mod window;
 
@@ -25,6 +24,7 @@ use window::{Histogram, LATENCIES, RETENTION, STEP, Window};
 const MAX_SCOPES_PER_KIND: usize = 32;
 
 #[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
 pub struct Pressure {
     pub active: usize,
     pub upstream_active: usize,
@@ -43,6 +43,7 @@ pub struct Pressure {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
 pub struct Point {
     pub peaks: Peaks,
     pub at_unix_ms: u64,
@@ -54,6 +55,7 @@ pub struct Point {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
 pub struct Peaks {
     pub output: Option<f64>,
     pub active: usize,
@@ -63,23 +65,38 @@ pub struct Peaks {
 }
 impl Peaks {
     fn include(&mut self, rates: Rates, pressure: &Pressure) {
-        if let Some(value) = rates.output.raw {
+        self.merge(&Self {
+            output: rates.output.raw,
+            active: pressure.active,
+            queued: pressure.queued,
+            waiting: pressure.waiting,
+            kv_usage: pressure.kv_usage,
+        });
+    }
+
+    fn merge(&mut self, other: &Self) {
+        if let Some(value) = other.output {
             self.output = Some(self.output.unwrap_or(value).max(value));
         }
-        self.active = self.active.max(pressure.active);
-        self.queued = self.queued.max(pressure.queued);
-        if let Some(value) = pressure.waiting {
+        self.active = self.active.max(other.active);
+        self.queued = self.queued.max(other.queued);
+        if let Some(value) = other.waiting {
             self.waiting = Some(self.waiting.unwrap_or(value).max(value));
         }
-        if let Some(value) = pressure.kv_usage {
+        if let Some(value) = other.kv_usage {
             self.kv_usage = Some(self.kv_usage.unwrap_or(value).max(value));
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
 pub struct ScopeSnapshot {
     pub peaks: Peaks,
+    #[cfg_attr(
+        feature = "config-contract",
+        ts(type = "\"fleet\" | \"node\" | \"model\"")
+    )]
     pub kind: String,
     pub id: String,
     pub instance: Option<u64>,
@@ -88,6 +105,12 @@ pub struct ScopeSnapshot {
     pub window: Counts,
     pub observed_seconds: f64,
     pub rates: Rates,
+    #[cfg_attr(
+        feature = "config-contract",
+        ts(
+            type = "Record<\"ttft\" | \"upstream_ttft\" | \"duration\" | \"ingress\" | \"queue\" | \"tpot\" | \"generation_rate\", Distribution>"
+        )
+    )]
     pub latency: BTreeMap<&'static str, Distribution>,
     pub success_ratio: Option<f64>,
     pub failure_ratio: Option<f64>,
@@ -100,6 +123,7 @@ pub struct ScopeSnapshot {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
 pub struct Snapshot {
     pub instance_id: String,
     pub generated_at_unix_ms: u64,
@@ -115,14 +139,13 @@ pub struct Snapshot {
     pub history: Vec<Point>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Series {
     peak_active: usize,
     created_at: f64,
     instance: Option<u64>,
     retired: bool,
     total: Counts,
-    lifetime: [Histogram; 7],
     window: Window,
     rates: Rates,
     sampled_total: Counts,
@@ -130,25 +153,6 @@ struct Series {
     pressure: Pressure,
     engine: EngineTelemetry,
     history: VecDeque<Point>,
-}
-impl Default for Series {
-    fn default() -> Self {
-        Self {
-            peak_active: 0,
-            created_at: 0.0,
-            instance: None,
-            retired: false,
-            total: Counts::default(),
-            lifetime: std::array::from_fn(|_| Histogram::default()),
-            window: Window::default(),
-            rates: Rates::default(),
-            sampled_total: Counts::default(),
-            sampled_at: 0.0,
-            pressure: Pressure::default(),
-            engine: EngineTelemetry::default(),
-            history: VecDeque::new(),
-        }
-    }
 }
 impl Series {
     fn new(created_at: f64) -> Self {
@@ -168,11 +172,6 @@ impl Series {
                 .unwrap_or(usize::MAX),
         );
         self.window.record(now, counts, values);
-        for (histogram, value) in self.lifetime.iter_mut().zip(values) {
-            if let Some(value) = value {
-                histogram.observe(value);
-            }
-        }
     }
     fn sample(&mut self, now: f64, at_unix_ms: u64) {
         let elapsed = now - self.sampled_at;
@@ -283,17 +282,7 @@ impl Series {
             .rev()
             .take_while(|point| point.at_unix_ms.saturating_add(seconds * 1000) >= at_unix_ms)
         {
-            if let Some(value) = point.peaks.output {
-                peaks.output = Some(peaks.output.unwrap_or(value).max(value));
-            }
-            peaks.active = peaks.active.max(point.peaks.active);
-            peaks.queued = peaks.queued.max(point.peaks.queued);
-            if let Some(value) = point.peaks.waiting {
-                peaks.waiting = Some(peaks.waiting.unwrap_or(value).max(value));
-            }
-            if let Some(value) = point.peaks.kv_usage {
-                peaks.kv_usage = Some(peaks.kv_usage.unwrap_or(value).max(value));
-            }
+            peaks.merge(&point.peaks);
         }
         ScopeSnapshot {
             peaks,
@@ -546,8 +535,15 @@ impl Observability {
                 .unwrap_or_default(),
         }
     }
-    pub(crate) fn encode_metrics(&self, body: String) -> String {
-        prometheus::encode(self, body)
+    pub(crate) fn for_each_scope(&self, mut visit: impl FnMut(&str, &str, Counts)) {
+        let state = self.state.lock();
+        visit("fleet", "", state.fleet.total);
+        for (id, series) in &state.nodes {
+            visit("node", id, series.total);
+        }
+        for (id, series) in &state.models {
+            visit("model", id, series.total);
+        }
     }
 }
 

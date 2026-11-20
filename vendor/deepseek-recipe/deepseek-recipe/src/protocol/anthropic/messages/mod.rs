@@ -14,8 +14,7 @@
 //! Use [`crate::request::ProtocolRequest::convert`] to produce a shared
 //! [`crate::request::ConversationRequest`], and
 //! [`crate::request::ProtocolRequest::chunk_generator`] to construct the
-//! chunk generator of response events. [`crate::stream::StreamProcessor`]
-//! parses backend output into typed [`response::MessagesStreamEvent`] values,
+//! chunk generator of typed [`response::MessagesStreamEvent`] values,
 //! which can also be accumulated into a complete
 //! [`response::MessagesResponse`].
 //!

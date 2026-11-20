@@ -173,17 +173,6 @@ pub(super) fn validate_stop_sequences(stop_sequences: &[String]) -> Result<(), C
     Ok(())
 }
 
-/// Validate one stop sequence, which must not be empty.
-pub(super) fn validate_stop_sequence(stop: &str) -> Result<(), ConversionError> {
-    if stop.is_empty() {
-        return Err(ConversionError::bad_request(
-            "Invalid 'stop': empty string. Expected a string with minimum length 1, but got an \
-             empty string instead.",
-        ));
-    }
-    Ok(())
-}
-
 /// Return the error for duplicate tool names.
 pub(super) fn duplicate_tool_names() -> ConversionError {
     ConversionError::bad_request("Tool names must be unique.")

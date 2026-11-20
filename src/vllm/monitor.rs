@@ -1,14 +1,8 @@
-use std::{
-    io::{BufRead, BufReader},
-    sync::Arc,
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use prometheus_parse::{Scrape, Value as MetricValue};
 use reqwest::Client;
-use semver::Version;
 use serde::Deserialize;
 use tokio::{
     sync::{Notify, watch},
@@ -19,11 +13,14 @@ use tracing::{debug, info, warn};
 use crate::{
     config::ProviderKind,
     kv_cache::ExactCacheDirectory,
-    node::{Node, ProviderCounter, ProviderState, VllmMetricsSnapshot},
+    node::{CounterKind, Node, ProviderCounter, ProviderState, VllmMetricsSnapshot},
     prefix::PrefixDirectory,
 };
 
 use super::{MAX_MANAGEMENT_BODY_BYTES, VERSION_RECHECK_TICKS, read_bounded_response};
+
+const MIN_VLLM_VERSION: (u64, u64, u64) = (0, 25, 0);
+const MIN_VLLM_VERSION_DISPLAY: &str = "0.25.0";
 
 pub(super) async fn run_node_monitor(
     client: Client,
@@ -84,10 +81,11 @@ pub(super) async fn poll_node(client: &Client, node: &Arc<Node>, check_version: 
                 node.record_vllm_ready(raw);
             }
             Ok(raw) => {
-                let message =
-                    format!("vLLM {raw} is unsupported; Estuary requires >= {MIN_VLLM_VERSION}");
+                let message = format!(
+                    "vLLM {raw} is unsupported; Estuary requires >= {MIN_VLLM_VERSION_DISPLAY}"
+                );
                 if node.record_vllm_incompatible(Some(raw.clone()), message.clone()) {
-                    warn!(node = node.id(), version = %raw, required = %MIN_VLLM_VERSION, "{message}");
+                    warn!(node = node.id(), version = %raw, required = MIN_VLLM_VERSION_DISPLAY, "{message}");
                 }
                 return;
             }
@@ -95,7 +93,7 @@ pub(super) async fn poll_node(client: &Client, node: &Arc<Node>, check_version: 
                 let changed =
                     node.record_provider_telemetry_error(format!("version probe failed: {error}"));
                 if changed && node.provider_state() != ProviderState::Ready {
-                    warn!(node = node.id(), error = %error, required = %MIN_VLLM_VERSION, "vLLM compatibility check failed; node remains out of rotation");
+                    warn!(node = node.id(), error = %error, required = MIN_VLLM_VERSION_DISPLAY, "vLLM compatibility check failed; node remains out of rotation");
                 } else {
                     debug!(node = node.id(), error = %error, "vLLM version probe failed");
                 }
@@ -124,7 +122,7 @@ pub async fn preflight_vllm(client: &Client, node: &Arc<Node>) -> Result<()> {
     }
     let raw = fetch_version(client, node).await?;
     if !is_supported_vllm_version(&raw) {
-        bail!("vLLM {raw} is unsupported; Estuary requires >= {MIN_VLLM_VERSION}");
+        bail!("vLLM {raw} is unsupported; Estuary requires >= {MIN_VLLM_VERSION_DISPLAY}");
     }
     node.record_vllm_ready(raw);
     let telemetry = fetch_metrics(client, node).await?;
@@ -133,11 +131,11 @@ pub async fn preflight_vllm(client: &Client, node: &Arc<Node>) -> Result<()> {
 }
 
 #[derive(Deserialize)]
-pub(super) struct VersionResponse {
-    pub(super) version: String,
+struct VersionResponse {
+    version: String,
 }
 
-pub(super) async fn fetch_version(client: &Client, node: &Node) -> Result<String> {
+async fn fetch_version(client: &Client, node: &Node) -> Result<String> {
     let body = management_get(client, node, &node.provider().version_path).await?;
     let response: VersionResponse =
         serde_json::from_slice(&body).context("invalid /version JSON")?;
@@ -150,9 +148,7 @@ pub(super) async fn fetch_version(client: &Client, node: &Node) -> Result<String
     Ok(response.version)
 }
 
-const MIN_VLLM_VERSION: Version = Version::new(0, 25, 0);
-
-fn release_version(raw: &str) -> Option<Version> {
+fn release_version(raw: &str) -> Option<(u64, u64, u64)> {
     let normalized = raw.trim().trim_start_matches('v');
     let prefix = normalized
         .split(|ch: char| !ch.is_ascii_digit() && ch != '.')
@@ -166,7 +162,7 @@ fn release_version(raw: &str) -> Option<Version> {
         .next()
         .and_then(|part| part.parse().ok())
         .unwrap_or(0);
-    Some(Version::new(major, minor, patch))
+    Some((major, minor, patch))
 }
 
 pub(super) fn is_supported_vllm_version(raw: &str) -> bool {
@@ -176,20 +172,22 @@ pub(super) fn is_supported_vllm_version(raw: &str) -> bool {
     release_version(raw).is_none_or(|version| version >= MIN_VLLM_VERSION)
 }
 
-pub(super) async fn fetch_metrics(client: &Client, node: &Node) -> Result<VllmMetricsSnapshot> {
+async fn fetch_metrics(client: &Client, node: &Node) -> Result<VllmMetricsSnapshot> {
     let body = management_get(client, node, &node.provider().metrics_path).await?;
     parse_metrics(&body)
 }
 
-pub(super) async fn management_get(client: &Client, node: &Node, path: &str) -> Result<Bytes> {
+async fn management_get(client: &Client, node: &Node, path: &str) -> Result<Bytes> {
     let url = node.provider_url(path)?;
-    let mut request = client
-        .get(url)
-        .timeout(Duration::from_millis(node.provider().request_timeout_ms));
-    for (name, value) in node.headers() {
-        request = request.header(name, value);
-    }
-    let response = request.send().await?.error_for_status()?;
+    let response = node
+        .apply_headers(
+            client
+                .get(url)
+                .timeout(Duration::from_millis(node.provider().request_timeout_ms)),
+        )
+        .send()
+        .await?
+        .error_for_status()?;
     if response
         .content_length()
         .is_some_and(|length| length > MAX_MANAGEMENT_BODY_BYTES as u64)
@@ -199,75 +197,59 @@ pub(super) async fn management_get(client: &Client, node: &Node, path: &str) -> 
     read_bounded_response(response, "vLLM management response").await
 }
 
+/// Parse only the scalar `vllm:*` / `vllm_*` gauges and counters Estuary consumes
+/// without pulling in a full Prometheus exposition AST parser.
 pub(super) fn parse_metrics(body: &[u8]) -> Result<VllmMetricsSnapshot> {
-    let reader = BufReader::new(body);
-    // prometheus-parse accepts the Prometheus grammar except ':' in metric names.
-    // Normalize vLLM's legal namespace separator before structured parsing.
-    let lines = reader
-        .lines()
-        .map(|line| line.map(|line| line.replacen("vllm:", "vllm_", 1)));
-    let scrape = Scrape::parse(lines).context("invalid Prometheus exposition")?;
+    let text = std::str::from_utf8(body).context("invalid UTF-8 in Prometheus exposition")?;
     let mut running = None;
     let mut waiting = None;
     let mut kv_usage = None;
-    let mut prompt_tokens = None;
-    let mut generation_tokens = None;
-    let mut requests = None;
-    let mut prefix_queries = None;
-    let mut prefix_hits = None;
-    let mut preemptions = None;
     let mut counter_series = Vec::new();
-    for sample in scrape.samples {
-        let value = scalar_metric(&sample.value);
-        let kind = match sample.metric.trim_end_matches("_total") {
-            "vllm_prompt_tokens" => Some(0),
-            "vllm_generation_tokens" => Some(1),
-            "vllm_request_success" => Some(2),
-            "vllm_prefix_cache_queries" => Some(3),
-            "vllm_prefix_cache_hits" => Some(4),
-            "vllm_num_preemptions" => Some(5),
-            _ => None,
-        };
-        if let (Some(kind), Some(value)) = (kind, value)
-            && value.is_finite()
-            && value >= 0.0
-            && counter_series.len() <= 512
-        {
-            let labels = sample.labels.to_string();
-            let key = format!("{kind}:{}", blake3::hash(labels.as_bytes()).to_hex());
-            counter_series.push(ProviderCounter { key, kind, value });
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
-        match sample.metric.as_str() {
-            "vllm_num_requests_running" => {
-                running = Some(running.unwrap_or(0.0) + value.unwrap_or(0.0));
+        let Some((metric, labels, value)) = parse_sample_line(line) else {
+            continue;
+        };
+        let Some(suffix) = metric
+            .strip_prefix("vllm:")
+            .or_else(|| metric.strip_prefix("vllm_"))
+        else {
+            continue;
+        };
+        match suffix {
+            "num_requests_running" => running = Some(running.unwrap_or(0.0) + value),
+            "num_requests_waiting" => waiting = Some(waiting.unwrap_or(0.0) + value),
+            "kv_cache_usage_perc" => kv_usage = Some(kv_usage.unwrap_or(0.0_f64).max(value)),
+            other => {
+                let kind = match other.trim_end_matches("_total") {
+                    "prompt_tokens" => Some(CounterKind::PromptTokens),
+                    "generation_tokens" => Some(CounterKind::GenerationTokens),
+                    "request_success" => Some(CounterKind::Requests),
+                    "prefix_cache_queries" => Some(CounterKind::PrefixQueries),
+                    "prefix_cache_hits" => Some(CounterKind::PrefixHits),
+                    "num_preemptions" => Some(CounterKind::Preemptions),
+                    _ => None,
+                };
+                if let Some(kind) = kind
+                    && value.is_finite()
+                    && value >= 0.0
+                    && counter_series.len() <= 512
+                {
+                    let key = format!(
+                        "{}:{}",
+                        kind as usize,
+                        blake3::hash(labels.as_bytes()).to_hex()
+                    );
+                    counter_series.push(ProviderCounter { key, kind, value });
+                }
             }
-            "vllm_num_requests_waiting" => {
-                waiting = Some(waiting.unwrap_or(0.0) + value.unwrap_or(0.0));
-            }
-            "vllm_kv_cache_usage_perc" => {
-                kv_usage = Some(kv_usage.unwrap_or(0.0_f64).max(value.unwrap_or(0.0)));
-            }
-            "vllm_prompt_tokens" | "vllm_prompt_tokens_total" => {
-                accumulate_counter(&mut prompt_tokens, value);
-            }
-            "vllm_generation_tokens" | "vllm_generation_tokens_total" => {
-                accumulate_counter(&mut generation_tokens, value);
-            }
-            "vllm_request_success" | "vllm_request_success_total" => {
-                accumulate_counter(&mut requests, value);
-            }
-            "vllm_prefix_cache_queries" | "vllm_prefix_cache_queries_total" => {
-                accumulate_counter(&mut prefix_queries, value);
-            }
-            "vllm_prefix_cache_hits" | "vllm_prefix_cache_hits_total" => {
-                accumulate_counter(&mut prefix_hits, value);
-            }
-            "vllm_num_preemptions" | "vllm_num_preemptions_total" => {
-                accumulate_counter(&mut preemptions, value);
-            }
-            _ => {}
         }
     }
+
     let running = finite_count(running.ok_or_else(|| anyhow!("running metric is missing"))?)?;
     let waiting = finite_count(waiting.ok_or_else(|| anyhow!("waiting metric is missing"))?)?;
     let kv_cache_usage = kv_usage
@@ -278,32 +260,56 @@ pub(super) fn parse_metrics(body: &[u8]) -> Result<VllmMetricsSnapshot> {
         running,
         waiting,
         kv_cache_usage,
-        prompt_tokens_total: prompt_tokens,
-        generation_tokens_total: generation_tokens,
-        requests_total: requests,
-        prefix_cache_queries_total: prefix_queries,
-        prefix_cache_hits_total: prefix_hits,
-        preemptions_total: preemptions,
     })
 }
 
-pub(super) fn accumulate_counter(total: &mut Option<f64>, value: Option<f64>) {
-    if let Some(value) = value.filter(|value| value.is_finite() && *value >= 0.0) {
-        *total = Some(total.unwrap_or_default() + value);
-    }
+fn parse_sample_line(line: &str) -> Option<(&str, &str, f64)> {
+    let bytes = line.as_bytes();
+    let name_end = bytes
+        .iter()
+        .position(|&b| b == b'{' || b.is_ascii_whitespace())?;
+    let metric = &line[..name_end];
+    let rest = &line[name_end..];
+    let (labels, value_part) = if let Some(after_open) = rest.strip_prefix('{') {
+        let close = find_label_close(after_open)?;
+        (&after_open[..close], after_open[close + 1..].trim_start())
+    } else {
+        ("", rest.trim_start())
+    };
+    let token = value_part.split_ascii_whitespace().next()?;
+    let value = match token {
+        "+Inf" | "Inf" | "+inf" | "inf" => f64::INFINITY,
+        "-Inf" | "-inf" => f64::NEG_INFINITY,
+        "NaN" | "nan" => f64::NAN,
+        other => other.parse::<f64>().ok()?,
+    };
+    Some((metric, labels, value))
 }
 
-pub(super) fn scalar_metric(value: &MetricValue) -> Option<f64> {
-    match value {
-        MetricValue::Counter(value) | MetricValue::Gauge(value) | MetricValue::Untyped(value) => {
-            Some(*value)
+fn find_label_close(input: &str) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_quotes = false;
+            }
+        } else if byte == b'"' {
+            in_quotes = true;
+        } else if byte == b'}' {
+            return Some(index);
         }
-        MetricValue::Histogram(_) | MetricValue::Summary(_) => None,
     }
+    None
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub(super) fn finite_count(value: f64) -> Result<usize> {
+fn finite_count(value: f64) -> Result<usize> {
     if !value.is_finite() || value < 0.0 || value > usize::MAX as f64 {
         bail!("invalid vLLM request count {value}");
     }

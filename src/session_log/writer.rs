@@ -1,103 +1,83 @@
-use super::{Command, Stats, store};
+use super::{Command, LogQueue, RecvStatus, Stats, store};
 use crate::config::SessionLogConfig;
 use crate::time::unix_millis;
 use std::{
-    sync::{Arc, atomic::Ordering},
-    time::Duration,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
 use tracing::warn;
 
-pub(super) fn run(
-    mut receiver: mpsc::Receiver<Command>,
-    config: &SessionLogConfig,
-    stats: &Arc<Stats>,
-    boot: &str,
-) {
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-    else {
-        return;
-    };
-    runtime.block_on(async {
-        let path = config.database.as_ref().expect("enabled writer");
-        let mut connection = None;
-        let mut batch = Vec::new();
-        let mut batch_bytes = 0usize;
-        let mut tick = tokio::time::interval(Duration::from_millis(config.flush_interval_ms));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut maintenance_at = std::time::Instant::now();
-        let mut retry_at = std::time::Instant::now();
-        loop {
-            if connection.is_none() && std::time::Instant::now() >= retry_at {
-                match store::open(path) {
-                    Ok(db) => {
-                        if let Err(error) = store::recover(&db) {
-                            stats.write_errors.fetch_add(1, Ordering::Relaxed);
-                            warn!(error = %error, "session log recovery failed");
-                        }
-                        connection = Some(db);
-                        stats.available.store(true, Ordering::Relaxed);
-                    }
-                    Err(error) => {
+pub(super) fn run(queue: &LogQueue, config: &SessionLogConfig, stats: &Stats, boot: &str) {
+    let path = config.database.as_ref().expect("enabled writer");
+    let flush_interval = Duration::from_millis(config.flush_interval_ms);
+    let mut connection = None;
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0usize;
+    let mut next_flush = Instant::now() + flush_interval;
+    let mut maintenance_at = Instant::now();
+    let mut retry_at = Instant::now();
+    loop {
+        if connection.is_none() && Instant::now() >= retry_at {
+            match store::open(path) {
+                Ok(db) => {
+                    if let Err(error) = store::recover(&db) {
                         stats.write_errors.fetch_add(1, Ordering::Relaxed);
-                        warn!(error = %error, "session log unavailable");
-                        retry_at = std::time::Instant::now() + Duration::from_secs(5);
+                        warn!(error = %error, "session log recovery failed");
                     }
+                    connection = Some(db);
+                    stats.available.store(true, Ordering::Relaxed);
                 }
-            }
-            let command = tokio::select! {
-                command = receiver.recv() => command,
-                _ = tick.tick() => {
-                    flush(&mut connection, &mut batch, stats).await;
-                    batch_bytes = 0;
-                    if maintenance_at.elapsed() >= Duration::from_secs(60) {
-                        if let Some(db) = &mut connection
-                            && let Err(error) = store::maintain(db, config) {
-                            stats.write_errors.fetch_add(1, Ordering::Relaxed);
-                            warn!(error = %error, "session log retention failed");
-                        }
-                        maintenance_at = std::time::Instant::now();
-                    }
-                    continue;
-                }
-            };
-            match command {
-                Some(Command::Flush(reply)) => {
-                    flush(&mut connection, &mut batch, stats).await;
-                    batch_bytes = 0;
-                    let _ =
-                        reply.send(connection.is_some() && stats.available.load(Ordering::Relaxed));
-                }
-                Some(command) => {
-                    stats.queued.fetch_sub(1, Ordering::Relaxed);
-                    if let Command::Finish(_, payloads) = &command {
-                        batch_bytes += payloads.iter().map(|p| p.bytes.len()).sum::<usize>();
-                    }
-                    batch.push(command);
-                    if batch.len() >= 100 || batch_bytes >= 1024 * 1024 {
-                        flush(&mut connection, &mut batch, stats).await;
-                        batch_bytes = 0;
-                    }
-                }
-                None => {
-                    flush(&mut connection, &mut batch, stats).await;
-                    if let Some(db) = &connection {
-                        let _ = store::interrupt_boot(db, boot);
-                    }
-                    break;
+                Err(error) => {
+                    stats.write_errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(error = %error, "session log unavailable");
+                    retry_at = Instant::now() + Duration::from_secs(5);
                 }
             }
         }
-    });
+        match queue.recv_until(next_flush) {
+            RecvStatus::Timeout => {
+                flush(&mut connection, &mut batch, stats);
+                batch_bytes = 0;
+                next_flush = Instant::now() + flush_interval;
+                if maintenance_at.elapsed() >= Duration::from_secs(60) {
+                    if let Some(db) = &mut connection
+                        && let Err(error) = store::maintain(db, config)
+                    {
+                        stats.write_errors.fetch_add(1, Ordering::Relaxed);
+                        warn!(error = %error, "session log retention failed");
+                    }
+                    maintenance_at = Instant::now();
+                }
+            }
+            RecvStatus::Item(Command::Flush(reply)) => {
+                flush(&mut connection, &mut batch, stats);
+                batch_bytes = 0;
+                let _ = reply.send(connection.is_some() && stats.available.load(Ordering::Relaxed));
+            }
+            RecvStatus::Item(command) => {
+                stats.queued.fetch_sub(1, Ordering::Relaxed);
+                if let Command::Finish(_, payloads) = &command {
+                    batch_bytes += payloads.iter().map(|p| p.bytes.len()).sum::<usize>();
+                }
+                batch.push(command);
+                if batch.len() >= 100 || batch_bytes >= 1024 * 1024 {
+                    flush(&mut connection, &mut batch, stats);
+                    batch_bytes = 0;
+                    next_flush = Instant::now() + flush_interval;
+                }
+            }
+            RecvStatus::Closed => {
+                flush(&mut connection, &mut batch, stats);
+                if let Some(db) = &connection {
+                    let _ = store::interrupt_boot(db, boot);
+                }
+                break;
+            }
+        }
+    }
 }
 
-async fn flush(
-    connection: &mut Option<rusqlite::Connection>,
-    batch: &mut Vec<Command>,
-    stats: &Stats,
-) {
+fn flush(connection: &mut Option<rusqlite::Connection>, batch: &mut Vec<Command>, stats: &Stats) {
     if batch.is_empty() {
         return;
     }
@@ -120,14 +100,13 @@ async fn flush(
         if !busy {
             break;
         }
-        let backoff_ms = 10u64 << retry;
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        std::thread::sleep(Duration::from_millis(10u64 << retry));
         result = write_batch(db, batch);
     }
     if let Err(error) = result {
         stats.write_errors.fetch_add(1, Ordering::Relaxed);
         stats.available.store(false, Ordering::Relaxed);
-        warn!(error=%error,"session log batch failed");
+        warn!(error = %error, "session log batch failed");
         // Metadata remains useful when content encoding or storage fails.
         let fallback = (|| -> anyhow::Result<()> {
             let tx = db.transaction()?;

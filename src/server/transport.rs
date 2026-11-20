@@ -38,7 +38,7 @@ pub(super) struct BoundedTcpListener {
     pub(super) connections: Arc<ConnectionTracker>,
     pub(super) track_public: bool,
     pub(super) accept_cancellation: CancellationToken,
-    pub(super) pending_connections: Arc<PendingConnections>,
+    pub(super) pending_connections: Option<Arc<PendingConnections>>,
 }
 
 impl BoundedTcpListener {
@@ -57,7 +57,7 @@ impl BoundedTcpListener {
             connections,
             track_public,
             accept_cancellation,
-            pending_connections: Arc::new(PendingConnections::default()),
+            pending_connections: track_public.then(|| Arc::new(PendingConnections::default())),
         }
     }
 }
@@ -68,7 +68,10 @@ impl Listener for BoundedTcpListener {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         // Include the accept future itself so stopping accepts cannot race a socket handoff.
-        let mut first_request = Some(self.pending_connections.track());
+        let mut first_request = self
+            .pending_connections
+            .as_ref()
+            .map(PendingConnections::track);
         let permit = tokio::select! {
             biased;
             () = self.accept_cancellation.cancelled() => {
@@ -100,7 +103,7 @@ impl Listener for BoundedTcpListener {
                     return (
                         BoundedTcpStream {
                             inner: stream,
-                            first_request: first_request.take().expect("accept is still active"),
+                            first_request: first_request.take(),
                             _permit: permit,
                             metrics: Arc::clone(&self.metrics),
                             connections: Arc::clone(&self.connections),
@@ -126,7 +129,7 @@ impl Listener for BoundedTcpListener {
 #[derive(Debug)]
 pub(super) struct BoundedTcpStream {
     pub(super) inner: tokio::net::TcpStream,
-    pub(super) first_request: PendingConnection,
+    pub(super) first_request: Option<PendingConnection>,
     pub(super) _permit: OwnedSemaphorePermit,
     pub(super) metrics: Arc<Metrics>,
     pub(super) connections: Arc<ConnectionTracker>,
@@ -136,7 +139,11 @@ pub(super) struct BoundedTcpStream {
 
 impl Connected<IncomingStream<'_, BoundedTcpListener>> for PendingConnection {
     fn connect_info(stream: IncomingStream<'_, BoundedTcpListener>) -> Self {
-        stream.io().first_request.clone()
+        stream
+            .io()
+            .first_request
+            .clone()
+            .expect("public listener tracks pending connections")
     }
 }
 

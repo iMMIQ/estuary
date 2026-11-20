@@ -1,6 +1,6 @@
+mod common;
+
 use std::{
-    collections::HashMap,
-    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -9,25 +9,15 @@ use std::{
 };
 
 use axum::{Json, Router, extract::State, routing::post};
-use estuary::{Gateway, Settings, config::NodeConfig};
+use common::{TestServer, node_config, test_client, unused_address, wait_until};
+use estuary::{Gateway, Settings};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, sync::Notify, task::JoinHandle, time::timeout};
+use tokio::{sync::Notify, time::timeout};
 
 struct UpstreamState {
     calls: AtomicUsize,
     release_first: Notify,
-}
-
-struct TestServer {
-    address: SocketAddr,
-    task: JoinHandle<()>,
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
 }
 
 async fn upstream_chat(State(state): State<Arc<UpstreamState>>) -> Json<Value> {
@@ -42,38 +32,16 @@ async fn upstream_chat(State(state): State<Arc<UpstreamState>>) -> Json<Value> {
 }
 
 async fn spawn_upstream(state: Arc<UpstreamState>) -> TestServer {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let router = Router::new()
-        .route(
-            "/v1/models",
-            axum::routing::get(|| async { Json(json!({"object": "list", "data": []})) }),
-        )
-        .route("/v1/chat/completions", post(upstream_chat))
-        .with_state(state);
-    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    TestServer { address, task }
-}
-
-async fn unused_addresses() -> (SocketAddr, SocketAddr) {
-    let public = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addresses = (public.local_addr().unwrap(), admin.local_addr().unwrap());
-    drop((public, admin));
-    addresses
-}
-
-async fn wait_for_url(client: &reqwest::Client, url: &str) {
-    timeout(Duration::from_secs(3), async {
-        loop {
-            if client.get(url).send().await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    TestServer::spawn(
+        Router::new()
+            .route(
+                "/v1/models",
+                axum::routing::get(|| async { Json(json!({"object": "list", "data": []})) }),
+            )
+            .route("/v1/chat/completions", post(upstream_chat))
+            .with_state(state),
+    )
     .await
-    .unwrap();
 }
 
 #[tokio::test]
@@ -83,7 +51,8 @@ async fn process_drain_finishes_an_existing_queue_before_exit() {
         release_first: Notify::new(),
     });
     let upstream = spawn_upstream(Arc::clone(&upstream_state)).await;
-    let (public, admin) = unused_addresses().await;
+    let public = unused_address().await;
+    let admin = unused_address().await;
 
     let mut settings = Settings::default();
     settings.server.listen = public.to_string();
@@ -91,16 +60,18 @@ async fn process_drain_finishes_an_existing_queue_before_exit() {
     settings.server.withdrawal_delay_ms = 20;
     settings.server.shutdown_grace_ms = 3_000;
     settings.health.route_while_starting = true;
-    settings.nodes = vec![NodeConfig {
-        id: "only".to_owned(),
-        base_url: format!("http://{}/v1", upstream.address),
-        models: HashMap::from([("model".to_owned(), "model".to_owned())]),
-        max_concurrency: 1,
-        ..NodeConfig::default()
-    }];
+    let mut node = node_config("only", &upstream.base_url, [("model", "model")]);
+    node.max_concurrency = 1;
+    settings.nodes = vec![node];
     let gateway = tokio::spawn(async move { Gateway::build(settings).unwrap().run().await });
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    wait_for_url(&client, &format!("http://{admin}/health/live")).await;
+    let client = test_client();
+    let live_url = format!("http://{admin}/health/live");
+    wait_until(Duration::from_secs(3), || {
+        let client = client.clone();
+        let live_url = live_url.clone();
+        async move { client.get(&live_url).send().await.is_ok() }
+    })
+    .await;
 
     let body = json!({
         "model": "model",

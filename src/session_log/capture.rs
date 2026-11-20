@@ -1,4 +1,4 @@
-use crate::time::unix_millis;
+use crate::time::{micros, unix_millis};
 use axum::http::HeaderMap;
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -10,10 +10,9 @@ use std::{
     },
     time::Instant,
 };
-use tokio::sync::mpsc;
 
 use super::{
-    Command, LogSink,
+    Command, LogSink, QueuePermit,
     model::{AttemptRecord, LogEvent, RequestRecord},
 };
 
@@ -38,7 +37,7 @@ struct Pending {
     payloads: BTreeMap<(String, usize), CapturedPayload>,
     active_attempts: usize,
     downstream_done: bool,
-    permit: Option<mpsc::OwnedPermit<Command>>,
+    permit: Option<QueuePermit>,
 }
 
 pub struct Observation {
@@ -54,11 +53,7 @@ impl Observation {
         headers: &HeaderMap,
         external_id: &str,
     ) -> Option<Arc<Self>> {
-        let sender = sink.sender.as_ref()?;
-        let Ok(permit) = sender.clone().try_reserve_owned() else {
-            sink.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            return None;
-        };
+        let queue = sink.queue.as_ref()?;
         let session_id = header(headers, "x-estuary-session-id");
         let record = RequestRecord {
             id: uuid::Uuid::now_v7().to_string(),
@@ -90,15 +85,11 @@ impl Observation {
             .to_owned(),
             ..RequestRecord::default()
         };
-        sink.stats.queued.fetch_add(1, Ordering::Relaxed);
-        if sender
-            .try_send(Command::Start(Box::new(record.clone())))
-            .is_err()
-        {
-            sink.stats.queued.fetch_sub(1, Ordering::Relaxed);
+        let Some(permit) = queue.try_start(Command::Start(Box::new(record.clone()))) else {
             sink.stats.dropped.fetch_add(1, Ordering::Relaxed);
             return None;
-        }
+        };
+        sink.stats.queued.fetch_add(1, Ordering::Relaxed);
 
         Some(Arc::new(Self {
             sink: Arc::clone(sink),
@@ -213,7 +204,7 @@ impl Observation {
         if pending.record.events.len() < 32 {
             pending.record.events.push(LogEvent {
                 kind: kind.to_owned(),
-                elapsed_us: super::micros(self.started.elapsed()),
+                elapsed_us: micros(self.started.elapsed()),
             });
         }
     }
@@ -224,10 +215,10 @@ impl Observation {
         // A streaming request can fail with a JSON error response. Preserve the
         // requested mode so those failures remain visible in stream diagnostics.
         pending.record.streaming |= streaming;
-        pending.record.timings_us.insert(
-            "headers_ready".to_owned(),
-            super::micros(self.started.elapsed()),
-        );
+        pending
+            .record
+            .timings_us
+            .insert("headers_ready".to_owned(), micros(self.started.elapsed()));
         if status >= 400 && pending.record.outcome != "error" {
             "error".clone_into(&mut pending.record.outcome);
             pending.record.error_phase = Some("gateway".to_owned());
@@ -253,7 +244,7 @@ impl Observation {
         pending
             .record
             .timings_us
-            .insert("total".to_owned(), super::micros(self.started.elapsed()));
+            .insert("total".to_owned(), micros(self.started.elapsed()));
         if pending.record.outcome == "started" {
             if consumed { "success" } else { "cancelled" }.clone_into(&mut pending.record.outcome);
         }
@@ -323,7 +314,7 @@ impl AttemptGuard {
             .capture("upstream_input", self.index + 1, body, false);
     }
     pub(crate) fn first_output(&self) {
-        let elapsed = super::micros(self.started.elapsed());
+        let elapsed = micros(self.started.elapsed());
         self.update(|attempt| {
             attempt
                 .timings_us
@@ -335,21 +326,21 @@ impl AttemptGuard {
             .record
             .timings_us
             .entry("first_output".to_owned())
-            .or_insert_with(|| super::micros(self.observation.started.elapsed()));
+            .or_insert_with(|| micros(self.observation.started.elapsed()));
     }
     pub(crate) fn first_visible_text(&self) {
         self.update(|attempt| {
             attempt
                 .timings_us
                 .entry("first_visible_text".to_owned())
-                .or_insert_with(|| super::micros(self.started.elapsed()));
+                .or_insert_with(|| micros(self.started.elapsed()));
         });
         let mut pending = self.observation.pending.lock();
         pending
             .record
             .timings_us
             .entry("first_visible_text".to_owned())
-            .or_insert_with(|| super::micros(self.observation.started.elapsed()));
+            .or_insert_with(|| micros(self.observation.started.elapsed()));
     }
     pub(crate) fn requires_terminal_marker(&self) -> bool {
         matches!(
@@ -372,7 +363,7 @@ impl AttemptGuard {
             attempt.error_class = error.map(str::to_owned);
             attempt
                 .timings_us
-                .insert("total".to_owned(), super::micros(self.started.elapsed()));
+                .insert("total".to_owned(), micros(self.started.elapsed()));
         });
         self.done = true;
     }

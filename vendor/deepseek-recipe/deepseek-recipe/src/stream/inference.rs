@@ -69,9 +69,8 @@ pub enum InferenceFinishReason {
     ContentFilter,
 }
 
-/// The finish reason that protocol chunk generators report, which
-/// [`StreamProcessor`](super::StreamProcessor) derives from the backend's
-/// finish reason, parsed tool calls, and matched stop sequences.
+/// The finish reason that protocol chunk generators report, derived from the
+/// backend's finish reason, parsed tool calls, and matched stop sequences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {
     /// The backend stopped without a parsed tool call.

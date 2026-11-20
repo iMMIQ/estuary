@@ -34,6 +34,10 @@ pub enum GatewayError {
     InvalidUpstreamResponse,
     #[error("upstream request failed: {0}")]
     Upstream(String),
+    #[error("invalid or missing API key")]
+    Unauthorized,
+    #[error("rate limit exceeded")]
+    RateLimited { retry_after: u64 },
     #[error("internal gateway error")]
     Internal,
 }
@@ -45,7 +49,9 @@ impl GatewayError {
             | Self::MissingModel
             | Self::UnsupportedFeature(_)
             | Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::UnknownModel(_) | Self::RouteNotFound => StatusCode::NOT_FOUND,
+            Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::NoHealthyNode(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
@@ -62,6 +68,8 @@ impl GatewayError {
         match self {
             Self::InvalidJson => "invalid_json",
             Self::MissingModel => "missing_model",
+            Self::Unauthorized => "invalid_api_key",
+            Self::RateLimited { .. } => "rate_limit_exceeded",
             Self::UnknownModel(_) => "model_not_found",
             Self::NoHealthyNode(_) => "no_healthy_upstream",
             Self::PayloadTooLarge => "request_too_large",
@@ -75,26 +83,56 @@ impl GatewayError {
             Self::Internal => "internal_error",
         }
     }
+
+    pub(crate) fn retry_after(&self) -> Option<HeaderValue> {
+        match self {
+            Self::NoHealthyNode(_) => Some(HeaderValue::from_static("1")),
+            Self::RateLimited { retry_after } => {
+                HeaderValue::from_str(&retry_after.to_string()).ok()
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Serialize)]
-struct ErrorEnvelope {
-    error: ErrorBody,
+struct ErrorEnvelope<'a> {
+    error: ErrorBody<'a>,
 }
 
 #[derive(Serialize)]
-struct ErrorBody {
+struct ErrorBody<'a> {
     message: String,
     r#type: &'static str,
     param: Option<String>,
-    code: &'static str,
+    code: &'a str,
+}
+
+pub(crate) fn openai_error_response(
+    status: StatusCode,
+    error_type: &'static str,
+    code: &str,
+    message: String,
+) -> Response {
+    (
+        status,
+        Json(ErrorEnvelope {
+            error: ErrorBody {
+                message,
+                r#type: error_type,
+                param: None,
+                code,
+            },
+        }),
+    )
+        .into_response()
 }
 
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
-        let status = self.status();
-        let retryable = matches!(self, Self::NoHealthyNode(_));
         let error_type = match self {
+            Self::Unauthorized => "authentication_error",
+            Self::RateLimited { .. } => "rate_limit_error",
             Self::InvalidJson
             | Self::MissingModel
             | Self::UnknownModel(_)
@@ -105,19 +143,10 @@ impl IntoResponse for GatewayError {
             | Self::RouteNotFound => "invalid_request_error",
             _ => "api_error",
         };
-        let body = Json(ErrorEnvelope {
-            error: ErrorBody {
-                message: self.to_string(),
-                r#type: error_type,
-                param: None,
-                code: self.code(),
-            },
-        });
-        let mut response = (status, body).into_response();
-        if retryable {
-            response
-                .headers_mut()
-                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        let mut response =
+            openai_error_response(self.status(), error_type, self.code(), self.to_string());
+        if let Some(retry_after) = self.retry_after() {
+            response.headers_mut().insert(RETRY_AFTER, retry_after);
         }
         response
     }

@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    mem::size_of,
+    mem::{size_of, size_of_val},
     sync::Arc,
 };
 
@@ -34,7 +34,6 @@ pub enum CacheMutation {
 #[derive(Debug, Default)]
 pub struct ExactPrefixMatch {
     pub matched_tokens: HashMap<String, usize>,
-    pub authoritative_nodes: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -52,10 +51,6 @@ pub struct ExactCacheDirectory {
 impl ExactCacheDirectory {
     pub fn configure_node(&self, node_id: &str, max_blocks: usize) {
         self.configure_node_owned(node_id, max_blocks, usize::MAX, 0);
-    }
-
-    pub fn remove_node(&self, node_id: &str) {
-        self.nodes.write().remove(node_id);
     }
 
     pub fn configure_node_owned(
@@ -138,46 +133,35 @@ impl ExactCacheDirectory {
         Ok(())
     }
 
+    fn with_owned_node(&self, node_id: &str, owner: u64, f: impl FnOnce(&mut NodeCache)) {
+        if let Some(node_lock) = self.nodes.read().get(node_id).cloned() {
+            let mut node = node_lock.write();
+            if node.owner == owner {
+                f(&mut node);
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub fn invalidate_node(&self, node_id: &str) {
         self.invalidate_node_owned(node_id, 0);
     }
 
     pub fn invalidate_node_owned(&self, node_id: &str, owner: u64) {
-        let node_lock = self.nodes.read().get(node_id).cloned();
-        if let Some(node_lock) = node_lock {
-            let mut node = node_lock.write();
-            if node.owner == owner {
-                node.invalidate();
-            }
-        }
+        self.with_owned_node(node_id, owner, NodeCache::invalidate);
     }
 
+    #[cfg(test)]
     pub fn suspend_node(&self, node_id: &str) {
         self.suspend_node_owned(node_id, 0);
     }
 
     pub fn suspend_node_owned(&self, node_id: &str, owner: u64) {
-        let node_lock = self.nodes.read().get(node_id).cloned();
-        if let Some(node_lock) = node_lock {
-            let mut node = node_lock.write();
-            if node.owner == owner {
-                node.authoritative = false;
-            }
-        }
-    }
-
-    pub fn resume_node(&self, node_id: &str) {
-        self.resume_node_owned(node_id, 0);
+        self.with_owned_node(node_id, owner, |node| node.authoritative = false);
     }
 
     pub fn resume_node_owned(&self, node_id: &str, owner: u64) {
-        let node_lock = self.nodes.read().get(node_id).cloned();
-        if let Some(node_lock) = node_lock {
-            let mut node = node_lock.write();
-            if node.owner == owner {
-                node.authoritative = true;
-            }
-        }
+        self.with_owned_node(node_id, owner, |node| node.authoritative = true);
     }
 
     pub fn matches(&self, token_ids: &[u64]) -> ExactPrefixMatch {
@@ -187,7 +171,7 @@ impl ExactCacheDirectory {
             .iter()
             .map(|(id, lock)| (id.clone(), Arc::clone(lock)))
             .collect();
-        let mut result = ExactPrefixMatch::default();
+        let mut matched_tokens = HashMap::new();
         for (node_id, node_lock) in entries {
             let node = node_lock.read();
             if !node.authoritative {
@@ -195,22 +179,23 @@ impl ExactCacheDirectory {
             }
             let matched = node.longest_match(token_ids);
             drop(node);
-            result.authoritative_nodes.insert(node_id.clone());
-            result.matched_tokens.insert(node_id, matched);
+            matched_tokens.insert(node_id, matched);
         }
-        result
+        ExactPrefixMatch { matched_tokens }
     }
 
     pub fn snapshot(&self, node_id: &str) -> NodeCacheSnapshot {
-        let node_lock = self.nodes.read().get(node_id).cloned();
-        node_lock.map_or_else(NodeCacheSnapshot::default, |node_lock| {
-            let node = node_lock.read();
-            NodeCacheSnapshot {
-                authoritative: node.authoritative,
-                blocks: node.block_count,
-                bytes: node.directory_bytes,
-            }
-        })
+        self.nodes.read().get(node_id).cloned().map_or_else(
+            NodeCacheSnapshot::default,
+            |node_lock| {
+                let node = node_lock.read();
+                NodeCacheSnapshot {
+                    authoritative: node.authoritative,
+                    blocks: node.block_count,
+                    bytes: node.directory_bytes,
+                }
+            },
+        )
     }
 }
 
@@ -273,28 +258,21 @@ impl NodeCache {
             bail!("vLLM KV directory exceeded its configured block limit");
         }
         let new_group = !self.groups.contains_key(&group);
-        let additional_bytes = if let Some(trie) = self.groups.get(&group) {
-            trie.additional_bytes(&hashes, parent, token_ids, block_size)?
-        } else {
-            TokenTrie::default()
-                .additional_bytes(&hashes, parent, token_ids, block_size)?
-                .saturating_add(size_of::<(i64, TokenTrie)>())
-                .saturating_add(size_of::<BlockNode>())
-        };
-        if self.directory_bytes.saturating_add(additional_bytes) > self.max_bytes {
-            bail!("vLLM KV directory exceeded its configured byte limit");
-        }
+        let group_overhead = usize::from(new_group) * size_of::<(i64, TokenTrie)>();
         let trie = self.groups.entry(group).or_default();
         let before = if new_group { 0 } else { trie.memory_bytes };
-        trie.store(hashes, parent, token_ids, block_size)?;
+        let byte_budget = self
+            .max_bytes
+            .saturating_sub(self.directory_bytes.saturating_add(group_overhead))
+            .saturating_add(before);
+        if trie.memory_bytes > byte_budget {
+            bail!("vLLM KV directory exceeded its configured byte limit");
+        }
+        trie.store(hashes, parent, token_ids, block_size, byte_budget)?;
         self.directory_bytes = self
             .directory_bytes
             .saturating_add(trie.memory_bytes.saturating_sub(before))
-            .saturating_add(if new_group {
-                size_of::<(i64, TokenTrie)>()
-            } else {
-                0
-            });
+            .saturating_add(group_overhead);
         self.block_count = self.block_count.saturating_add(additions);
         Ok(())
     }
@@ -312,9 +290,6 @@ impl NodeCache {
     }
 
     fn longest_match(&self, token_ids: &[u64]) -> usize {
-        if self.groups.is_empty() {
-            return 0;
-        }
         self.groups
             .values()
             .map(|group| group.longest_match(token_ids))
@@ -341,7 +316,7 @@ impl NodeCache {
 struct BlockNode {
     parent: Option<usize>,
     edge: Box<[u64]>,
-    children: HashMap<u64, Vec<usize>>,
+    children: HashMap<Box<[u64]>, usize>,
     terminals: usize,
     depth: usize,
 }
@@ -380,59 +355,13 @@ impl Default for TokenTrie {
 }
 
 impl TokenTrie {
-    fn additional_bytes(
-        &self,
-        hashes: &[BlockHash],
-        parent: Option<&BlockHash>,
-        token_ids: &[u64],
-        block_size: usize,
-    ) -> Result<usize> {
-        if self
-            .block_size
-            .is_some_and(|existing| existing != block_size)
-        {
-            bail!("vLLM KV cache group changed block size");
-        }
-        let mut current = match parent {
-            Some(hash) => Some(
-                self.hashes
-                    .get(hash)
-                    .copied()
-                    .ok_or_else(|| anyhow::anyhow!("vLLM KV parent hash is unknown"))?,
-            ),
-            None => Some(0),
-        };
-        let mut additional = 0usize;
-        for (index, hash) in hashes.iter().enumerate() {
-            let start = index * block_size;
-            let edge = &token_ids[start..start + block_size];
-            current = current.and_then(|parent| self.find_child(parent, edge));
-            if current.is_none() {
-                additional = additional
-                    .saturating_add(size_of::<BlockNode>())
-                    .saturating_add(size_of_val(edge))
-                    .saturating_add(size_of::<(u64, Vec<usize>)>())
-                    .saturating_add(size_of::<usize>());
-            }
-            if !self.hashes.contains_key(hash) {
-                additional = additional.saturating_add(hash_memory_bytes(hash));
-            } else if let Some(current) = current {
-                if self.hashes[hash] != current {
-                    bail!("vLLM KV hash mapped to conflicting token prefixes");
-                }
-            } else {
-                bail!("vLLM KV hash mapped to conflicting token prefixes");
-            }
-        }
-        Ok(additional)
-    }
-
     fn store(
         &mut self,
         hashes: Vec<BlockHash>,
         parent: Option<&BlockHash>,
         token_ids: &[u64],
         block_size: usize,
+        max_bytes: usize,
     ) -> Result<()> {
         if self
             .block_size
@@ -452,35 +381,35 @@ impl TokenTrie {
 
         for (index, hash) in hashes.into_iter().enumerate() {
             let start = index * block_size;
-            current = self.child_or_insert(current, &token_ids[start..start + block_size]);
+            current =
+                self.child_or_insert(current, &token_ids[start..start + block_size], max_bytes)?;
             if let Some(existing) = self.hashes.get(&hash) {
                 if *existing != current {
                     bail!("vLLM KV hash mapped to conflicting token prefixes");
                 }
                 continue;
             }
-            self.memory_bytes = self.memory_bytes.saturating_add(hash_memory_bytes(&hash));
+            let next_bytes = self.memory_bytes.saturating_add(hash_memory_bytes(&hash));
+            if next_bytes > max_bytes {
+                bail!("vLLM KV directory exceeded its configured byte limit");
+            }
+            self.memory_bytes = next_bytes;
             self.hashes.insert(hash, current);
             self.node_mut(current).terminals = self.node(current).terminals.saturating_add(1);
         }
         Ok(())
     }
 
-    fn find_child(&self, parent: usize, edge: &[u64]) -> Option<usize> {
-        let first = *edge.first()?;
-        self.node(parent)
-            .children
-            .get(&first)?
-            .iter()
-            .copied()
-            .find(|child| self.node(*child).edge.as_ref() == edge)
-    }
-
-    fn child_or_insert(&mut self, parent: usize, edge: &[u64]) -> usize {
-        if let Some(child) = self.find_child(parent, edge) {
-            return child;
+    fn child_or_insert(&mut self, parent: usize, edge: &[u64], max_bytes: usize) -> Result<usize> {
+        if let Some(&child) = self.node(parent).children.get(edge) {
+            return Ok(child);
         }
-        let first = edge[0];
+        let next_bytes = self
+            .memory_bytes
+            .saturating_add(block_node_memory_bytes(edge));
+        if next_bytes > max_bytes {
+            bail!("vLLM KV directory exceeded its configured byte limit");
+        }
         let depth = self.node(parent).depth.saturating_add(edge.len());
         let node = BlockNode {
             parent: Some(parent),
@@ -496,15 +425,9 @@ impl TokenTrie {
             self.nodes.push(Some(node));
             self.nodes.len() - 1
         };
-        self.node_mut(parent)
-            .children
-            .entry(first)
-            .or_default()
-            .push(index);
-        self.memory_bytes = self
-            .memory_bytes
-            .saturating_add(block_node_memory_bytes(edge));
-        index
+        self.node_mut(parent).children.insert(edge.into(), index);
+        self.memory_bytes = next_bytes;
+        Ok(index)
     }
 
     fn remove(&mut self, hash: &BlockHash) -> Option<usize> {
@@ -514,23 +437,13 @@ impl TokenTrie {
         self.node_mut(index).terminals = self.node(index).terminals.saturating_sub(1);
         while index != 0 && self.node(index).terminals == 0 && self.node(index).children.is_empty()
         {
-            let parent = self
-                .node(index)
-                .parent
-                .expect("non-root trie node has a parent");
-            let first = self.node(index).edge[0];
-            let removed_bytes = block_node_memory_bytes(&self.node(index).edge);
-            self.nodes[index] = None;
+            let removed = self.nodes[index]
+                .take()
+                .expect("active trie index contains a node");
+            let parent = removed.parent.expect("non-root trie node has a parent");
+            let removed_bytes = block_node_memory_bytes(&removed.edge);
             self.free.push(index);
-            let children = self
-                .node_mut(parent)
-                .children
-                .get_mut(&first)
-                .expect("parent contains the child being removed");
-            children.retain(|child| *child != index);
-            if children.is_empty() {
-                self.node_mut(parent).children.remove(&first);
-            }
+            self.node_mut(parent).children.remove(removed.edge.as_ref());
             self.memory_bytes = self.memory_bytes.saturating_sub(removed_bytes);
             index = parent;
         }
@@ -546,7 +459,7 @@ impl TokenTrie {
         };
         while offset.saturating_add(block_size) <= token_ids.len() {
             let edge = &token_ids[offset..offset + block_size];
-            let Some(child) = self.find_child(current, edge) else {
+            let Some(&child) = self.node(current).children.get(edge) else {
                 break;
             };
             current = child;
@@ -571,10 +484,6 @@ impl TokenTrie {
     }
 }
 
-fn size_of_val<T>(slice: &[T]) -> usize {
-    size_of::<T>().saturating_mul(slice.len())
-}
-
 fn hash_memory_bytes(hash: &BlockHash) -> usize {
     size_of::<(BlockHash, usize)>()
         + match hash {
@@ -585,9 +494,8 @@ fn hash_memory_bytes(hash: &BlockHash) -> usize {
 
 fn block_node_memory_bytes(edge: &[u64]) -> usize {
     size_of::<BlockNode>()
-        .saturating_add(size_of_val(edge))
-        .saturating_add(size_of::<(u64, Vec<usize>)>())
-        .saturating_add(size_of::<usize>())
+        .saturating_add(size_of_val(edge).saturating_mul(2))
+        .saturating_add(size_of::<(Box<[u64]>, usize)>())
 }
 
 #[cfg(test)]
@@ -639,6 +547,7 @@ mod tests {
             None,
             &[10, 11, 12, 13, 14, 15, 16, 17],
             4,
+            usize::MAX,
         )
         .unwrap();
 
@@ -649,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_limit_rejects_before_mutating_the_directory() {
+    fn byte_limit_rejects_and_invalidates_the_directory() {
         let directory = ExactCacheDirectory::default();
         directory.configure_node_owned("a", 10, 1, 0);
         let result = directory.apply_owned(
@@ -703,9 +612,9 @@ mod tests {
         let directory = ExactCacheDirectory::default();
         directory.configure_node("a", 10);
         directory.apply("a", vec![CacheMutation::Clear]).unwrap();
-        assert!(directory.matches(&[1]).authoritative_nodes.contains("a"));
+        assert!(directory.matches(&[1]).matched_tokens.contains_key("a"));
         directory.invalidate_node("a");
-        assert!(!directory.matches(&[1]).authoritative_nodes.contains("a"));
+        assert!(!directory.matches(&[1]).matched_tokens.contains_key("a"));
     }
 
     #[test]

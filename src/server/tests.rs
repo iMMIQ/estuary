@@ -2,11 +2,14 @@ use super::assets::*;
 use super::middleware::*;
 use super::transport::*;
 use super::*;
-use axum::http::{
-    HeaderMap,
-    header::{ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, VARY},
-};
 use axum::serve::Listener;
+use axum::{
+    http::{
+        HeaderMap, StatusCode,
+        header::{ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, VARY},
+    },
+    response::IntoResponse,
+};
 
 fn gateway_with_busy_node(max_concurrency: usize) -> (Gateway, crate::config::NodeConfig) {
     let config = crate::config::NodeConfig {
@@ -39,10 +42,6 @@ async fn apply_node_update(
     admin::update_node(
         State(Arc::clone(state)),
         axum::extract::Path(config.id.clone()),
-        axum::extract::Query(admin::MutationQuery {
-            timeout_ms: Some(0),
-            revision: None,
-        }),
         Json(admin::UpdateNodeRequest {
             revision,
             config,
@@ -51,6 +50,7 @@ async fn apply_node_update(
         }),
     )
     .await
+    .into_response()
 }
 
 #[tokio::test]
@@ -173,10 +173,13 @@ async fn reconciliation_updates_busy_nodes_and_deletion_waits_for_all_generation
             }),
         )
     };
-    assert_eq!(deletion().await.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        deletion().await.into_response().status(),
+        StatusCode::CONFLICT
+    );
     assert_eq!(state.scheduler.node("live").unwrap().active(), 1);
     drop(lease);
-    assert_eq!(deletion().await.status(), StatusCode::OK);
+    assert_eq!(deletion().await.into_response().status(), StatusCode::OK);
     assert!(state.scheduler.node("live").is_none());
 }
 
@@ -226,8 +229,13 @@ fn gzip_negotiation_respects_explicit_refusal_and_quality() {
 
 #[tokio::test]
 async fn admin_assets_serve_precompressed_bytes_with_matching_content_type_and_cache_policy() {
+    use std::io::Read;
+
     let path = AdminAssets::iter()
-        .find(|path| path.ends_with(".css"))
+        .find_map(|path| {
+            path.strip_suffix(".css.gz")
+                .map(|stem| format!("{stem}.css"))
+        })
         .unwrap();
     let plain = embedded_admin_response(&path, true, false);
     let compressed = embedded_admin_response(&path, true, true);
@@ -250,6 +258,11 @@ async fn admin_assets_serve_precompressed_bytes_with_matching_content_type_and_c
         .unwrap();
     assert!(compressed.starts_with(&[0x1f, 0x8b]));
     assert!(compressed.len() < plain.len());
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(compressed.as_ref())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, plain.as_ref());
     assert_eq!(
         embedded_admin_response("index.html", false, true).headers()[CACHE_CONTROL],
         "no-store"

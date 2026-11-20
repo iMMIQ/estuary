@@ -1,6 +1,6 @@
 import { Alert, Badge, Group, Select, Table } from "@mantine/core";
 import { useEffect, useId, useRef, useState } from "react";
-import { useTranslation } from "react-i18next";
+import { useTranslation } from "./i18n";
 import {
   chartPath,
   finiteMetric,
@@ -8,7 +8,7 @@ import {
   metricPercent,
   nearestSample,
 } from "./metric-series";
-import type { HistoryPoint, Observability, ScopeMetrics } from "./observability-types";
+import type { HistoryPoint, Observability, ScopeMetrics } from "./types";
 import { formatBytes, HelpTip } from "./ui";
 
 type Line = { label: string; read: (point: HistoryPoint) => number | null; dashed?: boolean };
@@ -28,7 +28,7 @@ function Trend({
   selectedAt: number | null;
   onInspect: (value: number) => void;
 }) {
-  const { t, i18n } = useTranslation();
+  const { t, locale } = useTranslation();
   const box = useRef<HTMLDivElement>(null);
   const id = useId();
   const [width, setWidth] = useState(480);
@@ -56,7 +56,7 @@ function Trend({
   const y = (value: number) => bottom - (value / maximum) * (bottom - top);
   const selectedPoint = selectedAt === null ? null : history[nearestSample(history, selectedAt)];
   const time = (value: number) =>
-    new Date(value).toLocaleTimeString(i18n.resolvedLanguage, {
+    new Date(value).toLocaleTimeString(locale, {
       hour: "2-digit",
       minute: "2-digit",
     });
@@ -103,7 +103,7 @@ function Trend({
                 y={y(maximum * fraction) + 4}
                 textAnchor="end"
               >
-                {metricNumber(maximum * fraction, i18n.resolvedLanguage)}
+                {metricNumber(maximum * fraction, locale)}
               </text>
             </g>
           ))}
@@ -147,14 +147,12 @@ function Trend({
           <span key={line.label}>
             <i className={`metric-swatch metric-series-${index}`} />
             {line.label}
-            {selectedPoint
-              ? ` ${metricNumber(line.read(selectedPoint), i18n.resolvedLanguage)} ${unit}`
-              : ""}
+            {selectedPoint ? ` ${metricNumber(line.read(selectedPoint), locale)} ${unit}` : ""}
           </span>
         ))}
         {selectedPoint && (
           <time dateTime={new Date(selectedPoint.at_unix_ms).toISOString()}>
-            {new Date(selectedPoint.at_unix_ms).toLocaleTimeString(i18n.resolvedLanguage)}
+            {new Date(selectedPoint.at_unix_ms).toLocaleTimeString(locale)}
           </time>
         )}
       </figcaption>
@@ -217,8 +215,7 @@ export function ObservabilityPanel({
   nodeId?: string;
   nodeInstance?: number;
 }) {
-  const { t, i18n } = useTranslation();
-  const locale = i18n.resolvedLanguage;
+  const { t, locale } = useTranslation();
   const inspectionKey = JSON.stringify([
     data?.instance_id,
     data?.selected?.kind,

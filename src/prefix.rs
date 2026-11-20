@@ -127,6 +127,33 @@ impl PrefixInput {
     }
 }
 
+pub(crate) fn is_media_object(items: &serde_json::Map<String, Value>) -> bool {
+    matches!(
+        items.get("type").and_then(Value::as_str),
+        Some(
+            "image"
+                | "image_url"
+                | "input_image"
+                | "audio"
+                | "input_audio"
+                | "audio_url"
+                | "video"
+                | "video_url"
+                | "input_video"
+                | "file"
+                | "input_file"
+        )
+    )
+}
+
+pub(crate) fn has_media(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(has_media),
+        Value::Object(object) => is_media_object(object) || object.values().any(has_media),
+        _ => false,
+    }
+}
+
 fn estimate_tokens(value: &Value) -> usize {
     match value {
         Value::String(text) => estimate_text_tokens(text),
@@ -135,25 +162,7 @@ fn estimate_tokens(value: &Value) -> usize {
         }),
         Value::Object(items) => {
             // Encoded media length is not a text-token or GPU-work estimate.
-            if items
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| {
-                    matches!(
-                        kind,
-                        "image"
-                            | "image_url"
-                            | "input_image"
-                            | "input_audio"
-                            | "audio"
-                            | "video"
-                            | "video_url"
-                            | "input_video"
-                            | "file"
-                            | "input_file"
-                    )
-                })
-            {
+            if is_media_object(items) {
                 return 0;
             }
             items.values().fold(0usize, |sum, item| {
@@ -181,13 +190,40 @@ fn estimate_text_tokens(text: &str) -> usize {
     ascii.div_ceil(4).saturating_add(non_ascii)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct NodeMatch {
+    pub chars: usize,
+    pub age_seconds: f64,
+}
+
 #[derive(Debug, Default)]
 pub struct PrefixMatch {
-    pub node_ids: Vec<String>,
     pub matched_chars: usize,
     pub input_chars: usize,
-    pub node_matches: HashMap<String, usize>,
-    pub node_age_seconds: HashMap<String, f64>,
+    pub node_matches: HashMap<String, NodeMatch>,
+}
+
+impl PrefixMatch {
+    pub fn best_nodes(&self) -> Vec<String> {
+        if self.matched_chars == 0 {
+            return Vec::new();
+        }
+        let mut nodes = self
+            .node_matches
+            .iter()
+            .filter(|&(_, matched)| matched.chars == self.matched_chars)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        nodes.sort_unstable();
+        nodes
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TenantState {
+    last_access: u64,
+    oldest_leaf: u64,
+    last_seen: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -195,9 +231,7 @@ struct RadixNode {
     text: String,
     char_count: usize,
     children: HashMap<char, RadixNode>,
-    tenant_last_access: HashMap<String, u64>,
-    tenant_oldest_leaf: HashMap<String, u64>,
-    tenant_last_seen: HashMap<String, Instant>,
+    tenants: HashMap<String, TenantState>,
 }
 
 impl RadixNode {
@@ -207,9 +241,14 @@ impl RadixNode {
             text,
             char_count,
             children: HashMap::new(),
-            tenant_last_access: HashMap::from([(tenant.to_owned(), epoch)]),
-            tenant_oldest_leaf: HashMap::from([(tenant.to_owned(), epoch)]),
-            tenant_last_seen: HashMap::from([(tenant.to_owned(), Instant::now())]),
+            tenants: HashMap::from([(
+                tenant.to_owned(),
+                TenantState {
+                    last_access: epoch,
+                    oldest_leaf: epoch,
+                    last_seen: Instant::now(),
+                },
+            )]),
         }
     }
 }
@@ -228,9 +267,19 @@ impl RadixTree {
         }
         self.epoch = self.epoch.wrapping_add(1);
         let epoch = self.epoch;
+        let now = Instant::now();
         self.root
-            .tenant_last_access
-            .insert(tenant.to_owned(), epoch);
+            .tenants
+            .entry(tenant.to_owned())
+            .and_modify(|state| {
+                state.last_access = epoch;
+                state.last_seen = now;
+            })
+            .or_insert(TenantState {
+                last_access: epoch,
+                oldest_leaf: epoch,
+                last_seen: now,
+            });
         let count = self.tenant_char_count.entry(tenant.to_owned()).or_default();
         insert_at(&mut self.root, text, tenant, epoch, count);
         refresh_oldest_leaf(&mut self.root, tenant);
@@ -245,9 +294,7 @@ impl RadixTree {
         let mut current = &self.root;
         let mut remaining = text;
         let mut matched_chars = 0;
-        let mut tenants = Vec::new();
         let mut node_matches = HashMap::new();
-        let mut node_age_seconds = HashMap::new();
         let now = Instant::now();
 
         while let Some(first) = remaining.chars().next() {
@@ -261,18 +308,15 @@ impl RadixTree {
                 shared_prefix_chars(remaining, &child.text)
             };
             matched_chars += shared;
-            tenants = child.tenant_last_access.keys().cloned().collect();
-            for (tenant, recorded) in &child.tenant_last_seen {
-                if let Some(matched) = node_matches.get_mut(tenant) {
-                    *matched = matched_chars;
+            for (tenant, state) in &child.tenants {
+                let entry = NodeMatch {
+                    chars: matched_chars,
+                    age_seconds: now.saturating_duration_since(state.last_seen).as_secs_f64(),
+                };
+                if let Some(existing) = node_matches.get_mut(tenant) {
+                    *existing = entry;
                 } else {
-                    node_matches.insert(tenant.clone(), matched_chars);
-                }
-                let age = now.saturating_duration_since(*recorded).as_secs_f64();
-                if let Some(previous) = node_age_seconds.get_mut(tenant) {
-                    *previous = age;
-                } else {
-                    node_age_seconds.insert(tenant.clone(), age);
+                    node_matches.insert(tenant.clone(), entry);
                 }
             }
             if !full_edge {
@@ -282,13 +326,10 @@ impl RadixTree {
             current = child;
         }
 
-        tenants.sort_unstable();
         PrefixMatch {
-            node_ids: tenants,
             matched_chars,
             input_chars,
             node_matches,
-            node_age_seconds,
         }
     }
 
@@ -310,32 +351,56 @@ impl RadixTree {
 
         if self.tenant_char_count.get(tenant).copied() == Some(0) {
             self.tenant_char_count.remove(tenant);
-            self.root.tenant_last_access.remove(tenant);
+            self.root.tenants.remove(tenant);
         }
     }
 
     fn clear_tenant(&mut self, tenant: &str) {
         clear_tenant_from_node(&mut self.root, tenant);
-        self.root.tenant_last_access.remove(tenant);
+        self.root.tenants.remove(tenant);
         self.tenant_char_count.remove(tenant);
     }
 }
 
 fn clear_tenant_from_node(node: &mut RadixNode, tenant: &str) {
-    node.tenant_last_seen.remove(tenant);
-    node.tenant_last_access.remove(tenant);
-    node.tenant_oldest_leaf.remove(tenant);
+    node.tenants.remove(tenant);
     node.children.retain(|_, child| {
         clear_tenant_from_node(child, tenant);
-        !child.children.is_empty() || !child.tenant_last_access.is_empty()
+        !child.children.is_empty() || !child.tenants.is_empty()
     });
+}
+
+fn touch_branch_tenant(node: &mut RadixNode, tenant: &str, count: &mut usize, added_chars: usize) {
+    let now = Instant::now();
+    if let Some(state) = node.tenants.get_mut(tenant) {
+        state.last_seen = now;
+    } else {
+        *count = count.saturating_add(added_chars);
+        node.tenants.insert(
+            tenant.to_owned(),
+            TenantState {
+                last_access: 0,
+                oldest_leaf: 0,
+                last_seen: now,
+            },
+        );
+    }
 }
 
 fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, count: &mut usize) {
     if remaining.is_empty() {
-        node.tenant_last_seen
-            .insert(tenant.to_owned(), Instant::now());
-        node.tenant_last_access.insert(tenant.to_owned(), epoch);
+        let now = Instant::now();
+        node.tenants
+            .entry(tenant.to_owned())
+            .and_modify(|state| {
+                state.last_access = epoch;
+                state.last_seen = now;
+            })
+            .or_insert(TenantState {
+                last_access: epoch,
+                oldest_leaf: epoch,
+                last_seen: now,
+            });
         refresh_oldest_leaf(node, tenant);
         return;
     }
@@ -353,13 +418,8 @@ fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, co
     };
 
     if let Some(suffix) = remaining.strip_prefix(&child.text) {
-        child
-            .tenant_last_seen
-            .insert(tenant.to_owned(), Instant::now());
-        if !child.tenant_last_access.contains_key(tenant) {
-            *count = count.saturating_add(child.char_count);
-            child.tenant_last_access.insert(tenant.to_owned(), 0);
-        }
+        let chars = child.char_count;
+        touch_branch_tenant(&mut child, tenant, count, chars);
         insert_at(&mut child, suffix, tenant, epoch, count);
         node.children.insert(first, child);
         refresh_oldest_leaf(node, tenant);
@@ -376,25 +436,15 @@ fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, co
         .chars()
         .next()
         .expect("radix suffix is not empty");
-    let inherited_tenants = child.tenant_last_access.clone();
-    let inherited_oldest = child.tenant_oldest_leaf.clone();
-    let inherited_seen = child.tenant_last_seen.clone();
+    let inherited_tenants = child.tenants.clone();
 
     let mut branch = RadixNode {
         text: take_chars(remaining, shared).to_owned(),
         char_count: shared,
         children: HashMap::from([(child_key, child)]),
-        tenant_last_access: inherited_tenants,
-        tenant_oldest_leaf: inherited_oldest,
-        tenant_last_seen: inherited_seen,
+        tenants: inherited_tenants,
     };
-    branch
-        .tenant_last_seen
-        .insert(tenant.to_owned(), Instant::now());
-    if !branch.tenant_last_access.contains_key(tenant) {
-        *count = count.saturating_add(shared);
-        branch.tenant_last_access.insert(tenant.to_owned(), 0);
-    }
+    touch_branch_tenant(&mut branch, tenant, count, shared);
     insert_at(
         &mut branch,
         advance_chars(remaining, shared),
@@ -407,12 +457,12 @@ fn insert_at(node: &mut RadixNode, remaining: &str, tenant: &str, epoch: u64, co
 }
 
 fn oldest_leaf(node: &RadixNode, tenant: &str, path: &mut Vec<char>) -> Option<(u64, Vec<char>)> {
-    let epoch = *node.tenant_oldest_leaf.get(tenant)?;
+    let epoch = node.tenants.get(tenant)?.oldest_leaf;
     let mut current = node;
     while let Some((key, child)) = current
         .children
         .iter()
-        .find(|(_, child)| child.tenant_oldest_leaf.get(tenant).copied() == Some(epoch))
+        .find(|(_, child)| child.tenants.get(tenant).map(|s| s.oldest_leaf) == Some(epoch))
     {
         path.push(*key);
         current = child;
@@ -424,24 +474,25 @@ fn refresh_oldest_leaf(node: &mut RadixNode, tenant: &str) {
     let oldest = node
         .children
         .values()
-        .filter_map(|child| child.tenant_oldest_leaf.get(tenant).copied())
+        .filter_map(|child| child.tenants.get(tenant).map(|s| s.oldest_leaf))
         .min()
-        .or_else(|| node.tenant_last_access.get(tenant).copied());
+        .or_else(|| node.tenants.get(tenant).map(|s| s.last_access));
     if let Some(epoch) = oldest {
-        node.tenant_oldest_leaf.insert(tenant.to_owned(), epoch);
+        if let Some(state) = node.tenants.get_mut(tenant) {
+            state.oldest_leaf = epoch;
+        }
     } else {
-        node.tenant_oldest_leaf.remove(tenant);
+        node.tenants.remove(tenant);
     }
 }
 
 fn remove_tenant_at_path(node: &mut RadixNode, tenant: &str, path: &[char], depth: usize) -> usize {
     if depth == path.len() {
-        if node.tenant_last_access.remove(tenant).is_some() {
-            node.tenant_last_seen.remove(tenant);
-            node.tenant_oldest_leaf.remove(tenant);
-            return node.char_count;
-        }
-        return 0;
+        return if node.tenants.remove(tenant).is_some() {
+            node.char_count
+        } else {
+            0
+        };
     }
 
     let key = path[depth];
@@ -449,7 +500,7 @@ fn remove_tenant_at_path(node: &mut RadixNode, tenant: &str, path: &[char], dept
         return 0;
     };
     let removed = remove_tenant_at_path(child, tenant, path, depth + 1);
-    if child.children.is_empty() && child.tenant_last_access.is_empty() {
+    if child.children.is_empty() && child.tenants.is_empty() {
         node.children.remove(&key);
     }
     refresh_oldest_leaf(node, tenant);
@@ -886,8 +937,8 @@ mod tests {
     #[test]
     fn per_worker_prefix_matches_keep_shorter_owners_and_age_separately() {
         fn age(node: &mut RadixNode, timestamp: Instant) {
-            if let Some(seen) = node.tenant_last_seen.get_mut("short") {
-                *seen = timestamp;
+            if let Some(state) = node.tenants.get_mut("short") {
+                state.last_seen = timestamp;
             }
             for child in node.children.values_mut() {
                 age(child, timestamp);
@@ -901,10 +952,10 @@ mod tests {
             .unwrap();
         age(&mut tree.root, old);
         let matched = tree.prefix_match("shared short and long", 21);
-        assert_eq!(matched.node_matches["short"], 12);
-        assert_eq!(matched.node_matches["long"], 21);
-        assert!(matched.node_age_seconds["short"] >= 60.0);
-        assert!(matched.node_age_seconds["long"] < 1.0);
+        assert_eq!(matched.node_matches["short"].chars, 12);
+        assert_eq!(matched.node_matches["long"].chars, 21);
+        assert!(matched.node_matches["short"].age_seconds >= 60.0);
+        assert!(matched.node_matches["long"].age_seconds < 1.0);
     }
 
     #[test]
@@ -936,8 +987,7 @@ mod tests {
                     matched
                         .node_matches
                         .get(tenant)
-                        .copied()
-                        .unwrap_or_default(),
+                        .map_or(0, |item| item.chars),
                     expected,
                     "{tenant}: {text}"
                 );
@@ -974,7 +1024,7 @@ mod tests {
         directory.record("node-a", &first);
 
         let result = directory.best_match(&second);
-        assert_eq!(result.node_ids, ["node-a"]);
+        assert_eq!(result.best_nodes(), ["node-a"]);
         assert!(result.matched_chars > 20);
         assert!(result.matched_chars < result.input_chars);
     }
@@ -1002,7 +1052,7 @@ mod tests {
         directory.record("node-a", &first);
 
         let matched = directory.best_match(&second);
-        assert_eq!(matched.node_ids, ["node-a"]);
+        assert_eq!(matched.best_nodes(), ["node-a"]);
         assert_eq!(matched.matched_chars, matched.input_chars);
     }
 
@@ -1031,7 +1081,7 @@ mod tests {
             Some(&json!({"prompt": "shared alphabet"})),
             &config,
         ));
-        assert_eq!(result.node_ids, ["node-a"]);
+        assert_eq!(result.best_nodes(), ["node-a"]);
     }
 
     #[test]
@@ -1053,7 +1103,7 @@ mod tests {
             &config,
         );
         assert_eq!(
-            directory.best_match(&other_model).node_ids,
+            directory.best_match(&other_model).best_nodes(),
             Vec::<String>::new()
         );
     }
@@ -1082,7 +1132,7 @@ mod tests {
             &config,
         );
         assert_eq!(
-            directory.best_match(&evicted).node_ids,
+            directory.best_match(&evicted).best_nodes(),
             Vec::<String>::new()
         );
 
@@ -1213,9 +1263,12 @@ mod tests {
         tree.insert("aaaa", "node-a", 8);
         tree.insert("cccc", "node-a", 8);
 
-        assert_eq!(tree.prefix_match("aaaa", 4).node_ids, ["node-a"]);
-        assert_eq!(tree.prefix_match("bbbb", 4).node_ids, Vec::<String>::new());
-        assert_eq!(tree.prefix_match("cccc", 4).node_ids, ["node-a"]);
+        assert_eq!(tree.prefix_match("aaaa", 4).best_nodes(), ["node-a"]);
+        assert_eq!(
+            tree.prefix_match("bbbb", 4).best_nodes(),
+            Vec::<String>::new()
+        );
+        assert_eq!(tree.prefix_match("cccc", 4).best_nodes(), ["node-a"]);
     }
 
     #[test]

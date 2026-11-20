@@ -115,22 +115,19 @@ curl -H "Authorization: Bearer $ESTUARY_ADMIN_TOKEN" \
   'http://127.0.0.1:9090/admin/api/observability?scope=model&id=chat&window=300'
 ```
 
-`GET /metrics` exports the same source with bounded `scope` and `name` labels:
+`GET /metrics` exports all operational metrics through a single
+`prometheus-client` OpenMetrics registry (including bounded `scope` and `name`
+counters from observability, session-log status counters/gauges, and core
+gateway/node/queue/routing families):
 
-- `estuary_gateway_{started,success,failed,cancelled,unknown,retries,...}_total`;
-- `estuary_gateway_{incoming_requests,completed_requests,input_tokens,output_tokens}_per_second`
-  with `stat=raw|smoothed|mean_60s`;
-- lifetime `estuary_gateway_{ttft,upstream_ttft,duration,ingress,queue,tpot}_seconds`
-  and `estuary_gateway_generation_rate_tokens_per_second` histograms;
-- `estuary_engine_*_per_second` with the same `stat` values,
-  `estuary_engine_cache_hit_ratio`, `estuary_engine_preemptions_per_minute`,
-  and reporting/expected-node gauges;
-- `estuary_active_requests`, `estuary_upstream_active_requests`,
-  `estuary_concurrency_limit`, queue/memory gauges, and engine demand/KV gauges.
+- `estuary_gateway_{started,success,failed,cancelled,unknown,retries,input_tokens,output_tokens,cached_tokens}_total{scope,name}`;
+- `estuary_session_log_*` counters and gauges for session-log capture health;
+- core gateway request, upstream attempt, node concurrency/health/vLLM telemetry,
+  queue/memory, and latency histogram families.
 
-Unavailable series are omitted from exposition. Global queue and memory gauges
-are emitted only for fleet scope. Engine gauges are not attributed to models.
-Legacy HTTP header-creation metrics retain their existing names and semantics.
+Every metric family appears with a single `# TYPE` declaration and a single
+terminating `# EOF`. Full windowed distributions, smoothed rates, and 15-minute
+history series are served via `GET /admin/api/observability`.
 
 Collection retains at most 32 node scopes and 32 model scopes, plus fleet totals.
 Identifiers are limited to 1,024 bytes, window storage to 90 ten-second buckets

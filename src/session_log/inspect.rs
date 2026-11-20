@@ -40,30 +40,22 @@ pub(super) fn prepare(
     clippy::case_sensitive_file_extension_comparisons
 )]
 fn stream_summary(bytes: &[u8], anthropic: bool) -> (Value, Value, &'static str) {
-    let text = String::from_utf8_lossy(bytes)
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
     let mut blocks: BTreeMap<String, Value> = BTreeMap::new();
     let mut reported = json!({});
     let mut terminal = false;
     let mut unknown = 0;
     let mut final_response = None;
-    for event in text.split("\n\n") {
-        let data = event
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if data.is_empty() {
-            continue;
-        }
-        if data == "[DONE]" {
+    let mut handle_event = |event: Result<&[u8], ()>| {
+        let Ok(data) = event else {
+            return;
+        };
+        if data == b"[DONE]" {
             terminal = true;
-            continue;
+            return;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+        let Ok(value) = serde_json::from_slice::<Value>(data) else {
             unknown += 1;
-            continue;
+            return;
         };
         merge_usage(&mut reported, &usage(&value, anthropic));
         let kind = value
@@ -163,7 +155,10 @@ fn stream_summary(bytes: &[u8], anthropic: bool) -> (Value, Value, &'static str)
         ) {
             unknown += 1;
         }
-    }
+    };
+    let mut parser = crate::sse::SseParser::new(usize::MAX);
+    parser.push(bytes, &mut handle_event);
+    parser.finish(&mut handle_event);
     let content = final_response.unwrap_or_else(|| {
         json!({
             "format":"stream_summary","blocks":blocks.into_values().collect::<Vec<_>>(),
@@ -207,21 +202,12 @@ fn usage(value: &Value, anthropic: bool) -> Value {
     else {
         return Value::Null;
     };
-    let input = raw
-        .get("prompt_tokens")
-        .or_else(|| raw.get("input_tokens"))
-        .and_then(Value::as_u64);
-    let read = raw
-        .get("cache_read_input_tokens")
-        .or_else(|| raw.get("prompt_cache_hit_tokens"))
-        .or_else(|| raw.pointer("/prompt_tokens_details/cached_tokens"))
-        .or_else(|| raw.pointer("/input_tokens_details/cached_tokens"))
-        .and_then(Value::as_u64);
-    let write = crate::inference_stats::cache_write_tokens(raw);
-    let total_input = input.map(|n| {
+    let mut parsed = crate::inference_stats::Usage::default();
+    parsed.observe_usage_object(raw);
+    let total_input = parsed.input_tokens.map(|n| {
         if anthropic {
-            n.saturating_add(read.unwrap_or_default())
-                .saturating_add(write.unwrap_or_default())
+            n.saturating_add(parsed.cached_tokens.unwrap_or_default())
+                .saturating_add(parsed.cache_write_tokens.unwrap_or_default())
         } else {
             n
         }
@@ -231,9 +217,16 @@ fn usage(value: &Value, anthropic: bool) -> Value {
     } else {
         json!({"capture_state":"omitted","reason":"usage_too_large"})
     };
-    json!({"input_tokens":total_input,"output_tokens":raw.get("completion_tokens").or_else(|| raw.get("output_tokens")).and_then(Value::as_u64),
-        "cache_read_tokens":read,"cache_write_tokens":write,"reasoning_tokens":raw.pointer("/completion_tokens_details/reasoning_tokens").or_else(|| raw.pointer("/output_tokens_details/reasoning_tokens")).and_then(Value::as_u64),
-        "source":"provider","normalization_version":1,"raw":raw_preview})
+    json!({
+        "input_tokens": total_input,
+        "output_tokens": parsed.output_tokens,
+        "cache_read_tokens": parsed.cached_tokens,
+        "cache_write_tokens": parsed.cache_write_tokens,
+        "reasoning_tokens": parsed.reasoning_tokens,
+        "source": "provider",
+        "normalization_version": 1,
+        "raw": raw_preview
+    })
 }
 
 pub(super) fn redact(value: &mut Value) {

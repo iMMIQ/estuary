@@ -14,7 +14,6 @@ The executable help is the complete configuration reference:
 
 ```bash
 estuary --help
-estuary supervisor --help
 ```
 
 Common settings and defaults:
@@ -172,13 +171,14 @@ The overview includes measured TTFT, pending prefill/decode token reservations,
 and admission warnings. Missing or stale provider telemetry is unavailable,
 rather than zero. Failed refreshes retain previous data with a stale-data
 notice. Polling pauses while the page is hidden and backs off after failures.
-The vLLM runtime panel starts collapsed on small screens.
 
-Editor and details code loads on demand. The embedded server negotiates
-precompressed gzip JavaScript/CSS using `Accept-Encoding`, sets `Vary`, and
-retains immutable caching for hashed assets. The HTML entry point is uncached.
-Run `bun run build` in `web/` before building the gateway to update its bundled
-assets, including the generated `.gz` files.
+Editor and details code loads on demand. The build stores JavaScript and CSS
+assets solely in precompressed `.gz` form; the embedded server serves them
+directly when the client advertises `gzip` in `Accept-Encoding` and decompresses
+on demand otherwise, always setting `Vary: Accept-Encoding` and immutable
+caching for hashed assets. The HTML entry point is uncached. Run `bun run build`
+in `web/` before building the gateway from source because `web/dist/` is not
+committed to Git.
 
 ## Metrics
 
@@ -222,9 +222,8 @@ configured withdrawal delay, stops accepting public connections, and drains
 accepted queues and response bodies until the shutdown grace expires.
 
 Concurrency limits, queues, health state, circuit state, and prefix directories
-are process-local. The built-in deployment process keeps one active worker in
-steady state and briefly overlaps generations while the previous worker drains.
-See [deployment](../deploy/README.md) for the supported rollout topology.
+are process-local. Use an external process manager or load balancer for rolling
+upgrades; see [deployment](../deploy/README.md).
 
 ## Scheduling Observability
 
@@ -250,7 +249,3 @@ Set both workload weights to zero to retain count/latency/error scoring without
 token-work contributions. Setting `ESTUARY_PREFIX_ENABLED=false` disables cache
 credit while preserving workload tracking. Existing balance thresholds scale
 cache-credit decay rather than trigger a global strategy switch.
-
-Default workload settings are omitted from serialized supervisor settings so
-workers from earlier releases can still read the default payload. Non-default
-workload overrides require a worker release that supports these options.

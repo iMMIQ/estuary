@@ -1,8 +1,7 @@
 import { expect, test } from "bun:test";
 import fixtures from "../../tests/fixtures/node-config-contract.json";
-import { configDefaults as defaults } from "./config-contract";
 import { integerBounds, validateNodeConfig } from "./config-validation";
-import type { NodeConfig } from "./generated/config";
+import { configDefaults as defaults, type NodeConfig } from "./generated/config";
 import { createDraft } from "./node-config";
 
 function apply(target: Record<string, unknown>, path: string, value: unknown): void {

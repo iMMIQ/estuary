@@ -30,11 +30,6 @@ pub const UNSUPPORTED_DOCUMENT_PLACEHOLDER: &str = "[Unsupported Document]";
 /// input.
 pub const UNSUPPORTED_IMAGE_PLACEHOLDER: &str = "[Unsupported Image]";
 
-/// Error message for a Chat Completions `file` block with an unsupported media
-/// type.
-pub const UNSUPPORTED_FILE_ERROR_MESSAGE: &str = "You have uploaded an unsupported file. Please \
-    make sure your file is valid and has one of the following formats: webp, png, jpeg, and gif.";
-
 /// Convert a Messages `url` image source.
 ///
 /// Checks the case-insensitive `http` prefix and a UTF-8 byte length no greater
@@ -121,34 +116,6 @@ pub(super) fn validate_data_url_sources(
             .map_err(|_| ConversionError::bad_request(format!("{path}: Invalid base64 data")))?;
     }
     Ok(())
-}
-
-/// Validate the `file_data` of a Chat Completions `file` block, returning the
-/// data URL image source. `path` prefixes the errors and is the path the
-/// source records, because Chat Completions resolves the images of a message
-/// under the message's path.
-pub(super) fn file_data_image_source(
-    file_data: String,
-    path: &str,
-) -> Result<ImageSource, ConversionError> {
-    let invalid = || {
-        ConversionError::bad_request(format!("{path}: file_data is not a valid base64 data url"))
-    };
-    let parsed = DataUrl::process(&file_data).map_err(|_| invalid())?;
-    if !is_supported_media_type(parsed.mime_type()) {
-        return Err(ConversionError::bad_request(format!(
-            "{path}: {UNSUPPORTED_FILE_ERROR_MESSAGE}"
-        )));
-    }
-    // The decoded bytes are not kept; see `validate_data_url_sources`.
-    parsed
-        .decode(|_| Ok::<(), Infallible>(()))
-        .map_err(|_| invalid())?;
-    Ok(ImageSource::DataUrl {
-        data_url: file_data,
-        detail: ImageDetail::default(),
-        path: path.to_string(),
-    })
 }
 
 /// Return whether a data URL media type is a supported image type.

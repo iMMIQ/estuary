@@ -7,8 +7,7 @@ use axum::{
     http::{HeaderMap, Method, Uri},
     response::{IntoResponse, Response},
 };
-use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
+use bytes::Bytes;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -17,19 +16,20 @@ use crate::{
     error::GatewayError,
     prefix::{PrefixInput, routing_text},
     server::{AppState, IngressAdmissionHandle, RequestId},
+    time::micros,
 };
 
-mod upstream;
-use upstream::proxy_with_retries;
+mod headers;
 mod request_compat;
+mod response;
+mod streaming;
+mod upstream;
+
 use request_compat::{
     normalize_context_management, reject_stateful_responses, replace_unsupported_images,
     strip_claude_code_billing_blocks,
 };
-mod response;
-mod streaming;
-
-mod headers;
+use upstream::proxy_with_retries;
 
 const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
@@ -79,6 +79,14 @@ fn model_object(id: String) -> ModelObject {
     }
 }
 
+fn error_response(error: GatewayError, is_anthropic: bool, request_id: &str) -> Response {
+    if is_anthropic {
+        anthropic::error_response(&error, request_id)
+    } else {
+        error.into_response()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy(
     State(state): State<Arc<AppState>>,
@@ -108,24 +116,18 @@ pub async fn proxy(
     .await
     {
         Ok(body) => body,
-        Err(error) if is_anthropic => {
-            if let Some(log) = &observation {
-                log.error("request_body", error.code());
-            }
-            return anthropic::error_response(&error, &gateway_request_id);
-        }
         Err(error) => {
             if let Some(log) = &observation {
                 log.error("request_body", error.code());
             }
-            return error.into_response();
+            return error_response(error, is_anthropic, &gateway_request_id);
         }
     };
     if let Some(admission) = &admission {
         admission.adjust_bytes(body.len());
     }
     if let Some(log) = &observation {
-        log.request_body(&body, crate::session_log::micros(body_started.elapsed()));
+        log.request_body(&body, micros(body_started.elapsed()));
     }
     let result = proxy_inner(
         state,
@@ -145,11 +147,7 @@ pub async fn proxy(
     {
         log.error("proxy", error.code());
     }
-    match result {
-        Ok(response) => response,
-        Err(error) if is_anthropic => anthropic::error_response(&error, &gateway_request_id),
-        Err(error) => error.into_response(),
-    }
+    result.unwrap_or_else(|error| error_response(error, is_anthropic, &gateway_request_id))
 }
 
 async fn read_request_body(
@@ -158,30 +156,22 @@ async fn read_request_body(
     idle_timeout: Duration,
     total_timeout: Duration,
 ) -> Result<Bytes, GatewayError> {
-    let mut stream = body.into_data_stream();
-    let mut output = BytesMut::new();
-    let deadline = tokio::time::Instant::now() + total_timeout;
-    loop {
-        let item =
-            tokio::time::timeout_at(deadline, tokio::time::timeout(idle_timeout, stream.next()))
-                .await
-                .map_err(|_| GatewayError::RequestTimeout)?
-                .map_err(|_| GatewayError::RequestTimeout)?;
-        let Some(item) = item else {
-            break;
-        };
-        let bytes = item
-            .map_err(|_| GatewayError::InvalidRequest("failed to read request body".to_owned()))?;
-        if output.len().saturating_add(bytes.len()) > limit {
-            return Err(GatewayError::PayloadTooLarge);
-        }
-        output.extend_from_slice(&bytes);
-    }
-    Ok(output.freeze())
+    response::read_body_stream(
+        body.into_data_stream(),
+        response::BodyReadLimits {
+            limit,
+            length_hint: 0,
+            idle_timeout,
+            total_timeout,
+        },
+        || GatewayError::RequestTimeout,
+        || GatewayError::InvalidRequest("failed to read request body".to_owned()),
+        || GatewayError::PayloadTooLarge,
+    )
+    .await
 }
 
-#[allow(clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn proxy_inner(
     state: Arc<AppState>,
     endpoint: String,
@@ -204,78 +194,64 @@ async fn proxy_inner(
             "Responses retrieve, delete, and cancel endpoints require durable node affinity",
         ));
     }
-
-    let is_inference_json = matches!(
-        endpoint.as_str(),
-        "chat/completions"
-            | "responses"
-            | "completions"
-            | "embeddings"
-            | "messages"
-            | "messages/count_tokens"
-    );
-    if method != Method::POST || !is_inference_json {
+    if method != Method::POST
+        || !matches!(
+            endpoint.as_str(),
+            "chat/completions"
+                | "responses"
+                | "completions"
+                | "embeddings"
+                | "messages"
+                | "messages/count_tokens"
+        )
+    {
         return Err(GatewayError::RouteNotFound);
     }
-    let mut parsed = if body.is_empty() {
-        None
-    } else {
-        sonic_rs::from_slice::<Value>(&body).ok()
-    };
+
+    let parsed = (!body.is_empty())
+        .then(|| serde_json::from_slice::<Value>(&body).ok())
+        .flatten();
     if let Some(log) = &observation {
         log.parsed(parsed.as_ref());
     }
-    if is_inference_json && parsed.is_none() {
-        return Err(GatewayError::InvalidJson);
-    }
+    let mut parsed = parsed.ok_or(GatewayError::InvalidJson)?;
     if endpoint == "responses" {
-        reject_stateful_responses(parsed.as_ref())?;
+        reject_stateful_responses(Some(&parsed))?;
     }
     let mut body_changed = false;
     if matches!(endpoint.as_str(), "messages" | "messages/count_tokens") {
-        body_changed |= normalize_context_management(
-            parsed.as_mut().expect("inference JSON was validated above"),
-        )?;
+        body_changed |= normalize_context_management(&mut parsed)?;
     }
-    body_changed |= parsed
-        .as_mut()
-        .is_some_and(strip_claude_code_billing_blocks);
+    body_changed |= strip_claude_code_billing_blocks(&mut parsed);
 
     let public_model = parsed
-        .as_ref()
-        .and_then(|value| value.get("model"))
+        .get("model")
         .and_then(Value::as_str)
-        .map(str::to_owned);
-    if is_inference_json && public_model.is_none() {
-        return Err(GatewayError::MissingModel);
-    }
-    if let (Some(telemetry), Some(model)) = (&telemetry, public_model.as_deref())
-        && state.scheduler.has_explicit_model(model)
+        .map(str::to_owned)
+        .ok_or(GatewayError::MissingModel)?;
+    if let Some(telemetry) = &telemetry
+        && state.scheduler.has_explicit_model(&public_model)
     {
-        telemetry.model(model);
+        telemetry.model(&public_model);
     }
-    if let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_mut())
-        && !state.scheduler.model_supports_multimodal(model)
-    {
-        body_changed |= replace_unsupported_images(parsed, model) > 0;
+    if !state.scheduler.model_supports_multimodal(&public_model) {
+        body_changed |= replace_unsupported_images(&mut parsed, &public_model) > 0;
     }
 
     let count_tokens = endpoint == "messages/count_tokens";
-    let protocol = if matches!(endpoint.as_str(), "messages" | "messages/count_tokens") {
+    let client_protocol = if matches!(endpoint.as_str(), "messages" | "messages/count_tokens") {
         ClientProtocol::Anthropic
     } else {
         ClientProtocol::OpenAi
     };
-    let (converted, bridge_context) =
-        chat_bridge::prepare(&endpoint, parsed.take().expect("validated JSON"))?;
+    let (parsed, bridge_context) = chat_bridge::prepare(&endpoint, parsed)?;
     let endpoint = if bridge_context.is_some() {
         "chat/completions".to_owned()
     } else {
         endpoint
     };
-    parsed = Some(converted);
     let original_body = if body_changed || bridge_context.is_some() {
-        sonic_rs::to_vec(parsed.as_ref().expect("validated JSON"))
+        serde_json::to_vec(&parsed)
             .map(Bytes::from)
             .map_err(|_| GatewayError::Internal)?
     } else {
@@ -284,18 +260,16 @@ async fn proxy_inner(
     let record_prefix = !count_tokens;
     let streaming = !count_tokens
         && parsed
-            .as_ref()
-            .and_then(|value| value.get("stream"))
+            .get("stream")
             .and_then(Value::as_bool)
             .unwrap_or(false);
     let mut prefix_input = routing_text(
         &endpoint,
-        public_model.as_deref(),
-        parsed.as_ref(),
+        Some(&public_model),
+        Some(&parsed),
         &state.settings.routing.prefix,
     );
-    if !count_tokens && let (Some(model), Some(parsed)) = (public_model.as_deref(), parsed.as_ref())
-    {
+    if !count_tokens {
         let allow_remote = state
             .scheduler
             .approximate_prefix_worth_tokenizing(&prefix_input);
@@ -304,8 +278,8 @@ async fn proxy_inner(
             .tokenize_for_routing(
                 &state.control_client,
                 &endpoint,
-                model,
-                parsed,
+                &public_model,
+                &parsed,
                 allow_remote,
             )
             .await;
@@ -313,10 +287,7 @@ async fn proxy_inner(
             .metrics
             .tokenization(tokenization.outcome, tokenization.elapsed);
         if let Some(log) = &observation {
-            log.timing(
-                "tokenization",
-                crate::session_log::micros(tokenization.elapsed),
-            );
+            log.timing("tokenization", micros(tokenization.elapsed));
             log.event(tokenization.outcome);
         }
         if let Some(tokens) = tokenization.tokens {
@@ -324,13 +295,12 @@ async fn proxy_inner(
         }
     }
 
-    let upstream_query = uri.query().map(str::to_owned);
     proxy_with_retries(
         state,
         ProxyRequest {
             endpoint,
             method,
-            query: upstream_query,
+            query: uri.query().map(str::to_owned),
             headers,
             original_body,
             parsed_body: parsed,
@@ -338,7 +308,7 @@ async fn proxy_inner(
             prefix_input,
             streaming,
             request_id,
-            client_protocol: protocol,
+            client_protocol,
             bridge_context,
             count_tokens,
             record_prefix,
@@ -358,8 +328,8 @@ struct ProxyRequest {
     query: Option<String>,
     headers: HeaderMap,
     original_body: Bytes,
-    parsed_body: Option<Value>,
-    public_model: Option<String>,
+    parsed_body: Value,
+    public_model: String,
     prefix_input: PrefixInput,
     streaming: bool,
     request_id: RequestId,
@@ -379,7 +349,7 @@ enum ClientProtocol {
 #[derive(Clone, Debug)]
 enum UpstreamResponseMode {
     Passthrough,
-    ChatBridge { context: Arc<chat_bridge::Context> },
+    ChatBridge { context: Box<chat_bridge::Context> },
     TokenCount,
 }
 

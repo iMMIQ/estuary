@@ -29,7 +29,7 @@ export default defineConfig(({ mode }) => {
           // Vite finalizes preload references and CSS in its own bundle hooks.
           order: "post",
           handler(_, bundle) {
-            for (const asset of Object.values(bundle)) {
+            for (const [key, asset] of Object.entries(bundle)) {
               if (!/\.(js|css)$/.test(asset.fileName)) continue;
               const source = asset.type === "chunk" ? asset.code : asset.source;
               this.emitFile({
@@ -37,6 +37,7 @@ export default defineConfig(({ mode }) => {
                 fileName: `${asset.fileName}.gz`,
                 source: gzipSync(source, { level: 9 }),
               });
+              delete bundle[key];
             }
           },
         },

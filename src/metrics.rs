@@ -18,7 +18,9 @@ use prometheus_client::{
 
 use crate::{
     node::{CircuitState, HealthState, LifecycleState, ProviderState},
+    observability::Observability,
     scheduler::Scheduler,
+    session_log::LogSink,
 };
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
@@ -41,6 +43,12 @@ struct NodeLabels {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
 struct TokenizationLabels {
     outcome: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
+struct ScopeLabels {
+    scope: String,
+    name: String,
 }
 
 #[derive(Debug)]
@@ -81,9 +89,38 @@ pub struct Metrics {
     input_tokens: Histogram,
     cached_tokens: Histogram,
     output_tokens: Histogram,
+    gateway_started: Family<ScopeLabels, Counter>,
+    gateway_success: Family<ScopeLabels, Counter>,
+    gateway_failed: Family<ScopeLabels, Counter>,
+    gateway_cancelled: Family<ScopeLabels, Counter>,
+    gateway_unknown: Family<ScopeLabels, Counter>,
+    gateway_retries: Family<ScopeLabels, Counter>,
+    gateway_input_tokens: Family<ScopeLabels, Counter>,
+    gateway_output_tokens: Family<ScopeLabels, Counter>,
+    gateway_cached_tokens: Family<ScopeLabels, Counter>,
+    session_log_enabled: Gauge,
+    session_log_available: Gauge,
+    session_log_queued: Gauge,
+    session_log_content_bytes: Gauge,
+    session_log_dropped: Counter,
+    session_log_truncated: Counter,
+    session_log_write_errors: Counter,
+    session_log_committed: Counter,
+    session_log_last_commit_timestamp_ms: Gauge,
     node_labels: Mutex<HashSet<NodeLabels>>,
     attempt_labels: Mutex<HashSet<AttemptLabels>>,
     retry_labels: Mutex<HashSet<AttemptLabels>>,
+}
+
+fn sync_counter(counter: &Counter, target: u64) {
+    let current = counter.get();
+    if target > current {
+        counter.inc_by(target - current);
+    }
+}
+
+fn to_i64(value: usize) -> i64 {
+    value.try_into().unwrap_or(i64::MAX)
 }
 
 impl Metrics {
@@ -124,6 +161,24 @@ impl Metrics {
         let input_tokens = Histogram::new(exponential_buckets(16.0, 2.0, 16));
         let cached_tokens = Histogram::new(exponential_buckets(16.0, 2.0, 16));
         let output_tokens = Histogram::new(exponential_buckets(1.0, 2.0, 18));
+        let gateway_started = Family::default();
+        let gateway_success = Family::default();
+        let gateway_failed = Family::default();
+        let gateway_cancelled = Family::default();
+        let gateway_unknown = Family::default();
+        let gateway_retries = Family::default();
+        let gateway_input_tokens = Family::default();
+        let gateway_output_tokens = Family::default();
+        let gateway_cached_tokens = Family::default();
+        let session_log_enabled = Gauge::default();
+        let session_log_available = Gauge::default();
+        let session_log_queued = Gauge::default();
+        let session_log_content_bytes = Gauge::default();
+        let session_log_dropped = Counter::default();
+        let session_log_truncated = Counter::default();
+        let session_log_write_errors = Counter::default();
+        let session_log_committed = Counter::default();
+        let session_log_last_commit_timestamp_ms = Gauge::default();
 
         let mut registry = Registry::with_prefix("estuary");
         registry.register(
@@ -271,7 +326,6 @@ impl Metrics {
             "Longest exact vLLM cached prompt prefix selected, in tokens.",
             prefix_match_tokens.clone(),
         );
-
         registry.register(
             "node_pending_prefill_tokens",
             "Estimated uncached input work held by local leases.",
@@ -282,7 +336,11 @@ impl Metrics {
             "Estimated output work held by local leases.",
             node_pending_decode_tokens.clone(),
         );
-        registry.register("upstream_first_token_duration_seconds", "Time from upstream dispatch to the first observed generation event, including reasoning and tool output.", first_token_duration.clone());
+        registry.register(
+            "upstream_first_token_duration_seconds",
+            "Time from upstream dispatch to the first observed generation event, including reasoning and tool output.",
+            first_token_duration.clone(),
+        );
         registry.register(
             "inference_input_tokens",
             "Upstream-reported input tokens for completed requests.",
@@ -297,6 +355,96 @@ impl Metrics {
             "inference_output_tokens",
             "Upstream-reported output tokens for completed requests.",
             output_tokens.clone(),
+        );
+        registry.register(
+            "gateway_started",
+            "Gateway inference requests started by scope.",
+            gateway_started.clone(),
+        );
+        registry.register(
+            "gateway_success",
+            "Gateway inference requests succeeded by scope.",
+            gateway_success.clone(),
+        );
+        registry.register(
+            "gateway_failed",
+            "Gateway inference requests failed by scope.",
+            gateway_failed.clone(),
+        );
+        registry.register(
+            "gateway_cancelled",
+            "Gateway inference requests cancelled by scope.",
+            gateway_cancelled.clone(),
+        );
+        registry.register(
+            "gateway_unknown",
+            "Gateway inference requests ended with unknown outcome by scope.",
+            gateway_unknown.clone(),
+        );
+        registry.register(
+            "gateway_retries",
+            "Gateway upstream retry attempts by scope.",
+            gateway_retries.clone(),
+        );
+        registry.register(
+            "gateway_input_tokens",
+            "Reported input tokens by scope.",
+            gateway_input_tokens.clone(),
+        );
+        registry.register(
+            "gateway_output_tokens",
+            "Reported output tokens by scope.",
+            gateway_output_tokens.clone(),
+        );
+        registry.register(
+            "gateway_cached_tokens",
+            "Reported cached input tokens by scope.",
+            gateway_cached_tokens.clone(),
+        );
+        registry.register(
+            "session_log_enabled",
+            "Whether session logging is configured.",
+            session_log_enabled.clone(),
+        );
+        registry.register(
+            "session_log_available",
+            "Whether the session log writer database is currently healthy.",
+            session_log_available.clone(),
+        );
+        registry.register(
+            "session_log_queued",
+            "Session log commands currently queued.",
+            session_log_queued.clone(),
+        );
+        registry.register(
+            "session_log_content_bytes",
+            "Buffered session log payload bytes awaiting persistence.",
+            session_log_content_bytes.clone(),
+        );
+        registry.register(
+            "session_log_dropped",
+            "Session log records dropped due to backpressure or write failure.",
+            session_log_dropped.clone(),
+        );
+        registry.register(
+            "session_log_truncated",
+            "Session log payloads truncated to stay within configured byte budgets.",
+            session_log_truncated.clone(),
+        );
+        registry.register(
+            "session_log_write_errors",
+            "Session log database write or recovery errors.",
+            session_log_write_errors.clone(),
+        );
+        registry.register(
+            "session_log_committed",
+            "Completed requests committed to the session log database.",
+            session_log_committed.clone(),
+        );
+        registry.register(
+            "session_log_last_commit_timestamp_ms",
+            "Unix timestamp in milliseconds of the last committed session log batch.",
+            session_log_last_commit_timestamp_ms.clone(),
         );
         Arc::new(Self {
             registry,
@@ -335,6 +483,24 @@ impl Metrics {
             input_tokens,
             cached_tokens,
             output_tokens,
+            gateway_started,
+            gateway_success,
+            gateway_failed,
+            gateway_cancelled,
+            gateway_unknown,
+            gateway_retries,
+            gateway_input_tokens,
+            gateway_output_tokens,
+            gateway_cached_tokens,
+            session_log_enabled,
+            session_log_available,
+            session_log_queued,
+            session_log_content_bytes,
+            session_log_dropped,
+            session_log_truncated,
+            session_log_write_errors,
+            session_log_committed,
+            session_log_last_commit_timestamp_ms,
             node_labels: Mutex::new(HashSet::new()),
             attempt_labels: Mutex::new(HashSet::new()),
             retry_labels: Mutex::new(HashSet::new()),
@@ -355,8 +521,7 @@ impl Metrics {
             node: node.to_owned(),
             outcome: outcome.to_owned(),
         };
-        let mut tracked = self.attempt_labels.lock();
-        tracked.insert(labels.clone());
+        self.attempt_labels.lock().insert(labels.clone());
         self.attempts.get_or_create(&labels).inc();
     }
 
@@ -365,8 +530,7 @@ impl Metrics {
             node: node.to_owned(),
             outcome: reason.to_owned(),
         };
-        let mut tracked = self.retry_labels.lock();
-        tracked.insert(labels.clone());
+        self.retry_labels.lock().insert(labels.clone());
         self.retries.get_or_create(&labels).inc();
     }
 
@@ -383,8 +547,7 @@ impl Metrics {
         let labels = NodeLabels {
             node: node.to_owned(),
         };
-        let mut tracked = self.node_labels.lock();
-        tracked.insert(labels.clone());
+        self.node_labels.lock().insert(labels.clone());
         self.stream_cancellations.get_or_create(&labels).inc();
     }
 
@@ -392,8 +555,7 @@ impl Metrics {
         let labels = NodeLabels {
             node: node.to_owned(),
         };
-        let mut tracked = self.node_labels.lock();
-        tracked.insert(labels.clone());
+        self.node_labels.lock().insert(labels.clone());
         self.stream_errors.get_or_create(&labels).inc();
     }
 
@@ -430,13 +592,11 @@ impl Metrics {
     }
 
     pub fn response_buffer_bytes(&self, bytes: usize) {
-        self.response_buffer_bytes
-            .set(bytes.try_into().unwrap_or(i64::MAX));
+        self.response_buffer_bytes.set(to_i64(bytes));
     }
 
     pub fn response_buffer_waiters(&self, waiters: usize) {
-        self.response_buffer_waiters
-            .set(waiters.try_into().unwrap_or(i64::MAX));
+        self.response_buffer_waiters.set(to_i64(waiters));
     }
 
     pub fn public_connection_opened(&self) {
@@ -451,28 +611,33 @@ impl Metrics {
         self.public_connections.get()
     }
 
+    fn remove_node_series(&self, labels: &NodeLabels) {
+        self.stream_cancellations.remove(labels);
+        self.stream_errors.remove(labels);
+        self.node_active.remove(labels);
+        self.node_pending_prefill_tokens.remove(labels);
+        self.node_pending_decode_tokens.remove(labels);
+        self.node_health.remove(labels);
+        self.node_accepting_requests.remove(labels);
+        self.node_circuit_state.remove(labels);
+        self.node_provider_ready.remove(labels);
+        self.node_provider_state.remove(labels);
+        self.node_upstream_running.remove(labels);
+        self.node_upstream_waiting.remove(labels);
+        self.node_kv_cache_usage.remove(labels);
+        self.node_exact_kv_blocks.remove(labels);
+        self.node_exact_kv_bytes.remove(labels);
+        self.node_exact_kv_ready.remove(labels);
+    }
+
     pub fn remove_node(&self, node: &str) {
         self.node_labels.lock().retain(|labels| {
-            if labels.node != node {
-                return true;
+            if labels.node == node {
+                self.remove_node_series(labels);
+                false
+            } else {
+                true
             }
-            self.stream_cancellations.remove(labels);
-            self.stream_errors.remove(labels);
-            self.node_active.remove(labels);
-            self.node_pending_prefill_tokens.remove(labels);
-            self.node_pending_decode_tokens.remove(labels);
-            self.node_health.remove(labels);
-            self.node_accepting_requests.remove(labels);
-            self.node_circuit_state.remove(labels);
-            self.node_provider_ready.remove(labels);
-            self.node_provider_state.remove(labels);
-            self.node_upstream_running.remove(labels);
-            self.node_upstream_waiting.remove(labels);
-            self.node_kv_cache_usage.remove(labels);
-            self.node_exact_kv_blocks.remove(labels);
-            self.node_exact_kv_bytes.remove(labels);
-            self.node_exact_kv_ready.remove(labels);
-            false
         });
         self.attempt_labels.lock().retain(|labels| {
             if labels.node == node {
@@ -492,7 +657,7 @@ impl Metrics {
         });
     }
 
-    pub fn encode(&self, scheduler: &Scheduler) -> Result<String> {
+    fn sync_nodes(&self, scheduler: &Scheduler) {
         let nodes = scheduler.nodes();
         let current_nodes = nodes
             .iter()
@@ -506,7 +671,7 @@ impl Metrics {
             self.node_labels.lock().insert(labels.clone());
             self.node_active
                 .get_or_create(&labels)
-                .set(node.active().try_into().unwrap_or(i64::MAX));
+                .set(to_i64(node.active()));
             let health = match node.health() {
                 HealthState::Starting => 0,
                 HealthState::Healthy => 1,
@@ -515,18 +680,12 @@ impl Metrics {
             };
             self.node_health.get_or_create(&labels).set(health);
             let snapshot = node.snapshot();
-            self.node_pending_prefill_tokens.get_or_create(&labels).set(
-                snapshot
-                    .pending_prefill_tokens
-                    .try_into()
-                    .unwrap_or(i64::MAX),
-            );
-            self.node_pending_decode_tokens.get_or_create(&labels).set(
-                snapshot
-                    .pending_decode_tokens
-                    .try_into()
-                    .unwrap_or(i64::MAX),
-            );
+            self.node_pending_prefill_tokens
+                .get_or_create(&labels)
+                .set(to_i64(snapshot.pending_prefill_tokens));
+            self.node_pending_decode_tokens
+                .get_or_create(&labels)
+                .set(to_i64(snapshot.pending_decode_tokens));
             self.node_accepting_requests
                 .get_or_create(&labels)
                 .set(i64::from(
@@ -550,66 +709,106 @@ impl Metrics {
             self.node_provider_state
                 .get_or_create(&labels)
                 .set(provider_state);
-            self.node_upstream_running.get_or_create(&labels).set(
-                snapshot
-                    .upstream_running
-                    .unwrap_or_default()
-                    .try_into()
-                    .unwrap_or(i64::MAX),
-            );
-            self.node_upstream_waiting.get_or_create(&labels).set(
-                snapshot
-                    .upstream_waiting
-                    .unwrap_or_default()
-                    .try_into()
-                    .unwrap_or(i64::MAX),
-            );
+            self.node_upstream_running
+                .get_or_create(&labels)
+                .set(to_i64(snapshot.upstream_running.unwrap_or_default()));
+            self.node_upstream_waiting
+                .get_or_create(&labels)
+                .set(to_i64(snapshot.upstream_waiting.unwrap_or_default()));
             self.node_kv_cache_usage
                 .get_or_create(&labels)
                 .set(snapshot.kv_cache_usage.unwrap_or_default());
             let cache = scheduler.exact_cache_directory().snapshot(node.id());
             self.node_exact_kv_blocks
                 .get_or_create(&labels)
-                .set(cache.blocks.try_into().unwrap_or(i64::MAX));
+                .set(to_i64(cache.blocks));
             self.node_exact_kv_bytes
                 .get_or_create(&labels)
-                .set(cache.bytes.try_into().unwrap_or(i64::MAX));
+                .set(to_i64(cache.bytes));
             self.node_exact_kv_ready
                 .get_or_create(&labels)
                 .set(i64::from(cache.authoritative));
         }
         let (queued_requests, queued_bytes) = scheduler.queue_snapshot();
-        self.queue_requests
-            .set(queued_requests.try_into().unwrap_or(i64::MAX));
-        self.queue_bytes
-            .set(queued_bytes.try_into().unwrap_or(i64::MAX));
+        self.queue_requests.set(to_i64(queued_requests));
+        self.queue_bytes.set(to_i64(queued_bytes));
         self.admission_waiters
-            .set(scheduler.admission_waiters().try_into().unwrap_or(i64::MAX));
+            .set(to_i64(scheduler.admission_waiters()));
+    }
+
+    pub fn encode(
+        &self,
+        scheduler: &Scheduler,
+        telemetry: Option<&Observability>,
+        session_log: Option<&LogSink>,
+    ) -> Result<String> {
+        self.sync_nodes(scheduler);
+        if let Some(telemetry) = telemetry {
+            telemetry.for_each_scope(|scope, name, counts| {
+                let labels = ScopeLabels {
+                    scope: scope.to_owned(),
+                    name: name.to_owned(),
+                };
+                for (family, value) in [
+                    (&self.gateway_started, counts.started),
+                    (&self.gateway_success, counts.success),
+                    (&self.gateway_failed, counts.failed),
+                    (&self.gateway_cancelled, counts.cancelled),
+                    (&self.gateway_unknown, counts.unknown),
+                    (&self.gateway_retries, counts.retries),
+                    (&self.gateway_input_tokens, counts.input_tokens),
+                    (&self.gateway_output_tokens, counts.output_tokens),
+                    (&self.gateway_cached_tokens, counts.cached_tokens),
+                ] {
+                    sync_counter(&family.get_or_create(&labels), value);
+                }
+            });
+        }
+        if let Some(session_log) = session_log {
+            let status = session_log.status();
+            self.session_log_enabled.set(i64::from(status.enabled));
+            self.session_log_available.set(i64::from(status.available));
+            self.session_log_queued.set(to_i64(status.queued));
+            self.session_log_content_bytes
+                .set(to_i64(status.content_bytes));
+            sync_counter(&self.session_log_dropped, status.dropped);
+            sync_counter(&self.session_log_truncated, status.truncated);
+            sync_counter(&self.session_log_write_errors, status.write_errors);
+            sync_counter(&self.session_log_committed, status.committed);
+            self.session_log_last_commit_timestamp_ms
+                .set(status.last_commit_at_ms.try_into().unwrap_or(i64::MAX));
+        }
+
         let mut output = String::new();
         encode(&mut output, &self.registry)?;
         Ok(output)
     }
 
     fn prune_removed_nodes(&self, current_nodes: &HashSet<String>) {
-        let mut removed = HashSet::new();
-        for labels in &*self.node_labels.lock() {
-            if !current_nodes.contains(&labels.node) {
-                removed.insert(labels.node.clone());
+        self.node_labels.lock().retain(|labels| {
+            if current_nodes.contains(&labels.node) {
+                true
+            } else {
+                self.remove_node_series(labels);
+                false
             }
-        }
-        for labels in &*self.attempt_labels.lock() {
-            if !current_nodes.contains(&labels.node) {
-                removed.insert(labels.node.clone());
+        });
+        self.attempt_labels.lock().retain(|labels| {
+            if current_nodes.contains(&labels.node) {
+                true
+            } else {
+                self.attempts.remove(labels);
+                false
             }
-        }
-        for labels in &*self.retry_labels.lock() {
-            if !current_nodes.contains(&labels.node) {
-                removed.insert(labels.node.clone());
+        });
+        self.retry_labels.lock().retain(|labels| {
+            if current_nodes.contains(&labels.node) {
+                true
+            } else {
+                self.retries.remove(labels);
+                false
             }
-        }
-        for node in removed.drain() {
-            self.remove_node(&node);
-        }
+        });
     }
 }
 
@@ -638,7 +837,7 @@ mod tests {
         metrics.tokenization("prefix_gate", std::time::Duration::from_millis(2));
         metrics.response_buffer_bytes(1_024);
         metrics.response_buffer_waiters(2);
-        let output = metrics.encode(&scheduler).unwrap();
+        let output = metrics.encode(&scheduler, None, None).unwrap();
         assert!(output.contains("estuary_node_provider_ready"));
         assert!(output.contains("estuary_node_exact_kv_blocks"));
         assert!(output.contains("estuary_node_kv_cache_usage_ratio"));
@@ -664,7 +863,7 @@ mod tests {
         metrics.stream_error("temporary");
         assert!(
             metrics
-                .encode(&scheduler)
+                .encode(&scheduler, None, None)
                 .unwrap()
                 .contains("node=\"temporary\"")
         );
@@ -672,7 +871,7 @@ mod tests {
         scheduler.remove_node("temporary");
         assert!(
             !metrics
-                .encode(&scheduler)
+                .encode(&scheduler, None, None)
                 .unwrap()
                 .contains("node=\"temporary\"")
         );

@@ -6,7 +6,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Map, Value as JsonValue};
 
-use crate::node::Node;
+use crate::{node::Node, prefix::has_media};
 
 use super::{
     MAX_MANAGEMENT_BODY_BYTES, MAX_TOKENIZATION_CACHE_BYTES, TOKENIZATION_CACHE_ENTRY_OVERHEAD,
@@ -60,31 +60,6 @@ pub(super) fn prepare_tokenization(
     })
 }
 
-fn has_media(value: &JsonValue) -> bool {
-    match value {
-        JsonValue::Array(items) => items.iter().any(has_media),
-        JsonValue::Object(object) => {
-            matches!(
-                object.get("type").and_then(JsonValue::as_str),
-                Some(
-                    "image"
-                        | "image_url"
-                        | "input_image"
-                        | "audio"
-                        | "input_audio"
-                        | "audio_url"
-                        | "video"
-                        | "video_url"
-                        | "input_video"
-                        | "file"
-                        | "input_file"
-                )
-            ) || object.values().any(has_media)
-        }
-        _ => false,
-    }
-}
-
 pub(super) fn tokenize_payload(endpoint: &str, body: &JsonValue) -> Option<Map<String, JsonValue>> {
     let object = body.as_object()?;
     let mut payload = Map::new();
@@ -135,9 +110,9 @@ pub(super) fn pretokenized_completion(body: &JsonValue) -> Option<Vec<u64>> {
 }
 
 #[derive(Deserialize)]
-pub(super) struct TokenizeResponse {
+struct TokenizeResponse {
     #[serde(alias = "token_ids")]
-    pub(super) tokens: Vec<u64>,
+    tokens: Vec<u64>,
 }
 
 pub(super) async fn request_tokenization(
@@ -178,11 +153,10 @@ async fn send_tokenization(
     payload: &Map<String, JsonValue>,
 ) -> Result<reqwest::Response> {
     let url = node.provider_url(path)?;
-    let mut request = client.post(url).json(payload);
-    for (name, value) in node.headers() {
-        request = request.header(name, value);
-    }
-    Ok(request.send().await?)
+    Ok(node
+        .apply_headers(client.post(url).json(payload))
+        .send()
+        .await?)
 }
 
 pub(super) fn tokenization_key(
@@ -197,9 +171,7 @@ pub(super) fn tokenization_key(
         hasher.update(&[0]);
     }
     hasher.update(&generation.to_le_bytes());
-    if let Ok(encoded) = sonic_rs::to_vec(payload) {
-        hasher.update(&encoded);
-    }
+    let _ = serde_json::to_writer(&mut hasher, payload);
     *hasher.finalize().as_bytes()
 }
 

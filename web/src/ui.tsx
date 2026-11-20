@@ -1,8 +1,8 @@
 import { Popover } from "@mantine/core";
 import { CircleHelp } from "lucide-react";
 import type { ReactNode } from "react";
-import { useTranslation } from "react-i18next";
-import type { TranslationKey } from "./i18n";
+import { useTranslation } from "./i18n";
+import { protocolPaths } from "./node-config";
 
 function statusTone(value: string): "positive" | "warning" | "negative" | "neutral" {
   if (["healthy", "ready", "serving", "closed", "accepting"].includes(value)) return "positive";
@@ -26,9 +26,39 @@ export function StatusBadge({ value, label }: { value: string; label?: string })
   const { t } = useTranslation();
   return (
     <span className={`status-badge ${statusTone(value)}`}>
-      {label ??
-        t(`status.${value}` as TranslationKey, { defaultValue: value.replaceAll("_", " ") })}
+      {label ?? t(`status.${value}`, { defaultValue: value.replaceAll("_", " ") })}
     </span>
+  );
+}
+
+export function DataRow({
+  label,
+  value,
+  className = "data-row",
+}: {
+  label: string;
+  value: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={className}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+export function ProtocolReviewList({ mappings }: { mappings: [string, string][] }) {
+  return (
+    <>
+      {mappings.map(([model]) => (
+        <div className="protocol-review" key={model}>
+          <strong>{model}</strong>
+          <span>Codex: {protocolPaths.responses}</span>
+          <span>Claude: {protocolPaths.messages}</span>
+        </div>
+      ))}
+    </>
   );
 }
 
@@ -42,6 +72,10 @@ export function formatCompactNumber(value: number, locale = "en"): string {
   return new Intl.NumberFormat(locale, { notation: "compact", maximumFractionDigits: 1 }).format(
     value,
   );
+}
+
+export function formatMs(value: number | null | undefined, unavailable = "—"): string {
+  return value == null || !Number.isFinite(value) ? unavailable : `${Math.round(value)} ms`;
 }
 
 export function formatPercent(

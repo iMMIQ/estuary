@@ -1,4 +1,4 @@
-//! Image input types and DeepSeek V4.1 image token counts.
+//! Image input types.
 //!
 //! A caller supplies images as [`ImageSource`] values. Resolving an image
 //! source produces an [`ImageInfo`] that holds the encoded image bytes sent to
@@ -6,10 +6,6 @@
 //! the images appear in the conversation.
 
 use serde::{Deserialize, Serialize};
-
-pub mod token_spec;
-
-pub use token_spec::{CalcResizeError, ImageTokenSpec, ResizeResult};
 
 /// Token ID of the image token in the V4.1 tokenizer. Overriding
 /// [`SpecialToken::Image`] changes the image token's spelling but not this ID.
@@ -182,53 +178,5 @@ impl MultiModalData {
     /// Return whether no image is attached.
     pub fn is_empty(&self) -> bool {
         self.images.is_empty()
-    }
-
-    /// Return the number of inference input tokens beyond one per
-    /// placeholder, using the V4.1 image token specification.
-    ///
-    /// Every image contributes one placeholder to the prompt and its image
-    /// token count, [`ImageTokenSpec::calc_token_count`], to the inference input.
-    /// The adjustment is the sum of the differences over all images.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CalcResizeError`] when fitting an image does not converge.
-    pub fn image_token_adjustment(&self) -> Result<usize, CalcResizeError> {
-        let spec = ImageTokenSpec::v41();
-        let mut adjustment = 0usize;
-        for image in &self.images {
-            adjustment += spec.calc_token_count(image.width as usize, image.height as usize)? - 1;
-        }
-        Ok(adjustment)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn token_adjustment_counts_one_placeholder_per_image() {
-        let spec = ImageTokenSpec::v41();
-        let data = MultiModalData {
-            images: vec![
-                ImageInfo {
-                    data: Vec::new(),
-                    width: 1920,
-                    height: 1080,
-                },
-                ImageInfo {
-                    data: Vec::new(),
-                    width: 640,
-                    height: 480,
-                },
-            ],
-        };
-        let expected = spec.calc_token_count(1920, 1080).unwrap()
-            + spec.calc_token_count(640, 480).unwrap()
-            - 2;
-        assert_eq!(data.image_token_adjustment().unwrap(), expected);
-        assert!(MultiModalData::default().image_token_adjustment().unwrap() == 0);
     }
 }

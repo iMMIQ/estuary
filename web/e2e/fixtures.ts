@@ -1,5 +1,5 @@
 import type { Page } from "@playwright/test";
-import { configDefaults } from "../src/config-contract";
+import { configDefaults } from "../src/generated/config";
 import type { NodeConfig } from "../src/types";
 import { observabilityFixture } from "./observability-fixture";
 export function status(nodeCount: number) {

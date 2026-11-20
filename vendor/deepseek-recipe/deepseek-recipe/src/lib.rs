@@ -1,16 +1,12 @@
-//! API protocol conversion and inference output parsing.
+//! API protocol conversion and response event generation.
 //!
 //! [`request::ProtocolRequest::convert`] produces a shared
-//! [`request::ConversationRequest`]. [`stream::StreamProcessor`] parses backend
-//! output, passes it to the selected protocol's chunk generator
-//! ([`stream::ChunkGenerator`]), and accumulates completion usage. The caller
-//! renders and encodes the prompt, supplies the backend and its prompt usage,
-//! and transports the protocol responses.
+//! [`request::ConversationRequest`], and [`stream::ChunkGenerator`] turns
+//! backend output chunks into protocol response events.
 
 pub use protocol::anthropic;
 pub use protocol::openai;
 
-pub mod error_response;
 mod protocol;
 pub mod request;
 pub mod response;

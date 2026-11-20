@@ -10,18 +10,16 @@ import {
 } from "@mantine/core";
 import { ArrowLeft, Check, FlaskConical, LoaderCircle, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useTranslation } from "react-i18next";
 import * as api from "./api";
-import { configDefaults as defaults } from "./config-contract";
 import { integerBounds } from "./config-validation";
 import { mergeDraft } from "./draft-merge";
-import type { TranslationKey } from "./i18n";
+import { configDefaults as defaults } from "./generated/config";
+import { useTranslation } from "./i18n";
 import type { DraftErrors } from "./node-config";
 import {
   draftToConfig,
   draftWildcardCapability,
   effectiveModelMappings,
-  protocolPaths,
   recordToDraft,
   shouldClearApiKey,
   validateDraft,
@@ -32,9 +30,10 @@ import type {
   NodeDraft,
   NodeRecord,
   PreflightResponse,
+  ProviderConfig,
   ProviderKind,
 } from "./types";
-import { HelpTip } from "./ui";
+import { DataRow, HelpTip, ProtocolReviewList } from "./ui";
 
 export type EditorState =
   | { mode: "create"; draft: NodeDraft; revision: null }
@@ -42,15 +41,6 @@ export type EditorState =
 
 function numeric(value: string | number): number {
   return typeof value === "number" ? value : Number(value);
-}
-
-function ReviewRow({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div className="review-row">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
 }
 
 export function NodeEditor({
@@ -71,7 +61,7 @@ export function NodeEditor({
   onSave: (state: EditorState) => Promise<void>;
 }) {
   const { t } = useTranslation();
-  const errorText = (key?: string) => (key ? t(key as TranslationKey) : undefined);
+  const errorText = (key?: string) => (key ? t(key) : undefined);
   const [draft, setDraft] = useState(state.draft);
   const [step, setStep] = useState(0);
   const [errors, setErrors] = useState<DraftErrors>({});
@@ -196,6 +186,12 @@ export function NodeEditor({
               ...structuredClone(defaults.kv_events),
             },
       },
+    }));
+
+  const updateProvider = <K extends keyof ProviderConfig>(key: K, value: ProviderConfig[K]) =>
+    update((current) => ({
+      ...current,
+      provider: { ...current.provider, [key]: value },
     }));
 
   const updateKv = <K extends keyof KvEventsConfig>(key: K, value: KvEventsConfig[K]) =>
@@ -372,82 +368,47 @@ export function NodeEditor({
                         label={t("editor.versionPath")}
                         value={draft.provider.version_path}
                         error={errorText(errors.version_path)}
-                        onChange={(event) =>
-                          update((current) => ({
-                            ...current,
-                            provider: { ...current.provider, version_path: event.target.value },
-                          }))
-                        }
+                        onChange={(event) => updateProvider("version_path", event.target.value)}
                       />
                       <TextInput
                         label={t("editor.metricsPath")}
                         value={draft.provider.metrics_path}
                         error={errorText(errors.metrics_path)}
-                        onChange={(event) =>
-                          update((current) => ({
-                            ...current,
-                            provider: { ...current.provider, metrics_path: event.target.value },
-                          }))
-                        }
+                        onChange={(event) => updateProvider("metrics_path", event.target.value)}
                       />
                       <TextInput
                         label={t("editor.tokenizePath")}
                         value={draft.provider.tokenize_path}
                         error={errorText(errors.tokenize_path)}
-                        onChange={(event) =>
-                          update((current) => ({
-                            ...current,
-                            provider: { ...current.provider, tokenize_path: event.target.value },
-                          }))
-                        }
+                        onChange={(event) => updateProvider("tokenize_path", event.target.value)}
                       />
                       <NumberInput
                         label={t("editor.monitorInterval")}
                         {...integerBounds("provider.monitor_interval_ms")}
                         value={draft.provider.monitor_interval_ms}
                         error={errorText(errors.monitor_interval_ms)}
-                        onChange={(value) =>
-                          update((current) => ({
-                            ...current,
-                            provider: { ...current.provider, monitor_interval_ms: numeric(value) },
-                          }))
-                        }
+                        onChange={(value) => updateProvider("monitor_interval_ms", numeric(value))}
                       />
                       <NumberInput
                         label={t("editor.requestTimeout")}
                         {...integerBounds("provider.request_timeout_ms")}
                         value={draft.provider.request_timeout_ms}
                         error={errorText(errors.request_timeout_ms)}
-                        onChange={(value) =>
-                          update((current) => ({
-                            ...current,
-                            provider: { ...current.provider, request_timeout_ms: numeric(value) },
-                          }))
-                        }
+                        onChange={(value) => updateProvider("request_timeout_ms", numeric(value))}
                       />
                       <NumberInput
                         label={t("editor.telemetryStale")}
                         {...integerBounds("provider.telemetry_stale_ms")}
                         value={draft.provider.telemetry_stale_ms}
                         error={errorText(errors.telemetry_stale_ms)}
-                        onChange={(value) =>
-                          update((current) => ({
-                            ...current,
-                            provider: { ...current.provider, telemetry_stale_ms: numeric(value) },
-                          }))
-                        }
+                        onChange={(value) => updateProvider("telemetry_stale_ms", numeric(value))}
                       />
                       <NumberInput
                         label={t("editor.waitingWatermark")}
                         {...integerBounds("provider.waiting_threshold")}
                         value={draft.provider.waiting_threshold}
                         error={errorText(errors.waiting_threshold)}
-                        onChange={(value) =>
-                          update((current) => ({
-                            ...current,
-                            provider: { ...current.provider, waiting_threshold: numeric(value) },
-                          }))
-                        }
+                        onChange={(value) => updateProvider("waiting_threshold", numeric(value))}
                       />
                       <NumberInput
                         label={t("editor.tokenizeEntries")}
@@ -456,13 +417,7 @@ export function NodeEditor({
                         value={draft.provider.tokenize_cache_entries}
                         error={errorText(errors.tokenize_cache_entries)}
                         onChange={(value) =>
-                          update((current) => ({
-                            ...current,
-                            provider: {
-                              ...current.provider,
-                              tokenize_cache_entries: numeric(value),
-                            },
-                          }))
+                          updateProvider("tokenize_cache_entries", numeric(value))
                         }
                       />
                     </>
@@ -626,29 +581,42 @@ export function NodeEditor({
                 <h2>{t("editor.reviewConfiguration")}</h2>
               </div>
               <div className="review-grid">
-                <ReviewRow label={t("editor.nodeId")} value={draft.id} />
-                <ReviewRow label={t("editor.baseUrl")} value={draft.base_url} />
-                <ReviewRow
+                <DataRow className="review-row" label={t("editor.nodeId")} value={draft.id} />
+                <DataRow
+                  className="review-row"
+                  label={t("editor.baseUrl")}
+                  value={draft.base_url}
+                />
+                <DataRow
+                  className="review-row"
                   label={t("editor.provider")}
                   value={
                     draft.provider.type === "vllm" ? "vLLM 0.25+" : t("upstreams.openaiCompatible")
                   }
                 />
-                <ReviewRow label={t("editor.maxConcurrency")} value={draft.max_concurrency} />
-                <ReviewRow label={t("editor.schedulingWeight")} value={draft.weight} />
-                <ReviewRow
+                <DataRow
+                  className="review-row"
+                  label={t("editor.maxConcurrency")}
+                  value={draft.max_concurrency}
+                />
+                <DataRow
+                  className="review-row"
+                  label={t("editor.schedulingWeight")}
+                  value={draft.weight}
+                />
+                <DataRow
+                  className="review-row"
                   label={t("editor.modelMappings")}
                   value={draft.models.filter((row) => row.key && row.value).length}
                 />
-                {effectiveModelMappings(draftToConfig(draft)).map(([model]) => (
-                  <div className="protocol-review" key={model}>
-                    <strong>{model}</strong>
-                    <span>Codex: {protocolPaths.responses}</span>
-                    <span>Claude: {protocolPaths.messages}</span>
-                  </div>
-                ))}
-                <ReviewRow label={t("editor.healthPath")} value={draft.health_path} />
-                <ReviewRow
+                <ProtocolReviewList mappings={effectiveModelMappings(draftToConfig(draft))} />
+                <DataRow
+                  className="review-row"
+                  label={t("editor.healthPath")}
+                  value={draft.health_path}
+                />
+                <DataRow
+                  className="review-row"
                   label={t("editor.bearerCredential")}
                   value={
                     draft.api_key.trim() || draft.preserve_api_key || draft.api_key_env
@@ -656,7 +624,8 @@ export function NodeEditor({
                       : t("common.notConfigured")
                   }
                 />
-                <ReviewRow
+                <DataRow
+                  className="review-row"
                   label={t("editor.lifecycle")}
                   value={draft.draining ? t("overview.draining") : t("editor.serving")}
                 />

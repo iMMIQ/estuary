@@ -10,7 +10,6 @@ license = "MIT"
 repository = "https://github.com/deepseek-ai/deepseek-recipe"
 
 [workspace.dependencies]
-async-stream = "0.3.6"
 base64 = "0.23.1"
 data-url = "0.3.2"
 deepseek-recipe-core = { version = "0.2.0", path = "deepseek-recipe-core" }
@@ -25,7 +24,5 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 strum_macros = "0.28.0"
 syn = { version = "2.0.117", features = ["full", "extra-traits"] }
-tokenizers = { version = "0.23.2", features = ["http"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
-tokio-stream = "0.1.19"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }

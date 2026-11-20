@@ -49,36 +49,21 @@ FROM ${ALPINE_IMAGE}
 
 COPY --from=rust-builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 RUN addgroup -S -g 10001 estuary \
-    && adduser -S -D -H -u 10001 -G estuary estuary
-COPY --from=rust-builder /build/target/release/estuary /usr/local/bin/estuary-initial
-RUN set -eux; \
-    version="$(/usr/local/bin/estuary-initial --version | awk '{print $2}')"; \
-    release="/opt/estuary/releases/${version}"; \
-    mkdir -p "${release}" /opt/estuary/state/slots/a /opt/estuary/state/slots/b /var/lib/estuary/run; \
-    cp /usr/local/bin/estuary-initial "${release}/estuary"; \
-    chmod 0755 "${release}/estuary"; \
-    ln -s "${release}" /opt/estuary/state/current; \
-    ln -s "${release}" /opt/estuary/state/slots/a/current; \
-    ln -s "${release}" /opt/estuary/state/slots/b/current; \
-    chown -R estuary:estuary /opt/estuary/releases /opt/estuary/state /var/lib/estuary; \
-    rm /usr/local/bin/estuary-initial
+    && adduser -S -D -H -u 10001 -G estuary estuary \
+    && mkdir -p /var/lib/estuary \
+    && chown estuary:estuary /var/lib/estuary
+COPY --from=rust-builder /build/target/release/estuary /usr/local/bin/estuary
 
 ENV ESTUARY_DATABASE=/var/lib/estuary/estuary.db \
     ESTUARY_LISTEN=0.0.0.0:8080 \
     ESTUARY_ADMIN_LISTEN=0.0.0.0:9090 \
-    ESTUARY_SLOT_A_ADMIN_LISTEN=127.0.0.1:19091 \
-    ESTUARY_SLOT_B_ADMIN_LISTEN=127.0.0.1:19092 \
-    ESTUARY_RELEASE_ROOT=/opt/estuary/releases \
-    ESTUARY_STATE_ROOT=/opt/estuary/state \
-    ESTUARY_RUNTIME_DIR=/var/lib/estuary/run \
     ESTUARY_LOG_JSON=true
 
-VOLUME ["/opt/estuary", "/var/lib/estuary"]
+VOLUME ["/var/lib/estuary"]
 EXPOSE 8080 9090
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
-    CMD ["/opt/estuary/state/current/estuary", "status"]
+    CMD ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/health/live"]
 
 USER estuary
-ENTRYPOINT ["/opt/estuary/state/current/estuary"]
-CMD ["supervisor"]
+ENTRYPOINT ["/usr/local/bin/estuary"]

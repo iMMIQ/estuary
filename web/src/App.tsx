@@ -13,9 +13,8 @@ import {
   X,
 } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
-import { useTranslation } from "react-i18next";
 import * as api from "./api";
-import { type Locale, localeStorageKey } from "./i18n";
+import { useTranslation } from "./i18n";
 import { ObservabilityPanel } from "./Observability";
 import { Overview } from "./Overview";
 import { type NodeFilter, Upstreams } from "./Upstreams";
@@ -45,12 +44,7 @@ interface ToastState {
 }
 
 function LanguageSwitch() {
-  const { t, i18n } = useTranslation();
-  const locale: Locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
-  const select = (next: Locale) => {
-    window.localStorage.setItem(localeStorageKey, next);
-    void i18n.changeLanguage(next);
-  };
+  const { t, locale, setLocale } = useTranslation();
   return (
     <Menu position="bottom-end" shadow="md" width={160} withinPortal>
       <Menu.Target>
@@ -67,13 +61,13 @@ function LanguageSwitch() {
       <Menu.Dropdown>
         <Menu.Item
           rightSection={locale === "en" ? <Check size={13} /> : null}
-          onClick={() => select("en")}
+          onClick={() => setLocale("en")}
         >
           {t("language.english")}
         </Menu.Item>
         <Menu.Item
           rightSection={locale === "zh-CN" ? <Check size={13} /> : null}
-          onClick={() => select("zh-CN")}
+          onClick={() => setLocale("zh-CN")}
         >
           {t("language.chinese")}
         </Menu.Item>
@@ -83,7 +77,7 @@ function LanguageSwitch() {
 }
 
 export default function App() {
-  const { t, i18n } = useTranslation();
+  const { t, locale } = useTranslation();
   const [view, setView] = useState<View>("overview");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [metricsWindow, setMetricsWindow] = useState(300);
@@ -117,10 +111,9 @@ export default function App() {
   const [filter, setFilter] = useState<NodeFilter>("all");
 
   useEffect(() => {
-    const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
     document.documentElement.lang = locale;
     document.title = t("app.title");
-  }, [i18n.resolvedLanguage, t]);
+  }, [locale, t]);
 
   useEffect(() => {
     if (!toast) return;
@@ -203,71 +196,59 @@ export default function App() {
     }
   };
 
-  const toggleDrain = async (node: NodeRecord) => {
-    setBusy(true);
+  const runAction = async (
+    action: () => Promise<void>,
+    options: { success?: string; fallbackError: string; lock?: boolean },
+  ): Promise<boolean> => {
+    if (options.lock) setBusy(true);
     try {
-      await api.setDraining(node.config.id, node.runtime.lifecycle === "serving");
-      setToast({
-        tone: "success",
-        message:
-          node.runtime.lifecycle === "serving" ? t("toast.nodeDraining") : t("toast.nodeResumed"),
-      });
-      await refresh(true);
-    } catch (error) {
-      setToast({
-        tone: "error",
-        message: error instanceof Error ? error.message : t("toast.lifecycleFailed"),
-      });
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const remove = async () => {
-    if (!confirmDelete) return;
-    setBusy(true);
-    try {
-      await api.deleteNode(confirmDelete.config.id, confirmDelete.revision);
-      setToast({ tone: "success", message: t("toast.nodeDeleted") });
-      setConfirmDelete(null);
-      setSelectedNodeId(null);
-      setView("upstreams");
-      await refresh(true);
-    } catch (error) {
-      setToast({
-        tone: "error",
-        message: error instanceof Error ? error.message : t("toast.deleteFailed"),
-      });
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const setIpLimit = async (ip: string, limit: number) => {
-    try {
-      await api.setIpLimit(ip, limit);
-      setToast({ tone: "success", message: t("toast.ipLimitSaved") });
+      await action();
+      if (options.success) setToast({ tone: "success", message: options.success });
       await refresh(true);
       return true;
     } catch (error) {
       setToast({
         tone: "error",
-        message: error instanceof Error ? error.message : t("toast.ipLimitFailed"),
+        message: error instanceof Error ? error.message : options.fallbackError,
       });
       return false;
+    } finally {
+      if (options.lock) setBusy(false);
     }
   };
 
+  const toggleDrain = (node: NodeRecord) => {
+    const draining = node.runtime.lifecycle === "serving";
+    return runAction(() => api.setDraining(node.config.id, draining).then(() => undefined), {
+      success: draining ? t("toast.nodeDraining") : t("toast.nodeResumed"),
+      fallbackError: t("toast.lifecycleFailed"),
+      lock: true,
+    });
+  };
+
+  const remove = async () => {
+    if (!confirmDelete) return;
+    await runAction(
+      async () => {
+        await api.deleteNode(confirmDelete.config.id, confirmDelete.revision);
+        setConfirmDelete(null);
+        setSelectedNodeId(null);
+        setView("upstreams");
+      },
+      { success: t("toast.nodeDeleted"), fallbackError: t("toast.deleteFailed"), lock: true },
+    );
+  };
+
+  const setIpLimit = (ip: string, limit: number) =>
+    runAction(() => api.setIpLimit(ip, limit).then(() => undefined), {
+      success: t("toast.ipLimitSaved"),
+      fallbackError: t("toast.ipLimitFailed"),
+    });
+
   const deleteIpLimit = async (ip: string) => {
-    try {
-      await api.deleteIpLimit(ip);
-      await refresh(true);
-    } catch (error) {
-      setToast({
-        tone: "error",
-        message: error instanceof Error ? error.message : t("toast.ipLimitFailed"),
-      });
-    }
+    await runAction(() => api.deleteIpLimit(ip).then(() => undefined), {
+      fallbackError: t("toast.ipLimitFailed"),
+    });
   };
 
   return (

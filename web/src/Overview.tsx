@@ -1,10 +1,18 @@
 import { Button, TextInput } from "@mantine/core";
 import { AlertTriangle, Check, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import { type ReactNode, useState } from "react";
-import { useTranslation } from "react-i18next";
-import { MetricBox, relativeSync, summarizeVllm, UsageRow } from "./admin-metrics";
+import {
+  isDraining,
+  isNotReady,
+  MetricBox,
+  needsAttention,
+  relativeSync,
+  summarizeVllm,
+  UsageRow,
+} from "./admin-metrics";
+import { useTranslation } from "./i18n";
 import type { GatewayStatus, NodeRecord } from "./types";
-import { formatBytes, formatCompactNumber, StatusBadge } from "./ui";
+import { formatBytes, formatCompactNumber, formatMs, StatusBadge } from "./ui";
 export function Overview({
   observabilityPanel,
   status,
@@ -34,18 +42,13 @@ export function Overview({
   onSetIpLimit: (ip: string, limit: number) => Promise<boolean>;
   onDeleteIpLimit: (ip: string) => Promise<void>;
 }) {
-  const { t, i18n } = useTranslation();
-  const locale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
-  const draining = nodes.filter((node) => node.runtime.lifecycle === "draining").length;
-  const notReady = nodes.filter(
-    (node) => !node.admission.routable && node.runtime.lifecycle !== "draining",
-  ).length;
+  const { t, locale } = useTranslation();
+  const draining = nodes.filter(isDraining).length;
+  const notReady = nodes.filter(isNotReady).length;
   const connectionLost = nodes.filter(
     (node) => node.runtime.health === "unhealthy" && Boolean(node.runtime.provider_last_error),
   ).length;
-  const attention = nodes.filter(
-    (node) => !node.admission.accepting_assignments && node.admission.state !== "at_capacity",
-  );
+  const attention = nodes.filter(needsAttention);
   const totalConcurrency = status?.fleet.total_concurrency ?? null;
   const active = status?.fleet.active_requests ?? null;
   const vllm = summarizeVllm(nodes);
@@ -215,7 +218,14 @@ export function Overview({
             label={t("scheduler.maxTtft")}
             value={
               nodes.some((node) => node.runtime.ttft_ewma_ms != null)
-                ? `${Math.round(Math.max(...nodes.flatMap((node) => (node.runtime.ttft_ewma_ms == null ? [] : [node.runtime.ttft_ewma_ms]))))} ms`
+                ? formatMs(
+                    Math.max(
+                      ...nodes.flatMap((node) =>
+                        node.runtime.ttft_ewma_ms == null ? [] : [node.runtime.ttft_ewma_ms],
+                      ),
+                    ),
+                    "--",
+                  )
                 : "--"
             }
           />

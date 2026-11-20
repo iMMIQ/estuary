@@ -1,3 +1,5 @@
+mod common;
+
 use axum::{
     Json, Router,
     body::Body,
@@ -5,13 +7,15 @@ use axum::{
     response::IntoResponse,
     routing::post,
 };
+use common::{
+    TempSqlite as Database, TestServer as Server, node_config, test_client as client, wait_until,
+};
 use estuary::{
     Gateway, Settings,
     config::{NodeConfig, SessionLogConfig},
 };
 use serde_json::{Value, json};
 use std::{
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -19,41 +23,6 @@ use std::{
     time::Duration,
 };
 
-struct Server {
-    url: String,
-    task: tokio::task::JoinHandle<()>,
-}
-impl Server {
-    async fn spawn(router: Router) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        Self { url, task }
-    }
-}
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-struct Database(PathBuf);
-impl Database {
-    fn new() -> Self {
-        Self(std::env::temp_dir().join(format!("estuary-logs-{}.sqlite", uuid::Uuid::now_v7())))
-    }
-}
-impl Drop for Database {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
-        }
-    }
-}
-fn client() -> reqwest::Client {
-    reqwest::Client::builder().no_proxy().build().unwrap()
-}
 fn settings(path: &Database, nodes: Vec<NodeConfig>) -> Settings {
     let mut settings = Settings {
         nodes,
@@ -67,13 +36,8 @@ fn settings(path: &Database, nodes: Vec<NodeConfig>) -> Settings {
     settings.retry.max_attempts = 2;
     settings
 }
-fn node(id: &str, url: &str) -> NodeConfig {
-    NodeConfig {
-        id: id.to_owned(),
-        base_url: format!("{url}/v1"),
-        models: std::collections::HashMap::from([("m".to_owned(), "upstream-m".to_owned())]),
-        ..NodeConfig::default()
-    }
+fn node(id: &str, server: &Server) -> NodeConfig {
+    node_config(id, &server.base_url, [("m", "upstream-m")])
 }
 async fn logged_gateway(
     settings: Settings,
@@ -91,13 +55,13 @@ async fn logged_gateway(
 #[tokio::test]
 async fn roundtrip_deduplicates_history_without_merging_requests_or_protocols() {
     let upstream=Server::spawn(Router::new().route("/v1/chat/completions",post(|| async {Json(json!({"id":"c","choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":80}}}))}))).await;
-    let db = Database::new();
-    let (public, admin, logs) = logged_gateway(settings(&db, vec![node("n", &upstream.url)])).await;
+    let db = Database::new("estuary-logs");
+    let (public, admin, logs) = logged_gateway(settings(&db, vec![node("n", &upstream)])).await;
     let mut messages = vec![json!({"role":"system","content":"stable instructions ".repeat(512)})];
     for i in 0..20 {
         messages.push(json!({"role":"user","content":format!("turn {i}")}));
         let response = client()
-            .post(format!("{}/v1/chat/completions", public.url))
+            .post(public.url("/v1/chat/completions"))
             .header("x-request-id", "reused")
             .header("x-estuary-session-id", "agent-1")
             .json(&json!({"model":"m","messages":messages}))
@@ -150,7 +114,7 @@ async fn roundtrip_deduplicates_history_without_merging_requests_or_protocols() 
     let next = logs.list(None, first.next_cursor, 0, 100).await.unwrap();
     assert_eq!(first.requests.len() + next.requests.len(), 20);
     let sessions = client()
-        .get(format!("{}/admin/api/logs/sessions?since=0", admin.url))
+        .get(admin.url("/admin/api/logs/sessions?since=0"))
         .send()
         .await
         .unwrap()
@@ -182,14 +146,14 @@ async fn retry_keeps_failed_attempt_and_final_success() {
         }),
     ))
     .await;
-    let db = Database::new();
+    let db = Database::new("estuary-logs");
     let (public, _, logs) = logged_gateway(settings(
         &db,
-        vec![node("a-bad", &bad.url), node("z-good", &good.url)],
+        vec![node("a-bad", &bad), node("z-good", &good)],
     ))
     .await;
     let response = client()
-        .post(format!("{}/v1/chat/completions", public.url))
+        .post(public.url("/v1/chat/completions"))
         .json(&json!({"model":"m","messages":[]}))
         .send()
         .await
@@ -239,10 +203,10 @@ async fn streaming_end_and_usage_are_observed_without_chunk_rows() {
         }),
     ))
     .await;
-    let db = Database::new();
-    let (public, _, logs) = logged_gateway(settings(&db, vec![node("n", &upstream.url)])).await;
+    let db = Database::new("estuary-logs");
+    let (public, _, logs) = logged_gateway(settings(&db, vec![node("n", &upstream)])).await;
     let response = client()
-        .post(format!("{}/v1/chat/completions", public.url))
+        .post(public.url("/v1/chat/completions"))
         .json(&json!({"model":"m","stream":true,"messages":[]}))
         .send()
         .await
@@ -276,10 +240,10 @@ async fn completion_stream_text_survives_log_storage_and_reconstruction() {
         post(move || async move { ([(header::CONTENT_TYPE, "text/event-stream")], sse) }),
     ))
     .await;
-    let db = Database::new();
-    let (public, _, logs) = logged_gateway(settings(&db, vec![node("n", &upstream.url)])).await;
+    let db = Database::new("estuary-logs");
+    let (public, _, logs) = logged_gateway(settings(&db, vec![node("n", &upstream)])).await;
     let response = client()
-        .post(format!("{}/v1/completions", public.url))
+        .post(public.url("/v1/completions"))
         .json(&json!({"model":"m","stream":true,"prompt":"hello"}))
         .send()
         .await
@@ -320,10 +284,10 @@ async fn missing_stream_terminal_is_logged_even_after_http_200() {
         }),
     ))
     .await;
-    let db = Database::new();
-    let (public, _, logs) = logged_gateway(settings(&db, vec![node("n", &upstream.url)])).await;
+    let db = Database::new("estuary-logs");
+    let (public, _, logs) = logged_gateway(settings(&db, vec![node("n", &upstream)])).await;
     let response = client()
-        .post(format!("{}/v1/chat/completions", public.url))
+        .post(public.url("/v1/chat/completions"))
         .json(&json!({"model":"m","stream":true,"messages":[]}))
         .send()
         .await
@@ -348,12 +312,12 @@ async fn disabled_content_still_records_usage_and_unavailable_database_does_not_
         }),
     ))
     .await;
-    let db = Database::new();
-    let mut config = settings(&db, vec![node("n", &upstream.url)]);
+    let db = Database::new("estuary-logs");
+    let mut config = settings(&db, vec![node("n", &upstream)]);
     config.session_log.capture_content = false;
     let (public, _, logs) = logged_gateway(config).await;
     let _ = client()
-        .post(format!("{}/v1/chat/completions", public.url))
+        .post(public.url("/v1/chat/completions"))
         .json(&json!({"model":"m","messages":[]}))
         .send()
         .await
@@ -371,13 +335,13 @@ async fn disabled_content_still_records_usage_and_unavailable_database_does_not_
     assert!(detail.payloads.is_empty());
     assert_eq!(detail.request.capture_state, "metadata_only");
     assert_eq!(detail.request.usage["input_tokens"], 3);
-    let mut config = settings(&db, vec![node("n", &upstream.url)]);
+    let mut config = settings(&db, vec![node("n", &upstream)]);
     config.session_log.database = Some(std::env::temp_dir());
     let gateway = Gateway::build(config).unwrap();
     let logs = gateway.session_logs();
     let public = Server::spawn(gateway.public_router()).await;
     let response = client()
-        .post(format!("{}/v1/chat/completions", public.url))
+        .post(public.url("/v1/chat/completions"))
         .json(&json!({"model":"m","messages":[]}))
         .send()
         .await
@@ -406,8 +370,8 @@ fn generic_protocol_upstream() -> Router {
 #[tokio::test]
 async fn records_client_protocols_and_generic_upstream_paths() {
     let upstream = Server::spawn(generic_protocol_upstream()).await;
-    let db = Database::new();
-    let config = node("openai", &upstream.url);
+    let db = Database::new("estuary-logs");
+    let config = node("openai", &upstream);
     let (public, _, logs) = logged_gateway(settings(&db, vec![config])).await;
     for endpoint in ["messages", "responses"] {
         for streaming in [false, true] {
@@ -417,7 +381,7 @@ async fn records_client_protocols_and_generic_upstream_paths() {
                 json!({"model":"m","stream":streaming,"input":"hello"})
             };
             let response = client()
-                .post(format!("{}/v1/{endpoint}", public.url))
+                .post(public.url(&format!("/v1/{endpoint}")))
                 .header(
                     "user-agent",
                     if endpoint == "messages" {
@@ -488,12 +452,12 @@ async fn vllm_cache_creation_is_logged_with_and_without_content_capture() {
         Json(json!({"choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":40,"created_cache_tokens":32}}}))
     }))).await;
     for capture_content in [true, false] {
-        let db = Database::new();
-        let mut config = settings(&db, vec![node("n", &upstream.url)]);
+        let db = Database::new("estuary-logs");
+        let mut config = settings(&db, vec![node("n", &upstream)]);
         config.session_log.capture_content = capture_content;
         let (public, _, logs) = logged_gateway(config).await;
         let response = client()
-            .post(format!("{}/v1/chat/completions", public.url))
+            .post(public.url("/v1/chat/completions"))
             .json(&json!({"model":"m","messages":[{"role":"user","content":"hello"}]}))
             .send()
             .await
@@ -514,14 +478,14 @@ async fn vllm_cache_creation_is_logged_with_and_without_content_capture() {
 async fn responses_engine_timings_and_cache_writes_survive_disabled_or_partial_capture() {
     let upstream = Server::spawn(generic_protocol_upstream()).await;
     for (capture_content, limit) in [(true, 16384), (false, 16384), (true, 64)] {
-        let db = Database::new();
-        let mut config = settings(&db, vec![node("n", &upstream.url)]);
+        let db = Database::new("estuary-logs");
+        let mut config = settings(&db, vec![node("n", &upstream)]);
         config.session_log.capture_content = capture_content;
         config.session_log.max_payload_bytes = limit;
         let (public, _, logs) = logged_gateway(config).await;
         for streaming in [false, true] {
             let response = client()
-                .post(format!("{}/v1/responses", public.url))
+                .post(public.url("/v1/responses"))
                 .json(&json!({"model":"m","stream":streaming,"input":"hello"}))
                 .send()
                 .await
@@ -597,11 +561,11 @@ async fn streaming_request_errors_keep_the_requested_mode() {
         }),
     ))
     .await;
-    let db = Database::new();
-    let (public, _, logs) = logged_gateway(settings(&db, vec![node("n", &upstream.url)])).await;
+    let db = Database::new("estuary-logs");
+    let (public, _, logs) = logged_gateway(settings(&db, vec![node("n", &upstream)])).await;
     for streaming in [false, true] {
         let response = client()
-            .post(format!("{}/v1/chat/completions", public.url))
+            .post(public.url("/v1/chat/completions"))
             .json(&json!({"model":"m","stream":streaming,"messages":[{"role":"user","content":"hello"}]}))
             .send().await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -626,13 +590,18 @@ async fn logs_require_admin_auth_and_partial_capture_does_not_change_inference()
         }),
     ))
     .await;
-    let db = Database::new();
-    let mut config = settings(&db, vec![node("n", &upstream.url)]);
+    let db = Database::new("estuary-logs");
+    let mut config = settings(&db, vec![node("n", &upstream)]);
     config.server.admin_token = Some("admin-test-token".to_owned());
     config.session_log.max_payload_bytes = 64;
     config.session_log.max_content_bytes = 128;
     let (public, admin, logs) = logged_gateway(config).await;
-    let response=client().post(format!("{}/v1/chat/completions",public.url)).json(&json!({"model":"m","messages":[{"role":"user","content":"large context".repeat(100)}]})).send().await.unwrap();
+    let response = client()
+        .post(public.url("/v1/chat/completions"))
+        .json(&json!({"model":"m","messages":[{"role":"user","content":"large context".repeat(100)}]}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.json::<Value>().await.unwrap()["usage"]["prompt_tokens"],
@@ -640,7 +609,7 @@ async fn logs_require_admin_auth_and_partial_capture_does_not_change_inference()
     );
     assert!(logs.flush(Duration::from_secs(3)).await);
     for path in ["logs/status", "logs/requests", "logs/sessions"] {
-        let url = format!("{}/admin/api/{path}", admin.url);
+        let url = admin.url(&format!("/admin/api/{path}"));
         assert_eq!(
             client().get(&url).send().await.unwrap().status(),
             StatusCode::UNAUTHORIZED
@@ -667,12 +636,12 @@ async fn logs_require_admin_auth_and_partial_capture_does_not_change_inference()
     assert_eq!(request.usage["input_tokens"], 7);
     let detail = logs.detail(request.id.clone()).await.unwrap().unwrap();
     assert!(detail.payloads.iter().any(|p| p.state == "partial"));
-    let url = format!("{}/admin/api/logs/requests/{}", admin.url, request.id);
+    let url = admin.url(&format!("/admin/api/logs/requests/{}", request.id));
     assert_eq!(
         client().get(url).send().await.unwrap().status(),
         StatusCode::UNAUTHORIZED
     );
-    let url = format!("{}/admin/api/logs/requests?cursor=wrong:value", admin.url);
+    let url = admin.url("/admin/api/logs/requests?cursor=wrong:value");
     assert_eq!(
         client()
             .get(url)
@@ -684,7 +653,7 @@ async fn logs_require_admin_auth_and_partial_capture_does_not_change_inference()
         StatusCode::BAD_REQUEST
     );
     let metrics = client()
-        .get(format!("{}/metrics", admin.url))
+        .get(admin.url("/metrics"))
         .bearer_auth("admin-test-token")
         .send()
         .await
@@ -707,10 +676,10 @@ async fn client_disconnect_finalizes_both_request_and_attempt() {
         };
         ([(header::CONTENT_TYPE,"text/event-stream")],Body::from_stream(body))
     }))).await;
-    let db = Database::new();
-    let (public, _, logs) = logged_gateway(settings(&db, vec![node("n", &upstream.url)])).await;
+    let db = Database::new("estuary-logs");
+    let (public, _, logs) = logged_gateway(settings(&db, vec![node("n", &upstream)])).await;
     let response = client()
-        .post(format!("{}/v1/chat/completions", public.url))
+        .post(public.url("/v1/chat/completions"))
         .json(&json!({"model":"m","stream":true,"messages":[]}))
         .send()
         .await
@@ -718,22 +687,14 @@ async fn client_disconnect_finalizes_both_request_and_attempt() {
     let mut body = response.bytes_stream();
     assert!(body.next().await.unwrap().is_ok());
     drop(body);
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            assert!(logs.flush(Duration::from_secs(1)).await);
-            let page = logs.list(None, None, 0, 10).await.unwrap();
-            if page
-                .requests
-                .first()
-                .is_some_and(|r| r.ended_at_ms.is_some())
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    wait_until(Duration::from_secs(3), || async {
+        assert!(logs.flush(Duration::from_secs(1)).await);
+        let page = logs.list(None, None, 0, 10).await.unwrap();
+        page.requests
+            .first()
+            .is_some_and(|r| r.ended_at_ms.is_some())
     })
-    .await
-    .unwrap();
+    .await;
     let request = logs
         .list(None, None, 0, 10)
         .await
@@ -776,13 +737,13 @@ async fn partial_stream_capture_preserves_late_usage_and_unknown_streams_remain_
             .route("/v1/completions", post(|| async { StatusCode::NO_CONTENT })),
     )
     .await;
-    let db = Database::new();
-    let mut config = settings(&db, vec![node("n", &upstream.url)]);
+    let db = Database::new("estuary-logs");
+    let mut config = settings(&db, vec![node("n", &upstream)]);
     config.session_log.max_payload_bytes = 64;
     let (public, _, logs) = logged_gateway(config).await;
     for endpoint in ["chat/completions", "embeddings", "completions"] {
         let response = client()
-            .post(format!("{}/v1/{endpoint}", public.url))
+            .post(public.url(&format!("/v1/{endpoint}")))
             .json(&json!({"model":"m","stream":true,"messages":[]}))
             .send()
             .await

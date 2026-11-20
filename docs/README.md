@@ -10,7 +10,7 @@ use. The maintained technical documentation is organized by task:
 | [Dashboard observability](observability.md) | Smoothed throughput, latency, request outcomes, engine telemetry, windows, and metric definitions. |
 | [Native vLLM provider](vllm.md) | vLLM version requirements, telemetry, tokenization, KV events, and client compatibility. |
 | [Local end-to-end tests](local-e2e.md) | Real Claude Code, Codex, and OpenCode tests with local CPU inference servers. |
-| [Deployment](../deploy/README.md) | Static binary installation, Docker, zero-downtime rollout, rollback, and persistent paths. |
+| [Deployment](../deploy/README.md) | Static binary installation, Docker, graceful shutdown, and persistent paths. |
 | [Performance benchmark](performance.md) | Reproducible gateway-overhead benchmark commands and output. |
 | [Generated configuration contract](config-contract.md) | Canonical config types, defaults, validation rules, shared cases, and module boundaries. |
 | [Session logging](session-logging.md) | Enable independent storage, inspect sessions, and understand capture limits and retention. |
@@ -19,8 +19,6 @@ The executable is authoritative for runtime flags and environment variables:
 
 ```bash
 estuary --help
-estuary supervisor --help
-estuary rollout --help
 ```
 
 Node-specific configuration is authoritative in SQLite and is managed through

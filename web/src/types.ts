@@ -1,54 +1,15 @@
-import type { ModelCapabilityConfig, NodeConfig, ProviderKind } from "./generated/config";
+import type { ModelCapabilityConfig, NodeConfig, NodeSnapshot } from "./generated/config";
 
 export type {
   ModelCapabilityConfig,
   NodeConfig,
+  Point as HistoryPoint,
+  ProviderConfig,
   ProviderKind,
+  ScopeSnapshot as ScopeMetrics,
+  Snapshot as Observability,
   VllmKvEventsConfig as KvEventsConfig,
 } from "./generated/config";
-
-type HealthState = "starting" | "healthy" | "degraded" | "unhealthy";
-type LifecycleState = "serving" | "draining";
-type CircuitState = "closed" | "open" | "half_open";
-
-interface NodeRuntime {
-  instance_id?: number;
-  id: string;
-  base_url: string;
-  provider: ProviderKind;
-  health: HealthState;
-  lifecycle: LifecycleState;
-  circuit: CircuitState;
-  circuit_open_until_unix_ms: number | null;
-  circuit_failures: number;
-  circuit_half_open_in_flight: number;
-  active: number;
-  available: number;
-  max_concurrency: number;
-  weight: number;
-  provider_state: "generic" | "checking" | "ready" | "incompatible";
-  provider_version: string | null;
-  provider_last_error: string | null;
-  upstream_running: number | null;
-  upstream_waiting: number | null;
-  kv_cache_usage: number | null;
-  prompt_tokens_per_second: number | null;
-  generation_tokens_per_second: number | null;
-  requests_per_second: number | null;
-  prefix_cache_queries_total: number | null;
-  prefix_cache_hits_total: number | null;
-  prefix_cache_hit_rate: number | null;
-  preemptions_total: number | null;
-  latency_ewma_ms: number;
-  ttft_ewma_ms: number | null;
-  pending_prefill_tokens: number;
-  pending_decode_tokens: number;
-  error_ewma: number;
-  last_error: string | null;
-  last_change_unix_ms: number;
-  provider_generation: number;
-  provider_telemetry_updated_unix_ms: number | null;
-}
 
 interface AdmissionSnapshot {
   state:
@@ -77,7 +38,7 @@ export interface NodeRecord {
   revision: number;
   created_at_unix_ms: number;
   updated_at_unix_ms: number;
-  runtime: NodeRuntime;
+  runtime: NodeSnapshot;
   admission: AdmissionSnapshot;
   exact_kv_authoritative: boolean;
   exact_kv_blocks: number;
@@ -124,7 +85,7 @@ export interface GatewayStatus {
 
 export interface PreflightResponse {
   ok: true;
-  runtime: NodeRuntime;
+  runtime: NodeSnapshot;
   admission: AdmissionSnapshot;
   checks: {
     configuration: "passed";
@@ -140,12 +101,10 @@ export interface Pair {
   inherit_capability?: boolean;
 }
 
-export interface NodeDraft
-  extends Omit<NodeConfig, "api_key" | "models" | "model_capabilities" | "headers_from_env"> {
+export interface NodeDraft extends Omit<NodeConfig, "api_key" | "models" | "model_capabilities"> {
   api_key: string;
   preserve_api_key: boolean;
   models: Pair[];
-  headers_from_env: Pair[];
   wildcard_capability?: ModelCapabilityConfig;
   unmapped_capabilities?: Record<string, ModelCapabilityConfig>;
 }
