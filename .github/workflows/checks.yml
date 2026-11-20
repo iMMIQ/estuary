@@ -35,14 +35,14 @@ jobs:
         with:
           bun-version: "1.4.4"
       - name: Use official npm registry
-        run: sed -i 's|https://repo.huaweicloud.com/repository/npm/|https://registry.npmjs.org/|g' bun.lock
+        run: sed -i -E 's#https://(repo\.huaweicloud\.com/repository/npm|registry\.npmmirror\.com)/#https://registry.npmjs.org/#g' bun.lock
       - run: bun install --frozen-lockfile --registry=https://registry.npmjs.org
-      - run: bun run contract:check
       - run: bun run check
       - run: bun run deadcode
       - run: bun run typecheck
       - run: bun run build
       - run: bun run test
+      - run: bun run contract:check
       - run: bunx --bun playwright install --with-deps chromium
       - run: bun run test:e2e
       - uses: actions/upload-artifact@v7.0.2

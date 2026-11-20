@@ -118,7 +118,9 @@ def main():
             workspace.mkdir()
             rules = [{"action": "*", "resource": "*", "effect": "deny"}]
             if tools:
-                rules.append({"action": "nonce_read", "resource": "*", "effect": "allow"})
+                rules.append(
+                    {"action": "nonce_read", "resource": "*", "effect": "allow"}
+                )
             config = {
                 "model": "estuary_cpu_e2e/cpu-opencode",
                 "default_agent": "e2e",
@@ -177,7 +179,14 @@ def main():
                 k: v
                 for k, v in os.environ.items()
                 if not k.startswith(
-                    ("OPENAI_", "ANTHROPIC_", "ESTUARY_", "CODEX_", "CLAUDE_", "OPENCODE_")
+                    (
+                        "OPENAI_",
+                        "ANTHROPIC_",
+                        "ESTUARY_",
+                        "CODEX_",
+                        "CLAUDE_",
+                        "OPENCODE_",
+                    )
                 )
             }
             env.pop("PWD", None)

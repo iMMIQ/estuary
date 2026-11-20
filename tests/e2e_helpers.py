@@ -232,7 +232,9 @@ class GatewayContext:
         if self._log is not None:
             self._log.close()
 
-    def register_node(self, node_id, upstream, models, *, max_concurrency=1, provider="openai"):
+    def register_node(
+        self, node_id, upstream, models, *, max_concurrency=1, provider="openai"
+    ):
         return http_json(
             self.control_url + "/admin/api/nodes",
             {
@@ -266,7 +268,9 @@ class GatewayContext:
             for row in rows
         ]
 
-    def check_logger_health(self, expected_sessions, *, include_sessions=False, count_only=False):
+    def check_logger_health(
+        self, expected_sessions, *, include_sessions=False, count_only=False
+    ):
         records = [
             detail["request"]
             for session in expected_sessions
@@ -380,21 +384,25 @@ class MockLlm(ThreadingHTTPServer):
         with self.lock:
             records = list(self.requests)
         actions = [record.get("action") for record in records]
-        return records, actions, {
-            "requests": len(records),
-            "actions": actions,
-            "errors": [r["error"] for r in records if "error" in r],
-            "only_chat_endpoints": bool(records)
-            and all(r["path"].startswith("/v1/chat/completions") for r in records),
-            "credentials_stripped": all(
-                not r["client_credentials_forwarded"] for r in records
-            ),
-            "image_checks": [
-                {"action": r["action"], "images": r["images"]}
-                for r in records
-                if r.get("action", "").startswith("images_")
-            ],
-        }
+        return (
+            records,
+            actions,
+            {
+                "requests": len(records),
+                "actions": actions,
+                "errors": [r["error"] for r in records if "error" in r],
+                "only_chat_endpoints": bool(records)
+                and all(r["path"].startswith("/v1/chat/completions") for r in records),
+                "credentials_stripped": all(
+                    not r["client_credentials_forwarded"] for r in records
+                ),
+                "image_checks": [
+                    {"action": r["action"], "images": r["images"]}
+                    for r in records
+                    if r.get("action", "").startswith("images_")
+                ],
+            },
+        )
 
 
 class MockHandler(BaseHTTPRequestHandler):

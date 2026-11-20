@@ -26,12 +26,12 @@ Run the same checks enforced by [.github/workflows/checks.yml](.github/workflows
 # Web checks & build
 cd web
 bun install --frozen-lockfile
-bun run contract:check
 bun run check
 bun run deadcode
 bun run typecheck
 bun run build
 bun run test
+bun run contract:check
 cd ..
 
 # Rust checks & tests

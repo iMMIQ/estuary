@@ -359,9 +359,9 @@ def main():
                     for p in detail["payloads"]
                     if p["stage"] == "client_output"
                 )
-                assert completed["status"] == "completed" and completed["error"] is None, (
-                    completed
-                )
+                assert (
+                    completed["status"] == "completed" and completed["error"] is None
+                ), completed
                 if rec["outcome"] == "cancelled":
                     assert rec["delivery"] == "body_dropped", rec
                     early_closes.append(rec["id"])
