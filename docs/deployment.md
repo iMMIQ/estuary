@@ -12,9 +12,9 @@ Estuary runs as a single self-contained binary with an embedded management web a
 GitHub Releases publish static `musl` binaries for `amd64` and `arm64`:
 
 ```bash
-sha256sum --check estuary-v0.4.0-linux-amd64.tar.gz.sha256
-tar -xzf estuary-v0.4.0-linux-amd64.tar.gz
-./estuary-v0.4.0-linux-amd64/estuary \
+sha256sum --check estuary-v0.5.0-linux-amd64.tar.gz.sha256
+tar -xzf estuary-v0.5.0-linux-amd64.tar.gz
+./estuary-v0.5.0-linux-amd64/estuary \
   --database /var/lib/estuary/estuary.db \
   --listen 0.0.0.0:8080 \
   --admin-listen 127.0.0.1:9090
@@ -53,7 +53,7 @@ To probe official and mainland mirrors (Docker Hub, Alpine APK, Cargo sparse ind
 Override the output tag with `ESTUARY_IMAGE`:
 
 ```bash
-ESTUARY_IMAGE=registry.example.com/estuary:0.4.0 ./deploy/docker-build.sh
+ESTUARY_IMAGE=registry.example.com/estuary:0.5.0 ./deploy/docker-build.sh
 ```
 
 ### Build Version Resolution
@@ -61,7 +61,7 @@ ESTUARY_IMAGE=registry.example.com/estuary:0.4.0 ./deploy/docker-build.sh
 [deploy/build-version.sh](../deploy/build-version.sh) and [build.rs](../build.rs) resolve the embedded version identically for both the CLI and management UI:
 
 - If `ESTUARY_BUILD_VERSION` is set, that value is used.
-- On a commit tagged `v<Cargo.toml version>` (e.g. `v0.4.0`), the version is `0.4.0`.
+- On a commit tagged `v<Cargo.toml version>` (e.g. `v0.5.0`), the version is `0.5.0`.
 - On other commits, the version is `<version>+<12-char Git SHA>`.
 - Without Git metadata or `ESTUARY_BUILD_VERSION`, the version falls back to `<version>+unknown`.
 
