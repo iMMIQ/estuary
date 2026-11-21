@@ -8,6 +8,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Override .cargo/config.toml's target-cpu=native so cached build scripts and
+  # proc-macros stay portable across heterogeneous GitHub-hosted runner CPUs.
+  RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
 
 jobs:
   web:
