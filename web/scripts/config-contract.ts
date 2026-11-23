@@ -11,6 +11,8 @@ try {
       "cargo",
       "run",
       "--locked",
+      "-p",
+      "estuary-contract",
       "--features",
       "config-contract",
       "--example",

@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use serde::Serialize;
+use estuary_contract::observability::{Counts, Distribution};
 
 pub(super) const RETENTION: u64 = 900;
 pub(super) const STEP: u64 = 5;
@@ -29,49 +29,6 @@ const fn histogram_bounds() -> [f64; BINS] {
     bounds
 }
 const BOUNDS: [f64; BINS] = histogram_bounds();
-
-macro_rules! counters {
-    ($($field:ident),+ $(,)?) => {
-        #[derive(Clone, Copy, Debug, Default, Serialize)]
-        #[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-        pub struct Counts { $(pub $field: u64,)+ }
-        impl Counts {
-            pub(super) fn add(&mut self, other: Self) {
-                $(self.$field = self.$field.saturating_add(other.$field);)+
-            }
-            pub(super) fn delta(self, previous: Self) -> Self {
-                Self { $($field: self.$field.saturating_sub(previous.$field),)+ }
-            }
-        }
-    };
-}
-counters!(
-    started,
-    success,
-    failed,
-    cancelled,
-    unknown,
-    retries,
-    retried_requests,
-    generation_requests,
-    input_tokens,
-    output_tokens,
-    cached_tokens,
-    cache_input_tokens,
-    input_samples,
-    output_samples,
-    cache_samples,
-    tpot_reported,
-    tpot_estimated,
-    route_exact,
-    route_approximate,
-    route_none,
-);
-impl Counts {
-    pub(super) fn completed(self) -> u64 {
-        self.success + self.failed + self.cancelled + self.unknown
-    }
-}
 
 #[derive(Clone, Debug)]
 pub(super) struct Histogram {
@@ -137,30 +94,6 @@ impl Histogram {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-pub struct Distribution {
-    pub samples: u64,
-    pub p50: Option<f64>,
-    pub p95: Option<f64>,
-    pub mean: Option<f64>,
-    pub overflow: u64,
-}
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-pub struct Rate {
-    pub raw: Option<f64>,
-    pub smoothed: Option<f64>,
-    pub mean_60s: Option<f64>,
-}
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-pub struct Rates {
-    pub incoming: Rate,
-    pub completed: Rate,
-    pub input: Rate,
-    pub output: Rate,
-}
 pub(crate) fn smooth(previous: Option<f64>, sample: Option<f64>, elapsed: f64) -> Option<f64> {
     let sample = sample.filter(|value| value.is_finite() && *value >= 0.0)?;
     Some(previous.map_or(sample, |previous| {

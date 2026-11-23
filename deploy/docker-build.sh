@@ -120,6 +120,7 @@ npm_registry=$(fastest npm https://registry.npmjs.org)
 
 cd "${root}"
 printf 'Build version: %s\n' "${build_version}" >&2
+export DOCKER_BUILDKIT=1
 exec docker build --network host --tag "${ESTUARY_IMAGE:-estuary:local}" \
     --build-arg "ESTUARY_BUILD_VERSION=${build_version}" \
     --build-arg "ALPINE_IMAGE=${docker_registry}/${alpine_image}" \

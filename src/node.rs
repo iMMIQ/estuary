@@ -9,9 +9,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+#[cfg(test)]
+use estuary_contract::node::prefix_cache_hit_rate;
+pub use estuary_contract::node::{
+    CircuitState, HealthState, LifecycleState, NodeSnapshot, ProviderState,
+};
 use http::{HeaderMap, HeaderName, HeaderValue, header::AUTHORIZATION};
 use parking_lot::Mutex;
-use serde::Serialize;
 use tokio::sync::Notify;
 use url::Url;
 
@@ -25,60 +29,6 @@ use capacity::{Capacity, CapacityPermit};
 pub use telemetry::EngineTelemetry;
 pub(crate) use telemetry::{CounterKind, ProviderCounter, sum_counter_kind};
 static NEXT_NODE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum HealthState {
-    Starting,
-    Healthy,
-    Degraded,
-    Unhealthy,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderState {
-    Generic,
-    Checking,
-    Ready,
-    Incompatible,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum LifecycleState {
-    Serving,
-    Draining,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum CircuitState {
-    Closed,
-    Open,
-    HalfOpen,
-}
-
-impl LifecycleState {
-    const fn encode(self) -> u8 {
-        match self {
-            Self::Serving => 0,
-            Self::Draining => 1,
-        }
-    }
-
-    const fn decode(value: u8) -> Self {
-        if value == 1 {
-            Self::Draining
-        } else {
-            Self::Serving
-        }
-    }
-}
 
 #[derive(Debug)]
 struct CircuitRuntime {
@@ -156,26 +106,6 @@ impl ProviderRuntime {
     }
 }
 
-impl HealthState {
-    fn encode(self) -> u8 {
-        match self {
-            Self::Starting => 0,
-            Self::Healthy => 1,
-            Self::Degraded => 2,
-            Self::Unhealthy => 3,
-        }
-    }
-
-    fn decode(value: u8) -> Self {
-        match value {
-            1 => Self::Healthy,
-            2 => Self::Degraded,
-            3 => Self::Unhealthy,
-            _ => Self::Starting,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 struct RuntimeStats {
     latency_ewma_ms: f64,
@@ -209,48 +139,6 @@ impl Default for RuntimeStats {
             last_change_unix_ms: unix_millis(),
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-pub struct NodeSnapshot {
-    pub instance_id: u64,
-    pub engine: EngineTelemetry,
-    pub id: String,
-    pub base_url: String,
-    pub health: HealthState,
-    pub lifecycle: LifecycleState,
-    pub circuit: CircuitState,
-    pub circuit_open_until_unix_ms: Option<u64>,
-    pub circuit_failures: u32,
-    pub circuit_half_open_in_flight: usize,
-    pub active: usize,
-    pub available: usize,
-    pub max_concurrency: usize,
-    pub weight: f64,
-    pub latency_ewma_ms: f64,
-    pub ttft_ewma_ms: Option<f64>,
-    pub pending_prefill_tokens: usize,
-    pub pending_decode_tokens: usize,
-    pub error_ewma: f64,
-    pub last_error: Option<String>,
-    pub last_change_unix_ms: u64,
-    pub provider: ProviderKind,
-    pub provider_state: ProviderState,
-    pub provider_version: Option<String>,
-    pub provider_generation: u64,
-    pub upstream_running: Option<usize>,
-    pub upstream_waiting: Option<usize>,
-    pub kv_cache_usage: Option<f64>,
-    pub prompt_tokens_per_second: Option<f64>,
-    pub generation_tokens_per_second: Option<f64>,
-    pub requests_per_second: Option<f64>,
-    pub prefix_cache_queries_total: Option<f64>,
-    pub prefix_cache_hits_total: Option<f64>,
-    pub prefix_cache_hit_rate: Option<f64>,
-    pub preemptions_total: Option<f64>,
-    pub provider_telemetry_updated_unix_ms: Option<u64>,
-    pub provider_last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1109,12 +997,6 @@ impl Node {
                 .cloned(),
         }
     }
-}
-
-fn prefix_cache_hit_rate(hits: Option<f64>, queries: Option<f64>) -> Option<f64> {
-    let (hits, queries) = (hits?, queries?);
-    (queries > 0.0 && hits.is_finite() && queries.is_finite())
-        .then(|| (hits / queries).clamp(0.0, 1.0))
 }
 
 #[derive(Debug)]

@@ -340,6 +340,7 @@ async fn drain_preserves_an_accepted_connection_until_its_first_request() {
     let built = Gateway::build(settings).unwrap();
     let state = Arc::clone(&built.state);
     let gateway = tokio::spawn(async move { built.run().await });
+    crate::ensure_crypto_provider();
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -411,6 +412,7 @@ async fn public_api_key_auth_and_rpm_rate_limiting() {
             .await
             .unwrap();
     });
+    crate::ensure_crypto_provider();
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let url = format!("http://{addr}/v1/models");
 
@@ -449,6 +451,7 @@ async fn admin_nodes_supports_etag_not_modified() {
     let server = tokio::spawn(async move {
         axum::serve(listener, gateway.admin_router()).await.unwrap();
     });
+    crate::ensure_crypto_provider();
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let url = format!("http://{addr}/admin/api/nodes");
 

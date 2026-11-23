@@ -7,7 +7,7 @@ use serde_json::Value;
 #[test]
 fn shared_node_configuration_cases() {
     let fixtures: Value =
-        serde_json::from_str(include_str!("fixtures/node-config-contract.json")).unwrap();
+        serde_json::from_str(include_str!("../fixtures/node-config-contract.json")).unwrap();
     for case in fixtures["cases"].as_array().unwrap() {
         let mut config = fixtures["base"].clone();
         for (path, value) in case["changes"].as_object().unwrap() {

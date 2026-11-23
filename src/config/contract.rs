@@ -1,90 +1,20 @@
 //! Canonical node defaults, numeric limits, and typed validation shared with the admin editor.
-//! Generate the checked-in web contract with the `config_contract` example.
+//! Generate the checked-in web contract with `estuary-contract`'s `config_contract` example.
 use anyhow::{Result, ensure};
-use serde::Serialize;
 use tokio::sync::Semaphore;
 use url::Url;
 
+pub use estuary_contract::config::{
+    IntegerBounds, JS_MAX_SAFE_INTEGER, MIN_VLLM_MONITOR_INTERVAL_MS, NodeIntegerLimits,
+    RESERVED_UPSTREAM_HEADERS, editor_node_defaults, js_integer_limits,
+};
+
 use super::{MAX_TOKENIZE_CACHE_ENTRIES, NodeConfig, ProviderKind};
 
-pub const MIN_VLLM_MONITOR_INTERVAL_MS: u64 = 100;
-pub const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-
-pub const RESERVED_UPSTREAM_HEADERS: &[&str] = &[
-    "connection",
-    "content-length",
-    "host",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "proxy-connection",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "x-gateway-request-id",
-];
-
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Copy, Debug, Serialize)]
-pub struct IntegerBounds {
-    pub min: u64,
-    pub max: u64,
-}
-
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Serialize)]
-pub struct NodeIntegerLimits {
-    pub max_concurrency: IntegerBounds,
-    pub monitor_interval_ms: IntegerBounds,
-    pub request_timeout_ms: IntegerBounds,
-    pub telemetry_stale_ms: IntegerBounds,
-    pub waiting_threshold: IntegerBounds,
-    pub tokenize_cache_entries: IntegerBounds,
-    pub kv_reconnect_ms: IntegerBounds,
-    pub kv_max_blocks: IntegerBounds,
-    pub kv_max_directory_bytes: IntegerBounds,
-    pub kv_max_event_bytes: IntegerBounds,
-}
-
-pub const fn js_integer_limits() -> NodeIntegerLimits {
-    const fn js_bounds(min: u64, max: u64) -> IntegerBounds {
-        IntegerBounds {
-            min,
-            max: if max < JS_MAX_SAFE_INTEGER {
-                max
-            } else {
-                JS_MAX_SAFE_INTEGER
-            },
-        }
-    }
-    NodeIntegerLimits {
-        max_concurrency: js_bounds(1, Semaphore::MAX_PERMITS as u64),
-        monitor_interval_ms: js_bounds(MIN_VLLM_MONITOR_INTERVAL_MS, u64::MAX),
-        request_timeout_ms: js_bounds(1, u64::MAX),
-        telemetry_stale_ms: js_bounds(1, u64::MAX),
-        waiting_threshold: js_bounds(1, usize::MAX as u64),
-        tokenize_cache_entries: js_bounds(1, MAX_TOKENIZE_CACHE_ENTRIES as u64),
-        kv_reconnect_ms: js_bounds(1, u64::MAX),
-        kv_max_blocks: js_bounds(1, usize::MAX as u64),
-        kv_max_directory_bytes: js_bounds(1, usize::MAX as u64),
-        kv_max_event_bytes: js_bounds(1, usize::MAX as u64),
-    }
-}
-
-/// Editor presets deliberately differ from the minimal deserialization defaults.
-/// Define that policy here so the browser never copies backend default literals.
-pub fn editor_node_defaults() -> NodeConfig {
-    NodeConfig {
-        base_url: "http://127.0.0.1:8000/v1".to_owned(),
-        max_concurrency: 16,
-        provider: super::ProviderConfig {
-            kind: ProviderKind::Vllm,
-            ..super::ProviderConfig::default()
-        },
-        ..NodeConfig::default()
-    }
-}
+const _: () = assert!(
+    estuary_contract::config::MAX_SEMAPHORE_PERMITS == Semaphore::MAX_PERMITS,
+    "estuary-contract MAX_SEMAPHORE_PERMITS must match tokio::sync::Semaphore::MAX_PERMITS"
+);
 
 fn valid_header(name: &str) -> bool {
     http::HeaderName::from_bytes(name.as_bytes()).is_ok()

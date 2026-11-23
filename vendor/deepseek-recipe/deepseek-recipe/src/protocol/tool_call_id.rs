@@ -7,7 +7,7 @@
 //! the model produced no reasoning content from a historical assistant message
 //! whose reasoning content the request omits.
 
-use rand::Rng;
+use rand::RngExt;
 use rand::distr::Alphanumeric;
 use xxhash_rust::xxh3::xxh3_64;
 

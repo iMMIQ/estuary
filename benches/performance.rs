@@ -159,6 +159,7 @@ async fn main() -> Result<()> {
         benchmark_response_buffer(micro_iterations).await;
         return Ok(());
     }
+    estuary::ensure_crypto_provider();
     let upstream = mock_vllm().await?;
     let client = Client::builder().no_proxy().build()?;
 

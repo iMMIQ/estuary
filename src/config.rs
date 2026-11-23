@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use clap::{ArgAction, Args};
 use serde::{Deserialize, Serialize};
@@ -7,8 +7,10 @@ pub mod contract;
 mod validation;
 
 pub use contract::validate_node as validate_node_config;
-
-pub const MAX_TOKENIZE_CACHE_ENTRIES: usize = 65_536;
+pub use estuary_contract::config::{
+    MAX_TOKENIZE_CACHE_ENTRIES, ModelCapabilityConfig, NodeConfig, ProviderConfig, ProviderKind,
+    VllmKvEventsConfig,
+};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Args)]
 #[serde(default, deny_unknown_fields)]
@@ -518,149 +520,6 @@ impl Default for RetryConfig {
         Self {
             max_attempts: 1,
             statuses: vec![429, 502, 503, 504],
-        }
-    }
-}
-
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct NodeConfig {
-    pub id: String,
-    pub base_url: String,
-    pub api_key: Option<String>,
-    pub api_key_env: Option<String>,
-    pub models: HashMap<String, String>,
-    pub model_capabilities: HashMap<String, ModelCapabilityConfig>,
-    pub max_concurrency: usize,
-    pub weight: f64,
-    pub draining: bool,
-    pub health_path: String,
-    pub headers: HashMap<String, String>,
-    pub headers_from_env: HashMap<String, String>,
-    pub provider: ProviderConfig,
-}
-
-impl Default for NodeConfig {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            base_url: String::new(),
-            api_key: None,
-            api_key_env: None,
-            models: HashMap::new(),
-            model_capabilities: HashMap::new(),
-            max_concurrency: 1,
-            weight: 1.0,
-            draining: false,
-            health_path: "/v1/models".to_owned(),
-            headers: HashMap::new(),
-            headers_from_env: HashMap::new(),
-            provider: ProviderConfig::default(),
-        }
-    }
-}
-
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Serialize)]
-pub struct ModelCapabilityConfig {
-    pub multimodal: bool,
-}
-
-impl Default for ModelCapabilityConfig {
-    fn default() -> Self {
-        Self { multimodal: true }
-    }
-}
-
-impl<'de> Deserialize<'de> for ModelCapabilityConfig {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // Existing SQLite records and imported configs may contain the retired
-        // family selector. Accept it only as input; it cannot affect routing.
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Input {
-            #[serde(default = "default_multimodal")]
-            multimodal: bool,
-            #[serde(default, rename = "family")]
-            _retired_family: Option<serde::de::IgnoredAny>,
-        }
-        fn default_multimodal() -> bool {
-            ModelCapabilityConfig::default().multimodal
-        }
-        let input = Input::deserialize(deserializer)?;
-        Ok(Self {
-            multimodal: input.multimodal,
-        })
-    }
-}
-
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderKind {
-    #[default]
-    Openai,
-    Vllm,
-}
-
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ProviderConfig {
-    #[serde(rename = "type")]
-    pub kind: ProviderKind,
-    pub version_path: String,
-    pub metrics_path: String,
-    pub tokenize_path: String,
-    pub monitor_interval_ms: u64,
-    pub request_timeout_ms: u64,
-    pub telemetry_stale_ms: u64,
-    pub waiting_threshold: usize,
-    pub tokenize_cache_entries: usize,
-    pub kv_events: Option<VllmKvEventsConfig>,
-}
-
-impl Default for ProviderConfig {
-    fn default() -> Self {
-        Self {
-            kind: ProviderKind::Openai,
-            version_path: "/version".to_owned(),
-            metrics_path: "/metrics".to_owned(),
-            tokenize_path: "/tokenize".to_owned(),
-            monitor_interval_ms: 1_000,
-            request_timeout_ms: 2_000,
-            telemetry_stale_ms: 5_000,
-            waiting_threshold: 8,
-            tokenize_cache_entries: 4_096,
-            kv_events: None,
-        }
-    }
-}
-
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct VllmKvEventsConfig {
-    pub endpoint: String,
-    pub replay_endpoint: Option<String>,
-    pub topic: String,
-    pub reconnect_ms: u64,
-    pub max_blocks: usize,
-    pub max_directory_bytes: usize,
-    pub max_event_bytes: usize,
-}
-
-impl Default for VllmKvEventsConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: "tcp://127.0.0.1:5557".to_owned(),
-            replay_endpoint: None,
-            topic: "kv-events".to_owned(),
-            reconnect_ms: 1_000,
-            max_blocks: 1_000_000,
-            max_directory_bytes: 512 * 1024 * 1024,
-            max_event_bytes: 16 * 1024 * 1024,
         }
     }
 }

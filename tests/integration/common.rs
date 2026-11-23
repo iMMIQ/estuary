@@ -73,6 +73,7 @@ impl Drop for TempSqlite {
 }
 
 pub fn test_client() -> reqwest::Client {
+    estuary::ensure_crypto_provider();
     reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -80,6 +81,7 @@ pub fn test_client() -> reqwest::Client {
 }
 
 pub fn test_client_with_timeout(limit: Duration) -> reqwest::Client {
+    estuary::ensure_crypto_provider();
     reqwest::Client::builder()
         .no_proxy()
         .timeout(limit)

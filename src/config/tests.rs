@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use super::*;
 
 fn test_node(id: &str) -> NodeConfig {

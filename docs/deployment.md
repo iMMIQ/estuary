@@ -58,7 +58,7 @@ ESTUARY_IMAGE=registry.example.com/estuary:0.5.0 ./deploy/docker-build.sh
 
 ### Build Version Resolution
 
-[deploy/build-version.sh](../deploy/build-version.sh) and [build.rs](../build.rs) resolve the embedded version identically for both the CLI and management UI:
+[deploy/build-version.sh](../deploy/build-version.sh) and [crates/estuary-version/build.rs](../crates/estuary-version/build.rs) resolve the embedded version identically for both the CLI and management UI:
 
 - If `ESTUARY_BUILD_VERSION` is set, that value is used.
 - On a commit tagged `v<Cargo.toml version>` (e.g. `v0.5.0`), the version is `0.5.0`.

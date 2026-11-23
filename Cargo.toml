@@ -1,3 +1,31 @@
+[workspace]
+members = [
+    ".",
+    "crates/estuary-assets",
+    "crates/estuary-contract",
+    "crates/estuary-version",
+]
+exclude = [
+    "vendor/deepseek-recipe",
+    "vendor/deepseek-recipe/deepseek-recipe",
+    "vendor/deepseek-recipe/deepseek-recipe-core",
+    "vendor/deepseek-recipe/deepseek-recipe-macros",
+]
+resolver = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+dead_code = "deny"
+unreachable_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cast_precision_loss = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
 [package]
 name = "estuary"
 version = "0.5.0"
@@ -13,64 +41,67 @@ categories = ["network-programming", "web-programming::http-server"]
 [dependencies]
 anyhow = "1.0.104"
 async-stream = "0.3.6"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base64 = "0.23.1"
-axum = { version = "0.8.9", features = ["json", "macros"] }
 blake3 = "1.8.7"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
-futures-util = "0.3.34"
+deepseek-recipe = { path = "vendor/deepseek-recipe/deepseek-recipe" }
+deepseek-recipe-core = { path = "vendor/deepseek-recipe/deepseek-recipe-core" }
+estuary-assets = { path = "crates/estuary-assets" }
+estuary-contract = { path = "crates/estuary-contract" }
+estuary-version = { path = "crates/estuary-version" }
 flate2 = "1.1.10"
+futures-util = "0.3.34"
 http = "1.5.0"
 lru = "0.19.0"
-mime_guess = "2.0.5"
-parking_lot = "0.13.0"
+parking_lot = "0.12.5"
 prometheus-client = "0.25.2"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "stream"] }
 rmpv = "1.3.1"
 # rusqlite_migration 2.6 requires rusqlite 0.40 (the SQLite links must match).
-rusqlite = { version = "0.40.2", features = ["bundled", "hooks", "fallible_uint"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["modern_sqlite", "hooks", "fallible_uint"] }
 rusqlite_migration = "2.6.0"
-rust-embed = "8.13.0"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 subtle = "2.6.1"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7.20"
-tracing = "0.1.44"
+tracing = { version = "0.1.44", default-features = false, features = ["std", "log"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
-ts-rs = { version = "12.0.1", features = ["no-serde-warnings"], optional = true }
 url = "2.5.8"
 uuid = { version = "1.29.0", features = ["v7"] }
 zeromq = { version = "0.7.0", default-features = false, features = ["tcp-transport", "tokio-runtime"] }
-deepseek-recipe = { path = "vendor/deepseek-recipe/deepseek-recipe" }
-deepseek-recipe-core = { path = "vendor/deepseek-recipe/deepseek-recipe-core" }
+
+[features]
+default = ["bundled-sqlite"]
+bundled-sqlite = ["rusqlite/bundled"]
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.dev.package.deepseek-recipe]
+debug = false
+
+[profile.dev.package.deepseek-recipe-core]
+debug = false
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
 strip = true
+
+[profile.dist]
+inherits = "release"
+codegen-units = 1
 
 [[bench]]
 name = "performance"
 harness = false
 
-[lints.rust]
-unsafe_code = "forbid"
-dead_code = "deny"
-unreachable_code = "deny"
-
-[lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-cast_precision_loss = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-must_use_candidate = "allow"
-
-[features]
-config-contract = ["dep:ts-rs"]
-
-[[example]]
-name = "config_contract"
-required-features = ["config-contract"]
+[lints]
+workspace = true

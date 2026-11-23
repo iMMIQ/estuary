@@ -151,7 +151,10 @@ fn archives_use_explicit_metadata_or_unknown_hash() {
 fn cargo_rebuilds_when_head_or_release_tags_change() {
     let fixture = VersionFixture::new();
     fs::copy(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/build.rs"),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/crates/estuary-version/build.rs"
+        ),
         fixture.root.join("build.rs"),
     )
     .unwrap();

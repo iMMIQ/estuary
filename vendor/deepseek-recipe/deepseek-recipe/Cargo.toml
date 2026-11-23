@@ -1,26 +1,26 @@
 [package]
 name = "deepseek-recipe"
-version.workspace = true
-edition.workspace = true
+version = "0.2.0"
+edition = "2024"
+readme = "../README.md"
+license = "MIT"
+repository = "https://github.com/deepseek-ai/deepseek-recipe"
 description = "API request conversion and protocol response generators for DeepSeek models."
-readme.workspace = true
 documentation = "https://docs.rs/deepseek-recipe"
-license.workspace = true
-repository.workspace = true
 
 [dependencies]
-base64 = { workspace = true }
-data-url = { workspace = true }
-deepseek-recipe-core = { workspace = true }
-deepseek-recipe-macros = { workspace = true }
-indexmap = { workspace = true }
-itertools = { workspace = true }
-jsonschema = { workspace = true }
-rand = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-strum_macros = { workspace = true }
-xxhash-rust = { workspace = true }
+base64 = "0.23.1"
+data-url = "0.3.2"
+deepseek-recipe-core = { version = "0.2.0", path = "../deepseek-recipe-core" }
+deepseek-recipe-macros = { version = "0.2.0", path = "../deepseek-recipe-macros" }
+indexmap = { version = "2.14.1", features = ["serde"] }
+itertools = "0.15.0"
+jsonschema = { version = "0.60.2", default-features = false }
+rand = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+strum_macros = "0.28.0"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }

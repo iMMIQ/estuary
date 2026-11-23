@@ -29,6 +29,7 @@ use super::*;
 use crate::config::{HealthConfig, NodeConfig, PrefixConfig, ProviderConfig, VllmKvEventsConfig};
 
 fn test_client() -> Client {
+    crate::ensure_crypto_provider();
     // Local test servers must not depend on the host proxy configuration.
     Client::builder().no_proxy().build().unwrap()
 }

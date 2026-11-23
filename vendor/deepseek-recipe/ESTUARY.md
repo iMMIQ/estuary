@@ -21,7 +21,7 @@ Local changes:
   - `deepseek-recipe-core/src/multimodal/token_spec.rs` (DeepSeek V4.1 image tile resizing/counting)
 - Replace the full-workspace README with a description of the vendored subset.
 - Keep upstream JSON Schema tool validation enabled.
-- Retain Estuary's refreshed versions of existing workspace dependencies. Keep the
+- Retain Estuary's refreshed versions of existing dependencies (inlined into each vendored crate's `Cargo.toml` so Estuary can use a root Cargo workspace without nested-workspace conflicts, including `rand 0.10` to match `zeromq` without duplicate RNG crates). Keep the
   Tokio dev-dependency, which the 0.2.0 upstream unit tests now use.
 
 The Chat bridge registers each requested model as a V4.1 conversion alias to preserve

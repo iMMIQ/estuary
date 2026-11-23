@@ -23,7 +23,14 @@ mod time;
 pub mod vllm;
 
 pub use config::Settings;
+pub use estuary_version::VERSION;
 pub use server::Gateway;
 
-/// The release version, including the commit hash for untagged builds.
-pub const VERSION: &str = env!("ESTUARY_BUILD_VERSION");
+/// Ensures the `ring` crypto provider is installed for `rustls` before
+/// constructing any `reqwest::Client`. Safe to call repeatedly.
+pub fn ensure_crypto_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}

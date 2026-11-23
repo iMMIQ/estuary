@@ -1,14 +1,14 @@
 [package]
 name = "deepseek-recipe-core"
-version.workspace = true
-edition.workspace = true
+version = "0.2.0"
+edition = "2024"
+readme = "../README.md"
+license = "MIT"
+repository = "https://github.com/deepseek-ai/deepseek-recipe"
 description = "Shared conversation, message, and tool types for DeepSeek models."
-readme.workspace = true
 documentation = "https://docs.rs/deepseek-recipe-core"
-license.workspace = true
-repository.workspace = true
 
 [dependencies]
-deepseek-recipe-macros = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+deepseek-recipe-macros = { version = "0.2.0", path = "../deepseek-recipe-macros" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }

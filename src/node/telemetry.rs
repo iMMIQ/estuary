@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Serialize;
+pub use estuary_contract::node::EngineTelemetry;
 
 use crate::observability::{Rate, smooth};
 
@@ -33,71 +33,6 @@ pub(crate) fn sum_counter_kind(counters: &[ProviderCounter], kind: CounterKind) 
         .peekable();
     iter.peek()?;
     Some(iter.sum())
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-#[cfg_attr(feature = "config-contract", derive(ts_rs::TS))]
-pub struct EngineTelemetry {
-    pub input: Rate,
-    pub output: Rate,
-    pub requests: Rate,
-    pub cache_hit_ratio: Option<f64>,
-    pub cache_hits_60s: Option<f64>,
-    pub cache_queries_60s: Option<f64>,
-    pub preemptions_per_minute: Option<f64>,
-    pub reporting_nodes: usize,
-    pub expected_nodes: usize,
-    pub input_nodes: usize,
-    pub output_nodes: usize,
-    pub request_nodes: usize,
-    pub resets: u64,
-}
-
-impl EngineTelemetry {
-    pub(crate) fn aggregate(values: &[Self], expected_nodes: usize) -> Self {
-        let sum = |read: fn(&Self) -> Option<f64>| {
-            let mut valid = values.iter().filter_map(read).peekable();
-            valid.peek()?;
-            Some(valid.sum::<f64>())
-        };
-        let rate = |raw: fn(&Self) -> Option<f64>,
-                    smoothed: fn(&Self) -> Option<f64>,
-                    mean_60s: fn(&Self) -> Option<f64>| Rate {
-            raw: sum(raw),
-            smoothed: sum(smoothed),
-            mean_60s: sum(mean_60s),
-        };
-        // Pair numerator and denominator from the same reporting engines.
-        let (has_cache, hits, queries) = values
-            .iter()
-            .filter_map(|v| Some((v.cache_hits_60s?, v.cache_queries_60s?)))
-            .fold((false, 0.0, 0.0), |(_, hits, queries), (h, q)| {
-                (true, hits + h, queries + q)
-            });
-        Self {
-            input: rate(|v| v.input.raw, |v| v.input.smoothed, |v| v.input.mean_60s),
-            output: rate(
-                |v| v.output.raw,
-                |v| v.output.smoothed,
-                |v| v.output.mean_60s,
-            ),
-            requests: rate(
-                |v| v.requests.raw,
-                |v| v.requests.smoothed,
-                |v| v.requests.mean_60s,
-            ),
-            cache_hit_ratio: super::prefix_cache_hit_rate(Some(hits), Some(queries)),
-            cache_hits_60s: has_cache.then_some(hits),
-            cache_queries_60s: has_cache.then_some(queries),
-            preemptions_per_minute: sum(|v| v.preemptions_per_minute),
-            reporting_nodes: values.len(),
-            expected_nodes,
-            input_nodes: values.iter().filter(|v| v.input.raw.is_some()).count(),
-            output_nodes: values.iter().filter(|v| v.output.raw.is_some()).count(),
-            request_nodes: values.iter().filter(|v| v.requests.raw.is_some()).count(),
-            resets: values.iter().map(|v| v.resets).sum(),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]

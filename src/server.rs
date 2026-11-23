@@ -521,12 +521,13 @@ fn build_http_client(
     pool_idle_timeout: Duration,
     max_idle_per_host: Option<usize>,
 ) -> Result<reqwest::Client, reqwest::Error> {
+    crate::ensure_crypto_provider();
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(connect_timeout_ms))
         .pool_idle_timeout(pool_idle_timeout)
         .no_proxy()
         .redirect(Policy::none())
-        .user_agent(concat!("estuary/", env!("ESTUARY_BUILD_VERSION")));
+        .user_agent(estuary_version::USER_AGENT);
     if let Some(max_idle) = max_idle_per_host {
         builder = builder.pool_max_idle_per_host(max_idle);
     }

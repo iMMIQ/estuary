@@ -40,8 +40,6 @@ jobs:
         with:
           name: web-dist
           path: web/dist
-      - name: Install LLD
-        run: sudo apt-get update && sudo apt-get install -y lld
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.98.1"

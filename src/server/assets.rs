@@ -11,12 +11,9 @@ use axum::{
     },
     response::{IntoResponse, Redirect, Response},
 };
+pub(super) use estuary_assets::AdminAssets;
+use estuary_assets::content_type;
 use flate2::read::GzDecoder;
-use rust_embed::RustEmbed;
-
-#[derive(RustEmbed)]
-#[folder = "web/dist"]
-pub(super) struct AdminAssets;
 
 fn is_gzip_path(path: &str) -> bool {
     std::path::Path::new(path)
@@ -79,10 +76,10 @@ pub(super) fn embedded_admin_response(path: &str, immutable: bool, gzip: bool) -
     }
     let compressed = AdminAssets::get(&format!("{path}.gz"));
     let (body, is_compressed) = match (gzip, compressed, AdminAssets::get(path)) {
-        (true, Some(asset), _) => (asset.data.into_owned(), true),
-        (_, _, Some(asset)) => (asset.data.into_owned(), false),
+        (true, Some(asset), _) => (asset.into_owned(), true),
+        (_, _, Some(asset)) => (asset.into_owned(), false),
         (false, Some(asset), None) => {
-            let mut decoder = GzDecoder::new(asset.data.as_ref());
+            let mut decoder = GzDecoder::new(asset.as_ref());
             let mut plain = Vec::new();
             if decoder.read_to_end(&mut plain).is_err() {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -91,7 +88,7 @@ pub(super) fn embedded_admin_response(path: &str, immutable: bool, gzip: bool) -
         }
         (_, None, None) => return StatusCode::NOT_FOUND.into_response(),
     };
-    let content_type = mime_guess::from_path(path).first_or_octet_stream();
+    let content_type = content_type(path);
     let cache_control = if immutable {
         "public, max-age=31536000, immutable"
     } else {
@@ -99,7 +96,7 @@ pub(super) fn embedded_admin_response(path: &str, immutable: bool, gzip: bool) -
     };
     let mut response = Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, content_type.as_ref())
+        .header(CONTENT_TYPE, content_type)
         .header(CACHE_CONTROL, cache_control)
         .header(VARY, "Accept-Encoding")
         .header("x-content-type-options", "nosniff")
